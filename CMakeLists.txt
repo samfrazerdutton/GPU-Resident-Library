@@ -1,0 +1,43 @@
+cmake_minimum_required(VERSION 3.18)
+project(GPUResidentFHE LANGUAGES CXX CUDA)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CUDA_STANDARD 17)
+if(NOT CMAKE_CUDA_ARCHITECTURES)
+  set(CMAKE_CUDA_ARCHITECTURES 75)   # RTX 2060 (Turing)
+endif()
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release)
+endif()
+
+# Core library: pure device-resident FHE, NO OpenFHE dependency.
+add_library(gpufhe STATIC
+  src/device_ciphertext.cpp
+  kernels/ntt_ct.cu
+)
+find_package(CUDAToolkit REQUIRED)
+target_include_directories(gpufhe PUBLIC include)
+target_link_libraries(gpufhe PUBLIC CUDA::cudart)
+target_include_directories(gpufhe PUBLIC ${CUDAToolkit_INCLUDE_DIRS} /usr/local/cuda-13.2/include)
+set_target_properties(gpufhe PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+# OpenFHE is a TEST-ONLY dependency: ground-truth oracle, never linked into
+# the core library. Tests encrypt/decrypt in OpenFHE and compare bit-exact.
+find_package(OpenFHE QUIET)
+
+enable_testing()
+function(gpufhe_test name src)
+  add_executable(${name} ${src})
+  find_package(CUDAToolkit REQUIRED)
+  target_link_libraries(${name} PRIVATE gpufhe CUDA::cudart)
+  target_include_directories(${name} PRIVATE
+    /usr/local/include/openfhe
+    /usr/local/include/openfhe/pke
+    /usr/local/include/openfhe/core
+    /usr/local/include/openfhe/binfhe)
+  target_link_libraries(${name} PRIVATE OPENFHEpke OPENFHEcore)
+  add_test(NAME ${name} COMMAND ${name})
+endfunction()
+
+gpufhe_test(test_ntt_resident tests/test_ntt_resident.cpp)
