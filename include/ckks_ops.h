@@ -25,13 +25,14 @@ void build_device_tables(DeviceTables& T, uint32_t n,
 // Resident coefficient-wise multiply: ct_a *= ct_b, per tower, in place on
 // device. Both must be EVALUATION form, same tower count. No host transfer.
 void mul_resident(DeviceCiphertext& a, const DeviceCiphertext& b,
-                  const DeviceTables& T);
+                  const DeviceTables& T, cudaStream_t stream);
 
 // Resident rescale: drops the last tower and applies the correction entirely on
 // device, using pre-uploaded tables. s1[t]=qlInvModq, s2[t]=QlQlInvModqlDivqlModq
 // for the current level. Operates on both components. Scratch is device-side.
 void rescale_resident(DeviceCiphertext& ct, const DeviceTables& T,
                       const std::vector<uint64_t>& s1,
-                      const std::vector<uint64_t>& s2);
+                      const std::vector<uint64_t>& s2,
+                      cudaStream_t stream, uint64_t* scratch, uint64_t* dropCoeff);
 
 } // namespace gpufhe

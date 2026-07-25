@@ -86,52 +86,49 @@ DeviceTables::~DeviceTables() {
 }
 
 void mul_resident(DeviceCiphertext& a, const DeviceCiphertext& b,
-                  const DeviceTables& T) {
+                  const DeviceTables& T, cudaStream_t stream) {
     const uint32_t n = a.n(), towers = a.num_towers();
     for (uint32_t t=0;t<towers;++t) {
         uint64_t q = T.q[t];
         LaunchRNSMultTower(a.c0()+t*n, const_cast<DeviceCiphertext&>(b).c0()+t*n,
-                           a.c0()+t*n, q, n, 0);
+                           a.c0()+t*n, q, n, stream);
         LaunchRNSMultTower(a.c1()+t*n, const_cast<DeviceCiphertext&>(b).c1()+t*n,
-                           a.c1()+t*n, q, n, 0);
+                           a.c1()+t*n, q, n, stream);
     }
 }
 
 // Resident rescale. scratch is a device buffer of length n, reused per tower.
 void rescale_resident(DeviceCiphertext& ct, const DeviceTables& T,
                       const std::vector<uint64_t>& s1,
-                      const std::vector<uint64_t>& s2) {
+                      const std::vector<uint64_t>& s2,
+                      cudaStream_t stream, uint64_t* scratch, uint64_t* dropCoeff) {
     const uint32_t n = ct.n();
     const uint32_t towers = ct.num_towers();
+    if (towers < 2) return;   // nothing to drop; guard against underflow
     const uint32_t last = towers-1;
     const uint32_t surviving = towers-1;
     uint64_t qLast = T.q[last];
 
-    uint64_t *scratch=nullptr, *dropCoeff=nullptr;
-    cudaMalloc(&scratch, (size_t)n*sizeof(uint64_t));
-    cudaMalloc(&dropCoeff, (size_t)n*sizeof(uint64_t));
 
     // Both components share the same table/constant structure.
     uint64_t* comps[2] = { ct.c0(), ct.c1() };
     for (int cc=0; cc<2; ++cc) {
         uint64_t* base = comps[cc];
         // 1. INTT the dropped tower (in place into dropCoeff).
-        cudaMemcpy(dropCoeff, base+last*n, (size_t)n*sizeof(uint64_t),
-                   cudaMemcpyDeviceToDevice);
+        cudaMemcpyAsync(dropCoeff, base+last*n, (size_t)n*sizeof(uint64_t),
+                   cudaMemcpyDeviceToDevice, stream);
         LaunchINTT_GS(dropCoeff, T.d_iroots[last], T.d_iprecon[last],
-                      n, qLast, T.ninv[last], T.ninv_precon[last], 0);
+                      n, qLast, T.ninv[last], T.ninv_precon[last], stream);
         // 2. per surviving tower: switch dropped coeff into q_i, NTT, fuse.
         for (uint32_t t=0;t<surviving;++t) {
             uint64_t qi = T.q[t];
-            cudaMemcpy(scratch, dropCoeff, (size_t)n*sizeof(uint64_t),
-                       cudaMemcpyDeviceToDevice);
-            LaunchSwitchModulus(scratch, qLast, qi, n, 0);
-            LaunchNTT_CT(scratch, T.d_froots[t], T.d_fprecon[t], n, qi, 0);
-            LaunchRescaleFuse(base+t*n, scratch, s1[t], s2[t], qi, n, 0);
+            cudaMemcpyAsync(scratch, dropCoeff, (size_t)n*sizeof(uint64_t),
+                       cudaMemcpyDeviceToDevice, stream);
+            LaunchSwitchModulus(scratch, qLast, qi, n, stream);
+            LaunchNTT_CT(scratch, T.d_froots[t], T.d_fprecon[t], n, qi, stream);
+            LaunchRescaleFuse(base+t*n, scratch, s1[t], s2[t], qi, n, stream);
         }
     }
-    cudaDeviceSynchronize();
-    cudaFree(scratch); cudaFree(dropCoeff);
     ct.drop_tower();
 }
 
