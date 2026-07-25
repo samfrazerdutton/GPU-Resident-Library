@@ -116,12 +116,13 @@ int main() {
         auto drop_to=[&](DCRTPoly p, uint32_t target){
             while(p.GetNumOfElements()>target) p.DropLastElement();
             return p; };
+        // Build operands BEFORE timing (GPU path uploads before t0 too).
+        DCRTPoly A=mk(), B=mk(), B2pre=mk();
         auto t0=clk::now();
-        DCRTPoly A=mk(), B=mk();
         A=A*B;                                   // full towers
         A.DropLastElementAndScale(cryptoParams->GetQlQlInvModqlDivqlModq(0),
                                   cryptoParams->GetqlInvModq(0));
-        DCRTPoly B2=drop_to(mk(), A.GetNumOfElements());  // match rescaled A
+        DCRTPoly B2=drop_to(B2pre, A.GetNumOfElements());  // match rescaled A
         A=A*B2;
         A.DropLastElementAndScale(cryptoParams->GetQlQlInvModqlDivqlModq(1),
                                   cryptoParams->GetqlInvModq(1));
