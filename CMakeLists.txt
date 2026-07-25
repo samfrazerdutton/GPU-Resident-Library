@@ -18,6 +18,7 @@ add_library(gpufhe STATIC
   kernels/rns_arith.cu
   kernels/intt_ct.cu
   kernels/switch_modulus.cu
+  kernels/rescale.cu
 )
 find_package(CUDAToolkit REQUIRED)
 target_include_directories(gpufhe PUBLIC include)
@@ -47,3 +48,4 @@ gpufhe_test(test_ntt_resident tests/test_ntt_resident.cpp)
 gpufhe_test(test_mult_resident tests/test_mult_resident.cpp)
 gpufhe_test(test_intt_resident tests/test_intt_resident.cpp)
 gpufhe_test(test_switchmod_resident tests/test_switchmod_resident.cpp)
+gpufhe_test(test_rescale_resident tests/test_rescale_resident.cpp)
