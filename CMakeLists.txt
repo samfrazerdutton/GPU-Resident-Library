@@ -14,6 +14,7 @@ endif()
 # Core library: pure device-resident FHE, NO OpenFHE dependency.
 add_library(gpufhe STATIC
   src/device_ciphertext.cpp
+  src/ckks_ops.cpp
   kernels/ntt_ct.cu
   kernels/rns_arith.cu
   kernels/intt_ct.cu
@@ -49,3 +50,4 @@ gpufhe_test(test_mult_resident tests/test_mult_resident.cpp)
 gpufhe_test(test_intt_resident tests/test_intt_resident.cpp)
 gpufhe_test(test_switchmod_resident tests/test_switchmod_resident.cpp)
 gpufhe_test(test_rescale_resident tests/test_rescale_resident.cpp)
+gpufhe_test(bench_resident_chain bench/bench_resident_chain.cpp)
