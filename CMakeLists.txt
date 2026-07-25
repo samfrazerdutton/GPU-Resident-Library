@@ -16,6 +16,7 @@ add_library(gpufhe STATIC
   src/device_ciphertext.cpp
   kernels/ntt_ct.cu
   kernels/rns_arith.cu
+  kernels/intt_ct.cu
 )
 find_package(CUDAToolkit REQUIRED)
 target_include_directories(gpufhe PUBLIC include)
@@ -43,3 +44,4 @@ endfunction()
 
 gpufhe_test(test_ntt_resident tests/test_ntt_resident.cpp)
 gpufhe_test(test_mult_resident tests/test_mult_resident.cpp)
+gpufhe_test(test_intt_resident tests/test_intt_resident.cpp)
