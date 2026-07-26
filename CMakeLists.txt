@@ -46,6 +46,7 @@ function(gpufhe_test name src)
 endfunction()
 
 gpufhe_test(test_ntt_resident tests/test_ntt_resident.cpp)
+gpufhe_test(test_ntt_towers tests/test_ntt_towers.cpp)
 gpufhe_test(test_mult_resident tests/test_mult_resident.cpp)
 gpufhe_test(test_intt_resident tests/test_intt_resident.cpp)
 gpufhe_test(test_switchmod_resident tests/test_switchmod_resident.cpp)
