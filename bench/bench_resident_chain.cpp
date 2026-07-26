@@ -91,12 +91,18 @@ int main() {
         gpufhe::DeviceCiphertext A(gpufhe::Scheme::CKKS,n,towers0), B(gpufhe::Scheme::CKKS,n,towers0);
         std::vector<uint64_t> z((size_t)n*towers0,0);
         A.upload(ha,z); B.upload(hb,z);
+        static cudaStream_t stream = nullptr;
+        static uint64_t *scratch=nullptr,*drop=nullptr;
+        if(!stream){ cudaStreamCreate(&stream);
+            cudaMalloc(&scratch,(size_t)n*sizeof(uint64_t));
+            cudaMalloc(&drop,(size_t)n*sizeof(uint64_t)); }
         cudaDeviceSynchronize();
         auto t0=clk::now();
-        gpufhe::mul_resident(A,B,T);
-        gpufhe::rescale_resident(A,T,S1[0],S2[0]);
-        gpufhe::mul_resident(A,B,T);   // B still has full towers; use a truncated view
-        gpufhe::rescale_resident(A,T,S1[1],S2[1]);
+        gpufhe::mul_resident(A,B,T,stream);
+        gpufhe::rescale_resident(A,T,S1[0],S2[0],stream,scratch,drop);
+        gpufhe::mul_resident(A,B,T,stream);
+        gpufhe::rescale_resident(A,T,S1[1],S2[1],stream,scratch,drop);
+        cudaStreamSynchronize(stream);
         std::vector<uint64_t> o0,o1; A.to_host(o0,o1);
         double dt=std::chrono::duration<double,std::milli>(clk::now()-t0).count();
         return dt;
