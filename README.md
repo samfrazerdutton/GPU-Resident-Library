@@ -67,7 +67,7 @@ improved throughput (bandwidth-bound, concurrent) while barely moving latency
 
 | | GPU | CPU (OpenFHE EvalMult) | Result |
 |---|---|---|---|
-| Per-op cost | 5.59 ms | 62.9 ms | **GPU ~11× faster** |
+| Per-op cost | 4.20 ms | 55.97 ms | **GPU 13.3× faster** |
 
 This is the headline. Relinearization is the most expensive CKKS operation on
 CPU (~60 of the 62.9 ms), and it's dense, parallel modular arithmetic — exactly
@@ -77,8 +77,10 @@ each operation is pure kernel launches and device-to-device copies on a stream,
 with zero mallocs or host transfers. (An earlier host-orchestrated version of
 the same keyswitch cost 124.7 ms/op — residency recovered all of it.)
 
-The comparison is verified under FIXEDMANUAL scaling so OpenFHE's EvalMult does
-exactly tensor + relin, matching the GPU pipeline op-for-op.
+The comparison uses FIXEDMANUAL scaling so OpenFHE's EvalMult does exactly
+tensor + relin, matching the GPU pipeline op-for-op (4-tower context; the
+default FLEXIBLEAUTO 5-tower config gives 11.3× — the result is robust across
+configurations).
 
 ### Benchmark methodology
 
