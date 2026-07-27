@@ -89,6 +89,25 @@ int main(int argc,char**argv){
         h=rb(); cudaMemcpy(x.c1b,h.data(),T*8,cudaMemcpyHostToDevice); }
     cudaDeviceSynchronize();
 
+    // capture each chain's full op (tensor->keyswitch->combine->2x rescale) as a graph
+    std::vector<cudaGraphExec_t> gexec(N);
+    for(uint32_t c=0;c<N;++c){ auto&x=ch[c]; cudaGraph_t g;
+        cudaStreamBeginCapture(streams[c],cudaStreamCaptureModeGlobal);
+        LaunchTensor(x.c0a,x.c1a,x.c0b,x.c1b,x.t0,x.t1,x.t2,d_mods,sizeQ,n,streams[c]);
+        gpufhe::keyswitch_resident(x.t2,x.ba0,x.ba1,C,W[c],streams[c]);
+        LaunchCombine(x.r0,x.r1,x.t0,x.t1,x.ba0,x.ba1,d_mods,sizeQ,n,streams[c]);
+        gpufhe::rescale_resident_raw(x.r0,sizeQ,C,rs1,rs2,x.scr,x.drp,streams[c]);
+        gpufhe::rescale_resident_raw(x.r1,sizeQ,C,rs1,rs2,x.scr,x.drp,streams[c]);
+        cudaStreamEndCapture(streams[c],&g);
+        cudaGraphInstantiate(&gexec[c],g,nullptr,nullptr,0); cudaGraphDestroy(g); }
+    cudaDeviceSynchronize();
+
+    auto run_gpu_graph=[&](){
+        auto t0=clk::now();
+        for(uint32_t c=0;c<N;++c) cudaGraphLaunch(gexec[c],streams[c]);
+        cudaDeviceSynchronize();
+        return std::chrono::duration<double,std::milli>(clk::now()-t0).count(); };
+
     auto run_gpu=[&](){
         auto t0=clk::now();
         for(uint32_t c=0;c<N;++c){ auto&x=ch[c];
@@ -108,19 +127,21 @@ int main(int argc,char**argv){
         for(uint32_t c=0;c<N;++c){ auto r=cc->EvalMult(ca[c],cb[c]); cc->RescaleInPlace(r); }
         return std::chrono::duration<double,std::milli>(clk::now()-t0).count(); };
 
-    run_gpu(); run_cpu();  // warmup
-    std::vector<double> g,cv,d;
-    for(uint32_t r=0;r<reps;++r){ double gt=run_gpu(), ct=run_cpu();
-        g.push_back(gt); cv.push_back(ct); d.push_back(gt-ct); }
+    run_gpu(); run_gpu_graph(); run_cpu();  // warmup
+    std::vector<double> g,gg,cv,d;
+    for(uint32_t r=0;r<reps;++r){ double gt=run_gpu(), ggt=run_gpu_graph(), ct=run_cpu();
+        g.push_back(gt); gg.push_back(ggt); cv.push_back(ct); d.push_back(ggt-ct); }
     auto ci=boot(d);
     std::cout<<"BATCH FULL EvalMult+RESCALE (tensor+resident relin+combine+resident rescale) N="<<N<<" ring="<<n<<" towers="<<sizeQ<<"\n";
-    std::cout<<"  gpu batch = "<<median(g)<<" ms  ("<<median(g)/N<<" ms/op)\n";
+    std::cout<<"  gpu direct = "<<median(g)<<" ms  ("<<median(g)/N<<" ms/op)\n";
+    std::cout<<"  gpu GRAPH  = "<<median(gg)<<" ms  ("<<median(gg)/N<<" ms/op)  [graphs vs direct: "<<(median(g)/median(gg))<<"x]\n";
     std::cout<<"  cpu batch = "<<median(cv)<<" ms  ("<<median(cv)/N<<" ms/op)\n";
     std::cout<<"  gpu-cpu median = "<<median(d)<<" ms  95% CI ["<<ci.first<<", "<<ci.second<<"]\n";
     std::cout<<"  => "<<((ci.second<0)?"GPU FASTER":(ci.first>0)?"GPU SLOWER":"inconclusive")<<" ("
-             <<median(cv)/median(g)<<"x)\n";
+             <<median(cv)/median(gg)<<"x, graph path)\n";
     for(uint32_t c=0;c<N;++c){ gpufhe::ks_work_destroy(W[c]); cudaStreamDestroy(streams[c]);
         auto&x=ch[c]; for(uint64_t* p:{x.c0a,x.c1a,x.c0b,x.c1b,x.t0,x.t1,x.t2,x.ba0,x.ba1,x.r0,x.r1,x.scr,x.drp})cudaFree(p); }
+    for(auto&e:gexec)cudaGraphExecDestroy(e);
     gpufhe::ks_context_destroy(C); cudaFree(d_mods);
     return 0;
 }

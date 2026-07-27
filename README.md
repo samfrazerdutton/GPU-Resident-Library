@@ -93,7 +93,7 @@ limit at these parameters; SM/bandwidth saturation is.
 
 | | GPU | CPU (EvalMult + Rescale) | Result |
 |---|---|---|---|
-| Per-op cost | 5.50 ms | 58.28 ms | **GPU 10.6× faster** |
+| Per-op cost | 3.87 ms (CUDA graphs) | 53.1 ms | **GPU 13.7× faster** |
 
 The full pipeline — including the resident rescale — is numerically gated: an
 encrypted product decrypts to exactly the expected polynomial at the
@@ -115,8 +115,9 @@ primitive against OpenFHE; benchmarks under `bench/`.
 
 ## What's next (optional)
 
-- Batch per-tower kernel launches into grid-spanning launches, and CUDA graphs
-  (~10–20% combined; the pipeline is near the card's bandwidth floor).
+- ~~Launch overhead~~ — done: each chain's full op is captured as a CUDA graph
+  (bit-exact gate) and replayed; 1.32× over direct launch, subsuming per-tower
+  launch batching.
 - Complex canonical encode/decode for real message packing.
 - Bootstrapping for unbounded depth.
 
