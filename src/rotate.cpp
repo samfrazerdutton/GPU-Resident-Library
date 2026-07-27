@@ -6,6 +6,7 @@
 #include <cuda_runtime.h>
 #include "ntt.h"
 #include "intt.h"
+#include "keyswitch.h"
 namespace gpufhe {
 namespace {
 uint64_t mm(uint64_t a,uint64_t b,uint64_t q){return(uint64_t)(((unsigned __int128)a*b)%q);}
@@ -60,5 +61,20 @@ void pt_to_eval_host(std::vector<uint64_t>& out, const std::vector<int64_t>& m,
         xf(c,n,q,root[t],false);
         std::copy(c.begin(),c.end(),out.begin()+(size_t)t*n);
     }
+}
+// Full homomorphic rotation: sigma_k on (c0,c1), keyswitch sigma(c1) with the
+// rotation key in Krot, output (sigma(c0)+ba0, ba1). k must match Krot's sOld.
+void rotate_ct_host(std::vector<uint64_t>& c0, std::vector<uint64_t>& c1,
+                    uint32_t k, const KeySwitchConstants& Krot,
+                    uint32_t towers, uint32_t n,
+                    const std::vector<uint64_t>& mod, const std::vector<uint64_t>& root)
+{
+    automorphism_eval_host(c0,towers,n,k,mod,root);
+    automorphism_eval_host(c1,towers,n,k,mod,root);
+    auto R=keyswitch_core_resident(c1,Krot);
+    for(uint32_t t=0;t<towers;++t){ uint64_t q=mod[t];
+        for(uint32_t kk=0;kk<n;++kk){ size_t x=(size_t)t*n+kk;
+            uint64_t s2=c0[x]+R.ba0[x]; c0[x]=(s2>=q)?s2-q:s2; } }
+    c1=R.ba1;
 }
 } // namespace gpufhe
