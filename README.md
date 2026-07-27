@@ -82,6 +82,12 @@ tensor + relin, matching the GPU pipeline op-for-op (4-tower context; the
 default FLEXIBLEAUTO 5-tower config gives 11.3× — the result is robust across
 configurations).
 
+**Batch-size sweep (N = 8→64):** GPU per-op cost is flat (4.2–5.5 ms/op) —
+the RTX 2060 saturates by N≈16, and larger batches queue rather than add
+throughput. The speedup holds at 9–14× across the sweep, with run-to-run
+variation dominated by CPU-side thermal noise, not the GPU. VRAM is not the
+limit at these parameters; SM/bandwidth saturation is.
+
 ### Benchmark methodology
 
 All GPU/CPU comparisons construct operands **outside** the timed region (an
