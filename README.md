@@ -44,6 +44,7 @@ exactly the expected result).
 | Native keygen (constants, RLWE key, relin key) | decryption-identity validated |
 | Encrypt / Decrypt | round-trip exact (after Δ scaling) |
 | **Full EvalMult (composed)** | **numerically exact end-to-end** |
+| **Full EvalMult + rescale (composed, resident)** | **numerically exact end-to-end** |
 
 ## Performance (RTX 2060 Max-Q, ring 32768)
 
@@ -88,6 +89,16 @@ throughput. The speedup holds at 9–14× across the sweep, with run-to-run
 variation dominated by CPU-side thermal noise, not the GPU. VRAM is not the
 limit at these parameters; SM/bandwidth saturation is.
 
+**Complete leveled multiply (tensor + relin + rescale), N=16:**
+
+| | GPU | CPU (EvalMult + Rescale) | Result |
+|---|---|---|---|
+| Per-op cost | 5.50 ms | 58.28 ms | **GPU 10.6× faster** |
+
+The full pipeline — including the resident rescale — is numerically gated: an
+encrypted product decrypts to exactly the expected polynomial at the
+post-rescale scale (`test_evalmult_rescale`, maxerr = 0).
+
 ### Benchmark methodology
 
 All GPU/CPU comparisons construct operands **outside** the timed region (an
@@ -104,11 +115,8 @@ primitive against OpenFHE; benchmarks under `bench/`.
 
 ## What's next (optional)
 
-- Fold rescale into the composed EvalMult benchmark.
-- Sweep batch size (N=32/64/128) and ring dimension to find device saturation —
-  the 11× at N=16 is likely not the peak.
-- Batch per-tower kernel launches into single grid-spanning launches (the next
-  launch-overhead lever).
+- Batch per-tower kernel launches into grid-spanning launches, and CUDA graphs
+  (~10–20% combined; the pipeline is near the card's bandwidth floor).
 - Complex canonical encode/decode for real message packing.
 - Bootstrapping for unbounded depth.
 

@@ -63,6 +63,10 @@ int main(int argc,char**argv){
     for(uint32_t t=0;t<sizeQlP;++t){uint64_t q=modQP[t],P=1%q;for(uint32_t j=0;j<sizeP;++j)P=mm(P,modQP[sizeQ+j]%q,q);PModq_QP[t]=P;}
     gpufhe::evalkeygen_host(K,KPqp.s,KPqp.pkA,KPqp.pkB,PModq_QP,modQP,rootQP,ns,3.19,202);
 
+    std::vector<uint64_t> rs1(sizeQ-1),rs2(sizeQ-1);
+    { const auto&a=cp->GetqlInvModq(0); const auto&b=cp->GetQlQlInvModqlDivqlModq(0);
+      for(uint32_t t=0;t<sizeQ-1;++t){ rs1[t]=a[t].ConvertToInt(); rs2[t]=b[t].ConvertToInt(); } }
+
     auto C=gpufhe::ks_context_create(K);
     std::vector<gpufhe::DeviceKSWork> W(N);
     std::vector<cudaStream_t> streams(N);
@@ -73,11 +77,12 @@ int main(int argc,char**argv){
     const size_t T=(size_t)sizeQ*n;
     auto rb=[&](){std::vector<uint64_t>v(T);for(uint32_t t=0;t<sizeQ;++t)for(uint32_t k=0;k<n;++k)v[(size_t)t*n+k]=rng()%mod[t];return v;};
     uint64_t* d_mods; cudaMalloc(&d_mods,sizeQ*8); cudaMemcpy(d_mods,mod.data(),sizeQ*8,cudaMemcpyHostToDevice);
-    struct Chain{uint64_t *c0a,*c1a,*c0b,*c1b,*t0,*t1,*t2,*ba0,*ba1,*r0,*r1;};
+    struct Chain{uint64_t *c0a,*c1a,*c0b,*c1b,*t0,*t1,*t2,*ba0,*ba1,*r0,*r1,*scr,*drp;};
     std::vector<Chain> ch(N);
     for(uint32_t c=0;c<N;++c){ auto&x=ch[c];
         for(uint64_t** p : {&x.c0a,&x.c1a,&x.c0b,&x.c1b,&x.t0,&x.t1,&x.t2,&x.ba0,&x.ba1,&x.r0,&x.r1})
             cudaMalloc(p,T*8);
+        cudaMalloc(&x.scr,(size_t)n*8); cudaMalloc(&x.drp,(size_t)n*8);
         auto h=rb(); cudaMemcpy(x.c0a,h.data(),T*8,cudaMemcpyHostToDevice);
         h=rb(); cudaMemcpy(x.c1a,h.data(),T*8,cudaMemcpyHostToDevice);
         h=rb(); cudaMemcpy(x.c0b,h.data(),T*8,cudaMemcpyHostToDevice);
@@ -89,7 +94,9 @@ int main(int argc,char**argv){
         for(uint32_t c=0;c<N;++c){ auto&x=ch[c];
             LaunchTensor(x.c0a,x.c1a,x.c0b,x.c1b,x.t0,x.t1,x.t2,d_mods,sizeQ,n,streams[c]);
             gpufhe::keyswitch_resident(x.t2,x.ba0,x.ba1,C,W[c],streams[c]);
-            LaunchCombine(x.r0,x.r1,x.t0,x.t1,x.ba0,x.ba1,d_mods,sizeQ,n,streams[c]); }
+            LaunchCombine(x.r0,x.r1,x.t0,x.t1,x.ba0,x.ba1,d_mods,sizeQ,n,streams[c]);
+            gpufhe::rescale_resident_raw(x.r0,sizeQ,C,rs1,rs2,x.scr,x.drp,streams[c]);
+            gpufhe::rescale_resident_raw(x.r1,sizeQ,C,rs1,rs2,x.scr,x.drp,streams[c]); }
         cudaDeviceSynchronize();
         return std::chrono::duration<double,std::milli>(clk::now()-t0).count(); };
 
@@ -98,7 +105,7 @@ int main(int argc,char**argv){
     std::vector<Ciphertext<DCRTPoly>> ca(N),cb(N);
     for(uint32_t c=0;c<N;++c){ ca[c]=cc->Encrypt(kp.publicKey,mkpt()); cb[c]=cc->Encrypt(kp.publicKey,mkpt()); }
     auto run_cpu=[&](){ auto t0=clk::now();
-        for(uint32_t c=0;c<N;++c){ auto r=cc->EvalMult(ca[c],cb[c]); (void)r; }
+        for(uint32_t c=0;c<N;++c){ auto r=cc->EvalMult(ca[c],cb[c]); cc->RescaleInPlace(r); }
         return std::chrono::duration<double,std::milli>(clk::now()-t0).count(); };
 
     run_gpu(); run_cpu();  // warmup
@@ -106,14 +113,14 @@ int main(int argc,char**argv){
     for(uint32_t r=0;r<reps;++r){ double gt=run_gpu(), ct=run_cpu();
         g.push_back(gt); cv.push_back(ct); d.push_back(gt-ct); }
     auto ci=boot(d);
-    std::cout<<"BATCH FULL EvalMult (tensor+RESIDENT relin+combine) N="<<N<<" ring="<<n<<" towers="<<sizeQ<<"\n";
+    std::cout<<"BATCH FULL EvalMult+RESCALE (tensor+resident relin+combine+resident rescale) N="<<N<<" ring="<<n<<" towers="<<sizeQ<<"\n";
     std::cout<<"  gpu batch = "<<median(g)<<" ms  ("<<median(g)/N<<" ms/op)\n";
     std::cout<<"  cpu batch = "<<median(cv)<<" ms  ("<<median(cv)/N<<" ms/op)\n";
     std::cout<<"  gpu-cpu median = "<<median(d)<<" ms  95% CI ["<<ci.first<<", "<<ci.second<<"]\n";
     std::cout<<"  => "<<((ci.second<0)?"GPU FASTER":(ci.first>0)?"GPU SLOWER":"inconclusive")<<" ("
              <<median(cv)/median(g)<<"x)\n";
     for(uint32_t c=0;c<N;++c){ gpufhe::ks_work_destroy(W[c]); cudaStreamDestroy(streams[c]);
-        auto&x=ch[c]; for(uint64_t* p:{x.c0a,x.c1a,x.c0b,x.c1b,x.t0,x.t1,x.t2,x.ba0,x.ba1,x.r0,x.r1})cudaFree(p); }
+        auto&x=ch[c]; for(uint64_t* p:{x.c0a,x.c1a,x.c0b,x.c1b,x.t0,x.t1,x.t2,x.ba0,x.ba1,x.r0,x.r1,x.scr,x.drp})cudaFree(p); }
     gpufhe::ks_context_destroy(C); cudaFree(d_mods);
     return 0;
 }
