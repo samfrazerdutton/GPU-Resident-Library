@@ -62,6 +62,12 @@ struct KeySwitchResult {
 // Full Hybrid KeySwitchCore, host-orchestrated over device kernels.
 // aTowers = input poly (cv.back()) as sizeQl*n eval-form host data.
 // Root tables are built internally per modulus (cached).
+void compute_keyswitch_constants(
+    KeySwitchConstants& K,
+    const std::vector<uint64_t>& moduliQ,
+    const std::vector<uint64_t>& moduliP,
+    uint32_t numPart);
+
 KeySwitchResult keyswitch_core_resident(
     const std::vector<uint64_t>& aTowers, const KeySwitchConstants& K);
 
