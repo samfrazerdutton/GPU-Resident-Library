@@ -4,6 +4,8 @@
 #include "basis_convert.h"
 #include "ks_fastcore.h"
 #include "moddown.h"
+#include "switch_modulus.h"
+#include "rescale.h"
 #include <cstring>
 #include <stdexcept>
 
@@ -163,6 +165,25 @@ void keyswitch_resident(const uint64_t* d_a, uint64_t* d_ba0, uint64_t* d_ba1,
     };
     moddown(W.d_res0, d_ba0);
     moddown(W.d_res1, d_ba1);
+}
+
+void rescale_resident_raw(uint64_t* d_c, uint32_t towers,
+                          const DeviceKSContext& C,
+                          const std::vector<uint64_t>& s1, const std::vector<uint64_t>& s2,
+                          uint64_t* d_scratch, uint64_t* d_drop, cudaStream_t s)
+{
+    const uint32_t n=C.n; if(towers<2) return;
+    const uint32_t last=towers-1;
+    uint64_t qLast=C.qModHost[last]; int rl=row_of(C,qLast);
+    cudaMemcpyAsync(d_drop, d_c+(size_t)last*n, (size_t)n*8, cudaMemcpyDeviceToDevice, s);
+    LaunchINTT_GS(d_drop, C.d_ir[rl], C.d_ip[rl], n, qLast, C.ninv[rl], C.ninv_p[rl], s);
+    for(uint32_t t=0;t<last;++t){
+        uint64_t qi=C.qModHost[t]; int r=row_of(C,qi);
+        cudaMemcpyAsync(d_scratch, d_drop, (size_t)n*8, cudaMemcpyDeviceToDevice, s);
+        LaunchSwitchModulus(d_scratch, qLast, qi, n, s);
+        LaunchNTT_CT(d_scratch, C.d_fr[r], C.d_fp[r], n, qi, s);
+        LaunchRescaleFuse(d_c+(size_t)t*n, d_scratch, s1[t], s2[t], qi, n, s);
+    }
 }
 
 } // namespace gpufhe

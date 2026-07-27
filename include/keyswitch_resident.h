@@ -43,6 +43,14 @@ void ks_work_destroy(DeviceKSWork& W);
 // Fully resident Hybrid keyswitch: d_a (sizeQl*n eval, DEVICE) -> d_ba0/d_ba1
 // (sizeQl*n, DEVICE, preallocated by caller). Pure kernel launches + DtoD
 // copies on `s`; no malloc, no host transfer. Caller syncs the stream.
+// Resident rescale on a raw component buffer (towers*n, eval): drop the last
+// tower, fuse into survivors. s1/s2 = OpenFHE's qlInvModq / QlQlInvModqlDivqlModq
+// at the current level. scratch/drop = n-sized device buffers.
+void rescale_resident_raw(uint64_t* d_c, uint32_t towers,
+                          const DeviceKSContext& C,
+                          const std::vector<uint64_t>& s1, const std::vector<uint64_t>& s2,
+                          uint64_t* d_scratch, uint64_t* d_drop, cudaStream_t s);
+
 void keyswitch_resident(const uint64_t* d_a, uint64_t* d_ba0, uint64_t* d_ba1,
                         const DeviceKSContext& C, DeviceKSWork& W, cudaStream_t s);
 
