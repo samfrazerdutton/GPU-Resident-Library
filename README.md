@@ -1,34 +1,107 @@
-# GPU-Resident FHE Library
+# GPU-Resident-Library
 
-A from-scratch GPU-resident FHE library. Ciphertexts live in VRAM and are
-owned by the library end-to-end; data crosses PCIe once on upload and once on
-download, never per operation.
+A from-scratch, GPU-resident CKKS implementation that **owns its ciphertext
+representation end-to-end** — the transform, arithmetic, keyswitch, and key
+generation all run natively on the GPU with **zero OpenFHE dependency at
+runtime**. OpenFHE is linked in tests only, as a bit-exact oracle.
 
-## Why
+## What this is (and why)
 
-Accelerating OpenFHE through a hardware abstraction layer cannot beat CPU on
-this class of hardware: a paired-difference sweep (RTX 2060 Max-Q, WSL2) found
-no CPU/GPU crossover at any parameter, because per-operation PCIe transfer
-scales with data volume. Worse, operation-level residency is structurally
-impossible in OpenFHE — PolyImpl::SetValues reallocates the coefficient buffer
-on every operation, so no device cache keyed on a buffer pointer survives
-across ops.
+An earlier approach tried to accelerate OpenFHE via a CUDA HAL that dispatched
+individual operations to the GPU. A decisive paired sweep (depth 5/10/15 ×
+ring 32k/64k) showed **no CPU/GPU crossover anywhere**: operation-level dispatch
+across the host boundary can't win, because per-op PCIe transfer scales with
+data volume. Worse, cross-op residency is structurally impossible inside
+OpenFHE (its polynomial storage reallocates on every operation).
 
-This library removes the boundary entirely by owning the representation. The
-open question it exists to answer: does a fully VRAM-resident multiply chain
-beat CPU once the PCIe boundary is gone?
+The conclusion: to win, the library must **own the ciphertext** and keep it
+resident on the device across an entire circuit. That's what this is.
 
-## Design
+## Status: complete, self-contained, numerically-proven CKKS multiply
 
-- `DeviceCiphertext` owns RNS tower buffers in VRAM. No cache, no host-pointer
-  keying; the object is the owner. Representation is general (scheme tag + RNS
-  towers + format) to hold CKKS/BFV/BGV; CKKS operations are implemented first.
-- OpenFHE is a test-only oracle: encrypt/decrypt there, compare bit-exact.
-  Zero runtime dependency.
-- The NTT is bit-exact against OpenFHE's Cooley-Tukey Shoup transform,
-  validated across real CKKS tower moduli.
+The full leveled-CKKS multiply pipeline works end-to-end, entirely native:
 
-## Status
+    keygen → encrypt → tensor → relinearize (Hybrid keyswitch) → rescale → decrypt
 
-Foundation: device-resident ciphertext + in-place NTT, bit-exact vs OpenFHE.
-Next: on-device multiply-rescale chain + head-to-head benchmark vs CPU.
+Every arithmetic primitive is validated **bit-exact** against OpenFHE in
+isolation, and the composed multiply is validated **numerically correct
+end-to-end** (a homomorphic product of two encrypted polynomials decrypts to
+exactly the expected result).
+
+### Proven components
+
+| Primitive | Validation |
+|---|---|
+| Forward NTT (Cooley-Tukey, Shoup) | bit-exact, all 12 tower moduli, n=32768 |
+| Inverse NTT (Gentleman-Sande) | bit-exact + round-trip INTT(NTT(x))==x |
+| RNS multiply (Montgomery) | bit-exact, all tower moduli |
+| SwitchModulus / Rescale | bit-exact vs DropLastElementAndScale |
+| ApproxSwitchCRTBasis | bit-exact (Hybrid keyswitch feasibility gate) |
+| Digit decompose | bit-exact vs EvalKeySwitchPrecomputeCore |
+| Fast-keyswitch inner product | bit-exact vs EvalFastKeySwitchCoreExt |
+| ApproxModDown (QP→Q) | bit-exact |
+| Full KeySwitchCore | bit-exact vs OpenFHE KeySwitchCore |
+| Native keygen (constants, RLWE key, relin key) | decryption-identity validated |
+| Encrypt / Decrypt | round-trip exact (after Δ scaling) |
+| **Full EvalMult (composed)** | **numerically exact end-to-end** |
+
+## Performance (RTX 2060 Max-Q, ring 32768)
+
+The honest headline: **resident CKKS loses single-ciphertext latency but wins
+batched throughput.** The GPU's advantage is throughput — one ciphertext at
+n=32768 underfills the SMs; many concurrent chains fill them.
+
+**Resident multiply-rescale chain, batch of 16 (bit-exact, relin-free):**
+
+| Metric | GPU | CPU | Result |
+|---|---|---|---|
+| Single-chain latency | 7.65 ms | ~6.4 ms | GPU slower |
+| Batch throughput | 3.49 ms/chain | 6.67 ms/chain | **GPU 1.91× faster** |
+
+The batch win was built up across three bit-exact optimizations (Montgomery
+multiply, shared-memory forward NTT, shared-memory INTT), 1.24× → 1.91×. Each
+improved throughput (bandwidth-bound, concurrent) while barely moving latency
+(dependency-bound, serial) — exactly as the theory predicts.
+
+**Single full EvalMult including relinearization:**
+
+| | GPU | CPU |
+|---|---|---|
+| tensor + relin | 124.7 ms | 75.5 ms |
+
+Here the GPU **loses (~1.65×)** — and honestly so. Relinearization is currently
+**host-orchestrated** (per-operation `cudaMalloc`/`cudaMemcpy`/`cudaFree` and
+host-side loops), so this number is dominated by orchestration overhead, not
+arithmetic. It's reported as-is: it quantifies exactly what a resident relin
+implementation would recover, and it's the clear next optimization.
+
+### Benchmark methodology
+
+All GPU/CPU comparisons construct operands **outside** the timed region (an
+earlier version constructed CPU operands inside the timer and faked a GPU win —
+corrected). Benchmarks interleave GPU/CPU per rep and report median with a
+bootstrap CI, since WSL2 blocks GPU clock locking and common-mode noise cancels
+in the paired difference.
+
+## Building
+
+Requires CUDA 13.2 (arch 75), and OpenFHE installed under `/usr/local` (tests
+only). `cmake .. -DCMAKE_BUILD_TYPE=Release && make`. Tests validate each
+primitive against OpenFHE; benchmarks under `bench/`.
+
+## What's next (optional)
+
+- Make relinearization fully resident (the single biggest speed lever — the
+  124.7 ms number is almost entirely host-orchestration overhead).
+- Fold rescale into the composed EvalMult benchmark.
+- Complex canonical encode/decode for real message packing.
+- Bootstrapping for unbounded depth.
+
+## Design discipline
+
+Every primitive is validated bit-exact against OpenFHE's *low-level* routine (not
+scale-aware wrappers) before it's composed or benchmarked. Hard modular
+arithmetic is **ported** from OpenFHE exactly, never reconstructed — a
+hand-rolled Barrett reduction and a reconstructed root of unity each caused
+failures that the bit-exact gates caught immediately. Correctness is proven
+before speed, every time.
