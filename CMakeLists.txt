@@ -22,6 +22,7 @@ add_library(gpufhe STATIC
   kernels/rescale.cu
   kernels/basis_convert.cu
   kernels/ks_fastcore.cu
+  kernels/moddown.cu
 )
 find_package(CUDAToolkit REQUIRED)
 target_include_directories(gpufhe PUBLIC include)
@@ -57,6 +58,7 @@ gpufhe_test(test_rescale_resident tests/test_rescale_resident.cpp)
 gpufhe_test(test_basis_convert tests/test_basis_convert.cpp)
 gpufhe_test(test_decompose tests/test_decompose.cpp)
 gpufhe_test(test_ks_fastcore tests/test_ks_fastcore.cpp)
+gpufhe_test(test_moddown tests/test_moddown.cpp)
 gpufhe_test(bench_resident_chain bench/bench_resident_chain.cpp)
 gpufhe_test(bench_batch bench/bench_batch.cpp)
 gpufhe_test(test_mult_barrett tests/test_mult_barrett.cpp)
