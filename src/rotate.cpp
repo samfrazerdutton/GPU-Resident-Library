@@ -47,4 +47,18 @@ void automorphism_eval_host(std::vector<uint64_t>& v, uint32_t towers, uint32_t 
         std::copy(o.begin(),o.end(),v.begin()+(size_t)t*n);
     }
 }
+// Embed an encoded integer-coeff poly into towers*n EVAL form (per tower:
+// center-embed mod q, NTT).
+void pt_to_eval_host(std::vector<uint64_t>& out, const std::vector<int64_t>& m,
+                     uint32_t towers, uint32_t n, const std::vector<uint64_t>& mod,
+                     const std::vector<uint64_t>& root)
+{
+    out.resize((size_t)towers*n);
+    for(uint32_t t=0;t<towers;++t){ uint64_t q=mod[t];
+        std::vector<uint64_t> c(n);
+        for(uint32_t k=0;k<n;++k){ long v=(long)m[k]; c[k]=(uint64_t)((v%(long)q+(long)q)%(long)q); }
+        xf(c,n,q,root[t],false);
+        std::copy(c.begin(),c.end(),out.begin()+(size_t)t*n);
+    }
+}
 } // namespace gpufhe
