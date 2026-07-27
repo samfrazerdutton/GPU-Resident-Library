@@ -39,8 +39,9 @@ void ntt_tower(std::vector<uint64_t>&h,uint32_t n,uint64_t q,uint64_t root){
 // key. Requires: s over QP (sizeQlP*n eval), pubkey (pkA,pkB) over QP, the
 // PModq value per Q tower (K.pInvModq's sibling -- pass P mod q_i), moduli+roots
 // for QP. Writes evalKeyTowers = sizeQlP.
-void evalkeygen_host(KeySwitchConstants& K,
-                     const std::vector<uint64_t>& sQP,        // sizeQlP*n eval (s extended to QP)
+void evalkeygen_host_sold(KeySwitchConstants& K,
+                     const std::vector<uint64_t>& sQP,
+                     const std::vector<uint64_t>& sOld,       // the key being switched (eval, QP)
                      const std::vector<uint64_t>& pkA_QP,     // sizeQlP*n eval
                      const std::vector<uint64_t>& pkB_QP,
                      const std::vector<uint64_t>& PModq_QP,   // P mod (each QP modulus) -- but P*s2 only added in Q range
@@ -53,10 +54,7 @@ void evalkeygen_host(KeySwitchConstants& K,
     K.evalKeyTowers=sizeQlP;
     K.av.assign(numPart,{}); K.bv.assign(numPart,{});
 
-    // s2 = s*s (pointwise eval, over QP)
-    std::vector<uint64_t> s2(sQP.size());
-    for(uint32_t t=0;t<sizeQlP;++t){ uint64_t q=modQP[t];
-        for(uint32_t k=0;k<n;++k) s2[(size_t)t*n+k]=mulmod(sQP[(size_t)t*n+k],sQP[(size_t)t*n+k],q); }
+    const std::vector<uint64_t>& s2 = sOld;   // generalized: caller supplies the switched key
 
     std::mt19937_64 rng(seed);
     std::normal_distribution<double> gauss(0.0,sigma);
@@ -95,6 +93,23 @@ void evalkeygen_host(KeySwitchConstants& K,
             }
         }
     }
+}
+
+// relin wrapper: sOld = s^2
+void evalkeygen_host(KeySwitchConstants& K,
+                     const std::vector<uint64_t>& sQP,
+                     const std::vector<uint64_t>& pkA_QP,
+                     const std::vector<uint64_t>& pkB_QP,
+                     const std::vector<uint64_t>& PModq_QP,
+                     const std::vector<uint64_t>& modQP,
+                     const std::vector<uint64_t>& rootQP,
+                     uint64_t ns, double sigma, uint64_t seed)
+{
+    const uint32_t n=K.n, sizeQlP=(uint32_t)modQP.size();
+    std::vector<uint64_t> s2(sQP.size());
+    for(uint32_t t=0;t<sizeQlP;++t){ uint64_t q=modQP[t];
+        for(uint32_t k=0;k<n;++k) s2[(size_t)t*n+k]=mulmod(sQP[(size_t)t*n+k],sQP[(size_t)t*n+k],q); }
+    evalkeygen_host_sold(K,sQP,s2,pkA_QP,pkB_QP,PModq_QP,modQP,rootQP,ns,sigma,seed);
 }
 
 } // namespace gpufhe

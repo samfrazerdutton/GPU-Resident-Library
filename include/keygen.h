@@ -11,6 +11,11 @@ KeyPairHost keygen_host(uint32_t n, const std::vector<uint64_t>& moduli,
                         uint64_t seed);
 
 struct KeySwitchConstants; // fwd
+void evalkeygen_host_sold(struct KeySwitchConstants& K,
+    const std::vector<uint64_t>& sQP, const std::vector<uint64_t>& sOld,
+    const std::vector<uint64_t>& pkA_QP, const std::vector<uint64_t>& pkB_QP,
+    const std::vector<uint64_t>& PModq_QP, const std::vector<uint64_t>& modQP,
+    const std::vector<uint64_t>& rootQP, uint64_t ns, double sigma, uint64_t seed);
 void evalkeygen_host(struct KeySwitchConstants& K,
     const std::vector<uint64_t>& sQP, const std::vector<uint64_t>& pkA_QP,
     const std::vector<uint64_t>& pkB_QP, const std::vector<uint64_t>& PModq_QP,
