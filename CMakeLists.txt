@@ -20,6 +20,7 @@ add_library(gpufhe STATIC
   src/keygen.cpp
   src/evalkeygen.cpp
   src/encdec.cpp
+  src/keyswitch_resident.cpp
   kernels/ntt_ct.cu
   kernels/rns_arith.cu
   kernels/intt_ct.cu
@@ -28,6 +29,7 @@ add_library(gpufhe STATIC
   kernels/basis_convert.cu
   kernels/ks_fastcore.cu
   kernels/moddown.cu
+  kernels/tensor.cu
 )
 find_package(CUDAToolkit REQUIRED)
 target_include_directories(gpufhe PUBLIC include)
@@ -70,6 +72,7 @@ gpufhe_test(test_keygen tests/test_keygen.cpp)
 gpufhe_test(test_evalkeygen tests/test_evalkeygen.cpp)
 gpufhe_test(test_encdec tests/test_encdec.cpp)
 gpufhe_test(test_evalmult tests/test_evalmult.cpp)
+gpufhe_test(test_ks_resident tests/test_ks_resident.cpp)
 gpufhe_test(bench_resident_chain bench/bench_resident_chain.cpp)
 gpufhe_test(bench_batch bench/bench_batch.cpp)
 gpufhe_test(bench_evalmult bench/bench_evalmult.cpp)
