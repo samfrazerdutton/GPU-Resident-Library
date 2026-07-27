@@ -63,17 +63,22 @@ multiply, shared-memory forward NTT, shared-memory INTT), 1.24× → 1.91×. Eac
 improved throughput (bandwidth-bound, concurrent) while barely moving latency
 (dependency-bound, serial) — exactly as the theory predicts.
 
-**Single full EvalMult including relinearization:**
+**Batched full EvalMult (tensor + resident relinearization), N=16:**
 
-| | GPU | CPU |
-|---|---|---|
-| tensor + relin | 124.7 ms | 75.5 ms |
+| | GPU | CPU (OpenFHE EvalMult) | Result |
+|---|---|---|---|
+| Per-op cost | 5.59 ms | 62.9 ms | **GPU ~11× faster** |
 
-Here the GPU **loses (~1.65×)** — and honestly so. Relinearization is currently
-**host-orchestrated** (per-operation `cudaMalloc`/`cudaMemcpy`/`cudaFree` and
-host-side loops), so this number is dominated by orchestration overhead, not
-arithmetic. It's reported as-is: it quantifies exactly what a resident relin
-implementation would recover, and it's the clear next optimization.
+This is the headline. Relinearization is the most expensive CKKS operation on
+CPU (~60 of the 62.9 ms), and it's dense, parallel modular arithmetic — exactly
+where batched GPU execution wins most. The keyswitch runs **fully resident**:
+all constants, eval-key material, and root tables are uploaded once at setup;
+each operation is pure kernel launches and device-to-device copies on a stream,
+with zero mallocs or host transfers. (An earlier host-orchestrated version of
+the same keyswitch cost 124.7 ms/op — residency recovered all of it.)
+
+The comparison is verified under FIXEDMANUAL scaling so OpenFHE's EvalMult does
+exactly tensor + relin, matching the GPU pipeline op-for-op.
 
 ### Benchmark methodology
 
@@ -91,9 +96,11 @@ primitive against OpenFHE; benchmarks under `bench/`.
 
 ## What's next (optional)
 
-- Make relinearization fully resident (the single biggest speed lever — the
-  124.7 ms number is almost entirely host-orchestration overhead).
 - Fold rescale into the composed EvalMult benchmark.
+- Sweep batch size (N=32/64/128) and ring dimension to find device saturation —
+  the 11× at N=16 is likely not the peak.
+- Batch per-tower kernel launches into single grid-spanning launches (the next
+  launch-overhead lever).
 - Complex canonical encode/decode for real message packing.
 - Bootstrapping for unbounded depth.
 
