@@ -15,6 +15,7 @@ endif()
 add_library(gpufhe STATIC
   src/device_ciphertext.cpp
   src/ckks_ops.cpp
+  src/keyswitch.cpp
   kernels/ntt_ct.cu
   kernels/rns_arith.cu
   kernels/intt_ct.cu
@@ -59,6 +60,7 @@ gpufhe_test(test_basis_convert tests/test_basis_convert.cpp)
 gpufhe_test(test_decompose tests/test_decompose.cpp)
 gpufhe_test(test_ks_fastcore tests/test_ks_fastcore.cpp)
 gpufhe_test(test_moddown tests/test_moddown.cpp)
+gpufhe_test(test_keyswitch tests/test_keyswitch.cpp)
 gpufhe_test(bench_resident_chain bench/bench_resident_chain.cpp)
 gpufhe_test(bench_batch bench/bench_batch.cpp)
 gpufhe_test(test_mult_barrett tests/test_mult_barrett.cpp)
