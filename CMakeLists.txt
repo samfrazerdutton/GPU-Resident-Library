@@ -23,6 +23,7 @@ add_library(gpufhe STATIC
   src/encode.cpp
   src/rotate.cpp
   src/ptops.cpp
+  src/params.cpp
   src/keyswitch_resident.cpp
   kernels/ntt_ct.cu
   kernels/rns_arith.cu
@@ -83,6 +84,8 @@ gpufhe_test(test_packed_evalmult tests/test_packed_evalmult.cpp)
 gpufhe_test(test_rotate tests/test_rotate.cpp)
 gpufhe_test(test_ptops tests/test_ptops.cpp)
 gpufhe_test(test_lintrans tests/test_lintrans.cpp)
+gpufhe_test(test_native_params tests/test_native_params.cpp)
+gpufhe_test(test_native_e2e tests/test_native_e2e.cpp)
 gpufhe_test(bench_resident_chain bench/bench_resident_chain.cpp)
 gpufhe_test(bench_batch bench/bench_batch.cpp)
 gpufhe_test(bench_evalmult bench/bench_evalmult.cpp)
