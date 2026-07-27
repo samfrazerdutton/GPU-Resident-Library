@@ -60,9 +60,45 @@ void compute_keyswitch_constants(
     // ModDown Barrett mu per Q tower = floor(2^128 / q_i)
     K.mdBMuLo.resize(sizeQ); K.mdBMuHi.resize(sizeQ);
     for(uint32_t i=0;i<sizeQ;++i){ unsigned __int128 mu=(~(unsigned __int128)0)/moduliQ[i];
-        // floor(2^128/q): use the identity floor((2^128-1)/q) then correct
-        // (2^128-1)/q == 2^128/q unless q | 2^128 (never, q odd prime), so ok.
         K.mdBMuLo[i]=(uint64_t)mu; K.mdBMuHi[i]=(uint64_t)(mu>>64); }
+
+    // ---- Decompose families (per part), full sublevel (l=0), matching what
+    // keyswitch_core_resident consumes. Part p owns towers [alpha*p, +sizePart).
+    K.sizePart.resize(numPart); K.sizeCompl.resize(numPart); K.startIdx.resize(numPart);
+    K.partSrcMod.resize(numPart); K.partComplMod.resize(numPart);
+    K.partQHatInv.resize(numPart); K.partQHatInvPrec.resize(numPart);
+    K.partQHatModp.resize(numPart); K.partBMuLo.resize(numPart); K.partBMuHi.resize(numPart);
+    for(uint32_t part=0; part<numPart; ++part){
+        uint32_t startIdx=alpha*part;
+        uint32_t sizePart=(sizeQ>startIdx+alpha)?alpha:(sizeQ-startIdx);
+        K.startIdx[part]=startIdx; K.sizePart[part]=sizePart;
+        // source moduli = this part's Q towers
+        std::vector<uint64_t> src(sizePart);
+        for(uint32_t i=0;i<sizePart;++i) src[i]=moduliQ[startIdx+i];
+        K.partSrcMod[part]=src;
+        // PartQHatInvModq[i] = (partQ/q_i)^{-1} mod q_i (full sublevel)
+        K.partQHatInv[part].resize(sizePart); K.partQHatInvPrec[part].resize(sizePart);
+        for(uint32_t i=0;i<sizePart;++i){ uint64_t q=src[i];
+            uint64_t QHat=prod_mod(src,q,(int)i);       // (partQ/q_i) mod q_i
+            K.partQHatInv[part][i]=invmod(QHat,q);
+            K.partQHatInvPrec[part][i]=precon(K.partQHatInv[part][i],q); }
+        // complement basis = all OTHER Q towers (not this part) + all P towers.
+        // Order must match OpenFHE's GetParamsComplPartQ(sizeQ-1,part):
+        //   first the non-part Q towers in index order, then the P towers.
+        std::vector<uint64_t> compl_mod;
+        for(uint32_t i=0;i<sizeQ;++i) if(i<startIdx || i>=startIdx+sizePart) compl_mod.push_back(moduliQ[i]);
+        for(uint32_t j=0;j<sizeP;++j) compl_mod.push_back(moduliP[j]);
+        uint32_t sizeCompl=(uint32_t)compl_mod.size();
+        K.sizeCompl[part]=sizeCompl; K.partComplMod[part]=compl_mod;
+        // PartQHatModp[i][j] = (partQ/q_i) mod compl_j   [sizePart x sizeCompl]
+        K.partQHatModp[part].resize((size_t)sizePart*sizeCompl);
+        for(uint32_t i=0;i<sizePart;++i)for(uint32_t j=0;j<sizeCompl;++j)
+            K.partQHatModp[part][(size_t)i*sizeCompl+j]=prod_mod(src, compl_mod[j], (int)i);
+        // complement Barrett mu = floor(2^128 / compl_j)
+        K.partBMuLo[part].resize(sizeCompl); K.partBMuHi[part].resize(sizeCompl);
+        for(uint32_t j=0;j<sizeCompl;++j){ unsigned __int128 mu=(~(unsigned __int128)0)/compl_mod[j];
+            K.partBMuLo[part][j]=(uint64_t)mu; K.partBMuHi[part][j]=(uint64_t)(mu>>64); }
+    }
 }
 
 } // namespace gpufhe

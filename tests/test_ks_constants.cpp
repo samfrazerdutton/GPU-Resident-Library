@@ -41,6 +41,27 @@ int main(){
         unsigned __int128 mine=((unsigned __int128)K.mdBMuHi[i]<<64)|K.mdBMuLo[i];
         if(mine!=r){ if(bad<5)std::cout<<"  ModqBMu["<<i<<"] differs\n"; ++bad; } }
 
+    // ---- decompose families per part vs OpenFHE ----
+    for(uint32_t part=0; part<numPart; ++part){
+        uint32_t sizePart=K.sizePart[part], sizeCompl=K.sizeCompl[part];
+        const auto& qhi=cp->GetPartQlHatInvModq(part,sizePart-1);
+        const auto& qhip=cp->GetPartQlHatInvModqPrecon(part,sizePart-1);
+        const auto& qmp=cp->GetPartQlHatModp(sizeQ-1,part);
+        auto paramsCompl=cp->GetParamsComplPartQ(sizeQ-1,part);
+        uint32_t refCompl=paramsCompl->GetParams().size();
+        if(refCompl!=sizeCompl){ std::cout<<"  part "<<part<<" sizeCompl mine="<<sizeCompl<<" ref="<<refCompl<<"\n"; ++bad; continue; }
+        for(uint32_t i=0;i<sizePart;++i){
+            if(K.partQHatInv[part][i]!=qhi[i].ConvertToInt()){ if(bad<8)std::cout<<"  part"<<part<<" QHatInv["<<i<<"] mine="<<K.partQHatInv[part][i]<<" ref="<<qhi[i].ConvertToInt()<<"\n"; ++bad; }
+            if(K.partQHatInvPrec[part][i]!=qhip[i].ConvertToInt()){ ++bad; } }
+        // complement moduli order
+        for(uint32_t j=0;j<sizeCompl;++j){ uint64_t rc=paramsCompl->GetParams()[j]->GetModulus().ConvertToInt();
+            if(K.partComplMod[part][j]!=rc){ if(bad<8)std::cout<<"  part"<<part<<" complMod["<<j<<"] mine="<<K.partComplMod[part][j]<<" ref="<<rc<<"\n"; ++bad; } }
+        // PartQHatModp [sizePart][sizeCompl]
+        for(uint32_t i=0;i<sizePart;++i)for(uint32_t j=0;j<sizeCompl;++j){
+            uint64_t r=qmp[i][j].ConvertToInt();
+            if(K.partQHatModp[part][(size_t)i*sizeCompl+j]!=r){ if(bad<8)std::cout<<"  part"<<part<<" QHatModp["<<i<<"]["<<j<<"] mine="<<K.partQHatModp[part][(size_t)i*sizeCompl+j]<<" ref="<<r<<"\n"; ++bad; } }
+    }
+
     std::cout<<"sizeQ="<<sizeQ<<" sizeP="<<sizeP<<" numPart="<<numPart<<"\n";
     if(bad==0){ std::cout<<"[PASS] native ModDown constants bit-exact vs OpenFHE\n"; return 0; }
     std::cout<<"[FAIL] "<<bad<<" mismatches\n"; return 1;
