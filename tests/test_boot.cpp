@@ -40,7 +40,7 @@ using cd=std::complex<double>;
 int main(){
     const uint32_t HW=64;
     gpufhe::set_secret_hamming_weight(HW);   // sparse secret: pins K independent of n
-    const uint32_t n=4096,S=n/2,sizeQ=30,sizeP=9,M=2*n; const uint64_t ns=1;
+    const uint32_t n=1024,S=n/2,sizeQ=30,sizeP=9,M=2*n; const uint64_t ns=1;
     // dnum: alpha=10 towers per part => 3 parts at tw=30 (was alpha=2 => 15 parts).
     // P must cover a part (10x50=500 bits), hence sizeP=9 x 60 = 540 bits.
     // At n=32768 this is what makes a rotation key ~61MB instead of ~251MB.
