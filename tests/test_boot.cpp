@@ -37,7 +37,7 @@ static uint64_t smu(uint64_t a,uint64_t b,uint64_t q){return a>=b?a-b:a+q-b;}
 using cd=std::complex<double>;
 
 int main(){
-    const uint32_t n=1024,S=n/2,sizeQ=22,sizeP=2,M=2*n; const uint64_t ns=1;
+    const uint32_t n=1024,S=n/2,sizeQ=30,sizeP=2,M=2*n; const uint64_t ns=1;
     auto npFor=[](uint32_t tw)->uint32_t{ return tw<=2?1u:(tw+1)/2; };
     std::vector<uint64_t> mod,modP;
     gpufhe::native_primes(mod,1,60,n,{});
@@ -112,8 +112,9 @@ int main(){
             unsigned long long k=(unsigned long long)(((unsigned __int128)diff*inv(mod[0]%q1,q1))%q1);
             x += (unsigned __int128)mod[0]*k;
             aref[j] = (x>half)? -(__int128)(prod-x) : (__int128)x; }
+        std::vector<int64_t> dec1; gpufhe::decrypt_host(dec1,c0,c1,KP1.s,n,mod1,root1);
         uint32_t bad=0; __int128 maxI=0;
-        for(uint32_t j=0;j<n;++j){ __int128 d=aref[j]-(__int128)mz[j];
+        for(uint32_t j=0;j<n;++j){ __int128 d=aref[j]-(__int128)dec1[j];
             if(d%(__int128)q0!=0) ++bad;
             else { __int128 I=d/(__int128)q0; if(I<0)I=-I; if(I>maxI)maxI=I; } }
         std::cout<<"ModRaise: congruence mismatches = "<<bad<<" (want 0), max|I| = "<<(double)(long long)maxI<<"\n";
