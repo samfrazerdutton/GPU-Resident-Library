@@ -38,7 +38,9 @@ static uint64_t smu(uint64_t a,uint64_t b,uint64_t q){return a>=b?a-b:a+q-b;}
 using cd=std::complex<double>;
 
 int main(){
-    const uint32_t n=1024,S=n/2,sizeQ=30,sizeP=9,M=2*n; const uint64_t ns=1;
+    const uint32_t HW=64;
+    gpufhe::set_secret_hamming_weight(HW);   // sparse secret: pins K independent of n
+    const uint32_t n=4096,S=n/2,sizeQ=30,sizeP=9,M=2*n; const uint64_t ns=1;
     // dnum: alpha=10 towers per part => 3 parts at tw=30 (was alpha=2 => 15 parts).
     // P must cover a part (10x50=500 bits), hence sizeP=9 x 60 = 540 bits.
     // At n=32768 this is what makes a rotation key ~61MB instead of ~251MB.
@@ -94,7 +96,14 @@ int main(){
     auto mkKidx=[&](uint32_t k,uint32_t seed)->gpufhe::KeySwitchConstants{
         return atLevel(rotFull(k,seed),sizeQ); };
 
-    const double Delta_in=std::pow(2.0,54), Delta_pt=std::pow(2.0,40);
+    // Encoded coeffs scale as |mz| ~ Delta_in*|z|*sqrt(2/N), so at fixed
+    // Delta_in the per-coefficient signal SHRINKS like 1/sqrt(n) -- and the
+    // EvalMod signal is 2pi*mz/q0, so SNR degrades with the ring. Scale
+    // Delta_in with sqrt(n) to hold |mz| constant. Ceiling is the sine
+    // approximation: need mz/q0 << 1 (cubic term), and we sit at ~2^-9 here
+    // versus a tolerance around 0.02, so there is ample room.
+    const double Delta_in=std::pow(2.0,54)*std::sqrt((double)n/1024.0)*8.0;
+    const double Delta_pt=std::pow(2.0,40);
 
     // ---- message, encrypt at the BOTTOM level (q0 only)
     std::vector<cd> z(S);
@@ -338,7 +347,23 @@ int main(){
         auto Kl=buildK(A.tw); rescIP(o.c0,o.c1,A.tw,Kl);
         o.tw=A.tw-1; o.scale=A.scale*Delta_w/(double)mod[A.tw-1]; return o; };
 
-    const uint32_t rDbl=8, degC=10;
+    // K = max|a_k/q0| grows like sqrt(n): uniform ternary s has ~n/3 nonzero
+    // coeffs, so |I| ~ sqrt(n) and K doubles per 4x ring (29.2@n=1024,
+    // 69.6@n=4096). The double-angle count must track it, since Chebyshev is
+    // only valid for |y|<=1 and y = 2pi(x-1/4)/2^r:
+    //     r = ceil(log2(2*pi*(K+0.25)))
+    // Costs one extra level per 4x ring. (A SPARSE ternary secret, fixed
+    // hamming weight ~64, would pin K independent of n — that is why standard
+    // CKKS bootstrapping uses one.)
+    // K = max|a_k/q0| is set by the SECRET's hamming weight, NOT by n: |I| ~
+    // sqrt(h). Uniform ternary (h ~ n/3) makes K grow like sqrt(n) -- 29.2@1024,
+    // 69.6@4096 -- but with fixed h it is n-independent (measured 9.49 at h=64).
+    // Using the sqrt(n) law with a sparse secret picks r=9 where 7 suffices, and
+    // each surplus doubling amplifies error ~4x (that cost a run: err 1.30).
+    const double Kbud=(HW? 2.5*std::sqrt((double)HW) : 40.0*std::sqrt((double)n/1024.0));
+    const uint32_t rDbl=(uint32_t)std::ceil(std::log2(2*M_PI*(Kbud+0.25))), degC=10;
+    std::cout<<"K budget="<<Kbud<<" -> "<<rDbl<<" double-angle steps; depth="
+             <<(1+1+(degC-1)+1+rDbl+1)<<" levels, output tw="<<((int)sizeQ-(int)(4+degC+rDbl))<<"\n";
     const double Aaff=2*M_PI/std::pow(2.0,rDbl), Baff=-(M_PI/2)/std::pow(2.0,rDbl);
     std::vector<double> cc(degC+1,0.0);
     { const uint32_t NQ=4*(degC+1);

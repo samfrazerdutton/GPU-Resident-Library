@@ -15,6 +15,7 @@
 #include <cuda_runtime.h>
 
 namespace gpufhe {
+namespace { uint32_t g_hw=0; }   // 0 = uniform ternary (default)
 namespace {
 uint64_t mulmod(uint64_t a,uint64_t b,uint64_t q){return (uint64_t)(((unsigned __int128)a*b)%q);}
 uint64_t addmod(uint64_t a,uint64_t b,uint64_t q){uint64_t s=a+b; return s>=q?s-q:s;}
@@ -49,6 +50,8 @@ void ntt_tower(std::vector<uint64_t>& h,uint32_t n,uint64_t q,const Tab& T){
 
 // Generate a keypair over Q. Returns s, and pubkey (b,a), all sizeQ*n eval form.
 // moduli/roots borrowed. sigma = Gaussian stddev (OpenFHE default 3.19).
+void set_secret_hamming_weight(uint32_t h){ g_hw=h; }
+
 KeyPairHost keygen_host(uint32_t n, const std::vector<uint64_t>& moduli,
                         const std::vector<uint64_t>& roots, uint64_t ns, double sigma,
                         uint64_t seed)
@@ -61,7 +64,22 @@ KeyPairHost keygen_host(uint32_t n, const std::vector<uint64_t>& moduli,
     // small signed integers, then CRT-embed + NTT into each tower. Same small
     // poly across towers (that's what CRT of a small integer poly means).
     std::vector<int> sc(n), ec(n);
-    for(uint32_t k=0;k<n;++k){ int r=(int)(rng()%3); sc[k]=r-1; }        // {-1,0,1}
+    if(g_hw==0){
+        for(uint32_t k=0;k<n;++k){ int r=(int)(rng()%3); sc[k]=r-1; }    // uniform {-1,0,1}
+    } else {
+        // SPARSE ternary: exactly g_hw nonzero coeffs, random positions/signs.
+        // Uniform ternary has ~n/3 nonzeros, so |I| in ModRaise grows like
+        // sqrt(n) and K=max|a_k/q0| doubles per 4x ring (29.2@1024 ->
+        // 69.6@4096), which forces more double-angle steps AND shrinks the
+        // message's share of the EvalMod range. Fixed hamming weight pins K
+        // independent of n. Sampled BEFORE the tower loop, so the same seed
+        // still yields the same secret at any tower count (the reduced-level
+        // decrypt trick depends on that).
+        std::vector<uint32_t> idx(n); for(uint32_t k=0;k<n;++k) idx[k]=k;
+        for(uint32_t k=n-1;k>0;--k){ uint32_t j=(uint32_t)(rng()%(k+1)); std::swap(idx[k],idx[j]); }
+        uint32_t h=(g_hw<n)?g_hw:n;
+        for(uint32_t k=0;k<h;++k) sc[idx[k]] = (rng()&1ull)? 1 : -1;
+    }
     for(uint32_t k=0;k<n;++k){ long e=std::lround(gauss(rng)); ec[k]=(int)e; }
     // uniform a is independent per tower (uniform mod q_i).
 
