@@ -110,22 +110,40 @@ KeySwitchResult keyswitch_core_resident(
     // QlP modulus per tower: Q towers use qMod, P towers use pMod.
     auto qlp_mod=[&](uint32_t i)->uint64_t{ return (i<sizeQl)? K.qMod[i] : K.pMod[i-sizeQl]; };
     std::vector<uint64_t> res0((size_t)sizeQlP*n), res1((size_t)sizeQlP*n);
-    for (uint32_t i=0;i<sizeQlP;++i){
-        uint64_t q=qlp_mod(i);
-        uint32_t idx=(i>=sizeQl)? i+delta : i;   // eval-key tower index
-        std::vector<uint64_t> z(n,0);
-        uint64_t *d_o0=up(z),*d_o1=up(z);
-        for(uint32_t part=0;part<K.numPart;++part){
-            std::vector<uint64_t> hd(digits[part].begin()+(size_t)i*n, digits[part].begin()+(size_t)(i+1)*n);
-            std::vector<uint64_t> hb(K.bv[part].begin()+(size_t)idx*n, K.bv[part].begin()+(size_t)(idx+1)*n);
-            std::vector<uint64_t> ha(K.av[part].begin()+(size_t)idx*n, K.av[part].begin()+(size_t)(idx+1)*n);
-            uint64_t *dd=up(hd),*db=up(hb),*da=up(ha);
-            LaunchKSMultAcc(d_o0,d_o1,dd,db,da,q,n,0); cudaDeviceSynchronize();
-            cudaFree(dd);cudaFree(db);cudaFree(da);
+    {
+        // PERF: hoist every allocation and upload key+digits ONCE. The previous
+        // version did 3 cudaMalloc + 3 memcpy + a full cudaDeviceSynchronize +
+        // 3 cudaFree per (tower,part) -- ~5300 CUDA calls per keyswitch at
+        // sizeQlP=32/numPart=15, which measured ~1.2 s per rotation. Now it is
+        // pure kernel launches over preloaded buffers with ONE sync.
+        const size_t DP=(size_t)sizeQlP*n, KP=(size_t)K.evalKeyTowers*n, OT=(size_t)sizeQlP*n;
+        uint64_t *d_dig=nullptr,*d_ka=nullptr,*d_kb=nullptr,*d_o0=nullptr,*d_o1=nullptr;
+        cudaMalloc(&d_dig,(size_t)K.numPart*DP*8);
+        cudaMalloc(&d_ka ,(size_t)K.numPart*KP*8);
+        cudaMalloc(&d_kb ,(size_t)K.numPart*KP*8);
+        cudaMalloc(&d_o0 ,OT*8);
+        cudaMalloc(&d_o1 ,OT*8);
+        for(uint32_t p=0;p<K.numPart;++p){
+            cudaMemcpy(d_dig+(size_t)p*DP,digits[p].data(),DP*8,cudaMemcpyHostToDevice);
+            cudaMemcpy(d_ka +(size_t)p*KP,K.av[p].data(),  KP*8,cudaMemcpyHostToDevice);
+            cudaMemcpy(d_kb +(size_t)p*KP,K.bv[p].data(),  KP*8,cudaMemcpyHostToDevice);
         }
-        cudaMemcpy(res0.data()+(size_t)i*n,d_o0,B,cudaMemcpyDeviceToHost);
-        cudaMemcpy(res1.data()+(size_t)i*n,d_o1,B,cudaMemcpyDeviceToHost);
-        cudaFree(d_o0);cudaFree(d_o1);
+        cudaMemset(d_o0,0,OT*8);
+        cudaMemset(d_o1,0,OT*8);
+        for (uint32_t i=0;i<sizeQlP;++i){
+            uint64_t q=qlp_mod(i);
+            uint32_t idx=(i>=sizeQl)? i+delta : i;   // eval-key tower index
+            for(uint32_t part=0;part<K.numPart;++part){
+                LaunchKSMultAcc(d_o0+(size_t)i*n, d_o1+(size_t)i*n,
+                                d_dig+(size_t)part*DP+(size_t)i*n,
+                                d_kb +(size_t)part*KP+(size_t)idx*n,
+                                d_ka +(size_t)part*KP+(size_t)idx*n, q, n, 0);
+            }
+        }
+        cudaDeviceSynchronize();
+        cudaMemcpy(res0.data(),d_o0,OT*8,cudaMemcpyDeviceToHost);
+        cudaMemcpy(res1.data(),d_o1,OT*8,cudaMemcpyDeviceToHost);
+        cudaFree(d_dig);cudaFree(d_ka);cudaFree(d_kb);cudaFree(d_o0);cudaFree(d_o1);
     }
 
     // === STAGE 3b: ApproxModDown QlP -> Q on each of res0, res1 ===
