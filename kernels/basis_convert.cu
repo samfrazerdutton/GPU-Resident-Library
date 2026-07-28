@@ -73,21 +73,30 @@ __global__ void approx_switch_kernel(
     uint32_t ri = blockIdx.x * blockDim.x + threadIdx.x;
     if (ri >= n) return;
 
-    // sizeP accumulators. sizeP is small (P basis ~1-4 towers); cap for locals.
-    unsigned __int128 sum[8];
-    for (uint32_t j = 0; j < sizeP; ++j) sum[j] = 0;
+    // BUGFIX: the target basis is NOT small. ModDown passes sizeP = sizeQl (the
+    // full Q tower count); decompose passes the complement basis
+    // (sizeQ - sizePart + sizeP). The old fixed sum[8] was written past its end
+    // whenever the target exceeded 8 towers -- undefined behaviour: exact for
+    // <=8 (every earlier gate), silent corruption above. Chunk the target so
+    // the bound always holds.
+    const uint32_t CHUNK = 8;
+    for (uint32_t j0 = 0; j0 < sizeP; j0 += CHUNK) {
+        uint32_t jn = (sizeP - j0 < CHUNK) ? (sizeP - j0) : CHUNK;
+        unsigned __int128 sum[8];
+        for (uint32_t j = 0; j < jn; ++j) sum[j] = 0;
 
-    for (uint32_t i = 0; i < sizeQ; ++i) {
-        uint64_t xi = shoup_mulmod(src[(size_t)i*n + ri],
-                                   QHatInvModq[i], QHatInvModqPrecon[i], q[i]);
-        const uint64_t* row = QHatModp + (size_t)i*sizeP;
-        for (uint32_t j = 0; j < sizeP; ++j)
-            sum[j] += (unsigned __int128)xi * row[j];
-    }
+        for (uint32_t i = 0; i < sizeQ; ++i) {
+            uint64_t xi = shoup_mulmod(src[(size_t)i*n + ri],
+                                       QHatInvModq[i], QHatInvModqPrecon[i], q[i]);
+            const uint64_t* row = QHatModp + (size_t)i*sizeP;
+            for (uint32_t j = 0; j < jn; ++j)
+                sum[j] += (unsigned __int128)xi * row[j0 + j];
+        }
 
-    for (uint32_t j = 0; j < sizeP; ++j) {
-        unsigned __int128 mu = ((unsigned __int128)mu_hi[j] << 64) | mu_lo[j];
-        dst[(size_t)j*n + ri] = barrett_u128_mod_u64(sum[j], p[j], mu);
+        for (uint32_t j = 0; j < jn; ++j) {
+            unsigned __int128 mu = ((unsigned __int128)mu_hi[j0+j] << 64) | mu_lo[j0+j];
+            dst[(size_t)(j0+j)*n + ri] = barrett_u128_mod_u64(sum[j], p[j0+j], mu);
+        }
     }
 }
 
