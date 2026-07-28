@@ -25,8 +25,8 @@ static uint64_t am(uint64_t a,uint64_t b,uint64_t q){uint64_t s=a+b;return s>=q?
 using cd=std::complex<double>;
 
 int main(){
-    const uint32_t n=1024,S=n/2,sizeQF=15,sizeP=2; const uint64_t ns=1;
-    auto npFor=[](uint32_t tw)->uint32_t{ return tw<=2?1u:(tw+1)/2; };   // alpha = 2
+    const uint32_t n=1024,S=n/2,sizeQF=30,sizeP=9; const uint64_t ns=1;
+    auto npFor=[](uint32_t tw)->uint32_t{ uint32_t a=10; return (tw+a-1)/a; };  // alpha = 10
     std::vector<uint64_t> mod,modP;
     gpufhe::native_primes(mod,1,60,n,{});
     { std::vector<uint64_t> mids; gpufhe::native_primes(mids,sizeQF-1,50,n,mod); for(auto m:mids)mod.push_back(m); }
@@ -53,7 +53,7 @@ int main(){
     for(uint32_t i=0;i<S;++i) xin[i]={0.6*std::sin(0.02*i),0};
 
     uint32_t fails=0;
-    for(uint32_t tw : {15u,13u,11u,9u,7u,5u,3u}){
+    for(uint32_t tw : {30u,29u,21u,20u,19u,11u,10u,9u,3u}){
         std::vector<uint64_t> ml(mod.begin(),mod.begin()+tw),rl(root.begin(),root.begin()+tw);
         // level constants, but the SAME key, with delta = sizeQF - tw
         gpufhe::KeySwitchConstants K; K.n=n;

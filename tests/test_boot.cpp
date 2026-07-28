@@ -153,20 +153,27 @@ int main(){
     // ---- C2S matrices [A B] = P * inv([W; conj W])
     std::vector<uint64_t> rk(S); {uint64_t r=1;for(uint32_t k=0;k<S;++k){rk[k]=r;r=(r*5)%M;}}
     const uint32_t N=n;
-    std::vector<cd> Wf((size_t)N*N);
-    for(uint32_t k=0;k<S;++k)for(uint32_t j=0;j<N;++j){
-        cd w=std::polar(1.0, M_PI*(double)((j*rk[k])%M)/(double)N);
-        Wf[(size_t)k*N+j]=w; Wf[(size_t)(k+S)*N+j]=std::conj(w); }
-    std::vector<cd> Inv((size_t)N*N,{0,0}); for(uint32_t i=0;i<N;++i)Inv[(size_t)i*N+i]={1,0};
-    for(uint32_t col=0;col<N;++col){
-        uint32_t piv=col; double best=std::abs(Wf[(size_t)col*N+col]);
-        for(uint32_t r=col+1;r<N;++r){double a=std::abs(Wf[(size_t)r*N+col]);if(a>best){best=a;piv=r;}}
-        if(piv!=col)for(uint32_t j=0;j<N;++j){std::swap(Wf[(size_t)col*N+j],Wf[(size_t)piv*N+j]);std::swap(Inv[(size_t)col*N+j],Inv[(size_t)piv*N+j]);}
-        cd d=Wf[(size_t)col*N+col];
-        for(uint32_t j=0;j<N;++j){Wf[(size_t)col*N+j]/=d;Inv[(size_t)col*N+j]/=d;}
-        for(uint32_t r=0;r<N;++r){ if(r==col)continue; cd f=Wf[(size_t)r*N+col]; if(std::abs(f)<1e-14)continue;
-            for(uint32_t j=0;j<N;++j){Wf[(size_t)r*N+j]-=f*Wf[(size_t)col*N+j];Inv[(size_t)r*N+j]-=f*Inv[(size_t)col*N+j];} } }
-    auto Aent=[&](uint32_t i,uint32_t c)->cd{ return Inv[(size_t)i*N+c]+cd{0,1}*Inv[(size_t)(i+S)*N+c]; };
+    // The rows of [W; conj W] are ORTHOGONAL: for two odd powers r,r',
+    // sum_j e^{i*pi*j(r-r')/N} = 0 (r-r' is even so the numerator vanishes) and
+    // = N when r=r'. So the matrix is sqrt(N)*unitary and its inverse is just
+    // (1/N)*conjugate transpose -- ANALYTIC, O(1) per entry, zero storage.
+    // The old NxN complex Gauss-Jordan was 3.5e13 ops and 17GB at n=32768.
+    auto Wrow=[&](uint32_t r,uint32_t j)->cd{        // row r, col j of [W; conj W]
+        uint32_t k=(r<S)? r : r-S;
+        cd w=std::polar(1.0, M_PI*(double)(((uint64_t)j*rk[k])%M)/(double)N);
+        return (r<S)? w : std::conj(w); };
+    auto Aent=[&](uint32_t i,uint32_t c)->cd{        // = Inv[i][c] + i*Inv[i+S][c]
+        return (std::conj(Wrow(c,i)) + cd{0,1}*std::conj(Wrow(c,i+S)))/(double)N; };
+    { // self-check: (Wf * Inv)[a][b] must be delta_ab
+      double offmax=0, diagerr=0;
+      for(uint32_t t=0;t<6;++t){
+        uint32_t a=(t*37)%N, b=(t*91+5)%N;
+        cd sd{0,0}, so{0,0};
+        for(uint32_t c=0;c<N;++c){ sd+=Wrow(a,c)*std::conj(Wrow(a,c))/(double)N;
+                                   so+=Wrow(a,c)*std::conj(Wrow(b,c))/(double)N; }
+        diagerr=std::max(diagerr,std::abs(sd-cd{1,0}));
+        if(a!=b) offmax=std::max(offmax,std::abs(so)); }
+      std::cout<<"analytic inverse self-check: diag err="<<diagerr<<" offdiag="<<offmax<<"\n"; }
 
     // ---- BSGS linear transform (46 keys, shared across branches)
     const uint32_t n1=32,n2=S/n1;
