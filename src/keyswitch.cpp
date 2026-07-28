@@ -78,38 +78,33 @@ KeySwitchResult keyswitch_core_resident(
         const uint32_t startIdx=K.startIdx[part], endIdx=startIdx+sizePart;
 
         // part's tower slice -> coeff via INTT
-        std::vector<uint64_t> partCoeff((size_t)sizePart*n);
+        // PERF: stage 2 stays RESIDENT. Was: download partCoeff, re-upload it,
+        // download complCoeff, then re-upload each of ~30 complement towers one
+        // at a time for the NTT. Now: one upload in, in-place transforms, one
+        // download out.
+        uint64_t *dsrc; cudaMalloc(&dsrc,(size_t)sizePart*n*8);
+        cudaMemcpy(dsrc,aTowers.data()+(size_t)startIdx*n,(size_t)sizePart*n*8,
+                   cudaMemcpyHostToDevice);
         for (uint32_t i=0;i<sizePart;++i){
             uint64_t q=K.partSrcMod[part][i]; DevTab&T=dev_tab(n,q,root_for(q));
-            std::vector<uint64_t> h(aTowers.begin()+(size_t)(startIdx+i)*n,
-                                    aTowers.begin()+(size_t)(startIdx+i+1)*n);
-            uint64_t *dx=up(h);
-            LaunchINTT_GS(dx,T.ir,T.ip,n,q,T.ninv,T.ninv_p,0);
-            cudaMemcpy(partCoeff.data()+(size_t)i*n,dx,B,cudaMemcpyDeviceToHost);
-            cudaFree(dx);
+            LaunchINTT_GS(dsrc+(size_t)i*n,T.ir,T.ip,n,q,T.ninv,T.ninv_p,0);
         }
-        // ApproxSwitchCRTBasis partQ -> complement
-        uint64_t *dsrc=up(partCoeff),
-                 *dqhi=up(K.partQHatInv[part]),*dqhip=up(K.partQHatInvPrec[part]),
+        // ApproxSwitchCRTBasis partQ -> complement (dsrc already resident)
+        uint64_t *dqhi=up(K.partQHatInv[part]),*dqhip=up(K.partQHatInvPrec[part]),
                  *dq=up(K.partSrcMod[part]),*dqmp=up(K.partQHatModp[part]),
                  *dp=up(K.partComplMod[part]),*dmlo=up(K.partBMuLo[part]),*dmhi=up(K.partBMuHi[part]);
         uint64_t* ddst; cudaMalloc(&ddst,(size_t)sizeCompl*n*8);
         LaunchApproxSwitchCRTBasis(dsrc,ddst,dqhi,dqhip,dq,dqmp,dp,dmlo,dmhi,sizePart,sizeCompl,n,0);
-        cudaDeviceSynchronize();
-        std::vector<uint64_t> complCoeff((size_t)sizeCompl*n);
-        cudaMemcpy(complCoeff.data(),ddst,(size_t)sizeCompl*n*8,cudaMemcpyDeviceToHost);
-        cudaFree(dsrc);cudaFree(dqhi);cudaFree(dqhip);cudaFree(dq);cudaFree(dqmp);
-        cudaFree(dp);cudaFree(dmlo);cudaFree(dmhi);cudaFree(ddst);
-        // NTT complement back to eval
-        std::vector<uint64_t> complEval((size_t)sizeCompl*n);
+        // NTT complement back to eval, in place on ddst
         for(uint32_t j=0;j<sizeCompl;++j){
             uint64_t q=K.partComplMod[part][j]; DevTab&T=dev_tab(n,q,root_for(q));
-            std::vector<uint64_t> h(complCoeff.begin()+(size_t)j*n, complCoeff.begin()+(size_t)(j+1)*n);
-            uint64_t *dx=up(h);
-            LaunchNTT_CT(dx,T.fr,T.fp,n,q,0);
-            cudaMemcpy(complEval.data()+(size_t)j*n,dx,B,cudaMemcpyDeviceToHost);
-            cudaFree(dx);
+            LaunchNTT_CT(ddst+(size_t)j*n,T.fr,T.fp,n,q,0);
         }
+        cudaDeviceSynchronize();
+        std::vector<uint64_t> complEval((size_t)sizeCompl*n);
+        cudaMemcpy(complEval.data(),ddst,(size_t)sizeCompl*n*8,cudaMemcpyDeviceToHost);
+        cudaFree(dsrc);cudaFree(dqhi);cudaFree(dqhip);cudaFree(dq);cudaFree(dqmp);
+        cudaFree(dp);cudaFree(dmlo);cudaFree(dmhi);cudaFree(ddst);
         // reassemble sizeQlP: [0,startIdx)=complEval[i]; [startIdx,endIdx)=a[i]; [endIdx,..)=complEval[i-sizePart]
         std::vector<uint64_t>& d=digits[part]; d.resize((size_t)sizeQlP*n);
         for(uint32_t i=0;i<sizeQlP;++i){
