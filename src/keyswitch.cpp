@@ -36,6 +36,23 @@ RootTab build_tab(uint32_t n, uint64_t q, uint64_t root){
 
 uint64_t* up(const std::vector<uint64_t>& h){ uint64_t* d; size_t B=h.size()*8;
     cudaMalloc(&d,B); cudaMemcpy(d,h.data(),B,cudaMemcpyHostToDevice); return d; }
+
+// PERF: root tables for a given (n,q) are IDENTICAL on every call, but the old
+// cache was function-local -- so build_tab (4n modmuls + 2n 128-bit divides)
+// re-ran and the tables were re-uploaded per transform, ~230 times per
+// bootstrap. Cache them on the DEVICE for the process lifetime instead.
+// (single-threaded use; concurrent first-touch would need a lock)
+struct DevTab { uint64_t *fr=nullptr,*fp=nullptr,*ir=nullptr,*ip=nullptr; uint64_t ninv=0,ninv_p=0; };
+DevTab& dev_tab(uint32_t n, uint64_t q, uint64_t root){
+    static std::map<std::pair<uint32_t,uint64_t>,DevTab> dcache;
+    auto key=std::make_pair(n,q);
+    auto it=dcache.find(key);
+    if(it!=dcache.end()) return it->second;
+    RootTab T=build_tab(n,q,root);
+    DevTab D; D.ninv=T.ninv; D.ninv_p=T.ninv_p;
+    D.fr=up(T.fr); D.fp=up(T.fp); D.ir=up(T.ir); D.ip=up(T.ip);
+    return dcache.emplace(key,D).first->second;
+}
 }
 
 KeySwitchResult keyswitch_core_resident(
@@ -63,13 +80,13 @@ KeySwitchResult keyswitch_core_resident(
         // part's tower slice -> coeff via INTT
         std::vector<uint64_t> partCoeff((size_t)sizePart*n);
         for (uint32_t i=0;i<sizePart;++i){
-            uint64_t q=K.partSrcMod[part][i]; RootTab&T=tab(q);
+            uint64_t q=K.partSrcMod[part][i]; DevTab&T=dev_tab(n,q,root_for(q));
             std::vector<uint64_t> h(aTowers.begin()+(size_t)(startIdx+i)*n,
                                     aTowers.begin()+(size_t)(startIdx+i+1)*n);
-            uint64_t *dx=up(h),*dir=up(T.ir),*dip=up(T.ip);
-            LaunchINTT_GS(dx,dir,dip,n,q,T.ninv,T.ninv_p,0); cudaDeviceSynchronize();
+            uint64_t *dx=up(h);
+            LaunchINTT_GS(dx,T.ir,T.ip,n,q,T.ninv,T.ninv_p,0);
             cudaMemcpy(partCoeff.data()+(size_t)i*n,dx,B,cudaMemcpyDeviceToHost);
-            cudaFree(dx);cudaFree(dir);cudaFree(dip);
+            cudaFree(dx);
         }
         // ApproxSwitchCRTBasis partQ -> complement
         uint64_t *dsrc=up(partCoeff),
@@ -86,12 +103,12 @@ KeySwitchResult keyswitch_core_resident(
         // NTT complement back to eval
         std::vector<uint64_t> complEval((size_t)sizeCompl*n);
         for(uint32_t j=0;j<sizeCompl;++j){
-            uint64_t q=K.partComplMod[part][j]; RootTab&T=tab(q);
+            uint64_t q=K.partComplMod[part][j]; DevTab&T=dev_tab(n,q,root_for(q));
             std::vector<uint64_t> h(complCoeff.begin()+(size_t)j*n, complCoeff.begin()+(size_t)(j+1)*n);
-            uint64_t *dx=up(h),*dr=up(T.fr),*dpp=up(T.fp);
-            LaunchNTT_CT(dx,dr,dpp,n,q,0); cudaDeviceSynchronize();
+            uint64_t *dx=up(h);
+            LaunchNTT_CT(dx,T.fr,T.fp,n,q,0);
             cudaMemcpy(complEval.data()+(size_t)j*n,dx,B,cudaMemcpyDeviceToHost);
-            cudaFree(dx);cudaFree(dr);cudaFree(dpp);
+            cudaFree(dx);
         }
         // reassemble sizeQlP: [0,startIdx)=complEval[i]; [startIdx,endIdx)=a[i]; [endIdx,..)=complEval[i-sizePart]
         std::vector<uint64_t>& d=digits[part]; d.resize((size_t)sizeQlP*n);
@@ -150,12 +167,12 @@ KeySwitchResult keyswitch_core_resident(
     auto moddown=[&](const std::vector<uint64_t>& res)->std::vector<uint64_t>{
         // P towers (high [sizeQl, sizeQlP)) -> coeff
         std::vector<uint64_t> pCoeff((size_t)sizeP*n);
-        for(uint32_t j=0;j<sizeP;++j){ uint64_t q=K.pMod[j]; RootTab&T=tab(q);
+        for(uint32_t j=0;j<sizeP;++j){ uint64_t q=K.pMod[j]; DevTab&T=dev_tab(n,q,root_for(q));
             std::vector<uint64_t> h(res.begin()+(size_t)(sizeQl+j)*n, res.begin()+(size_t)(sizeQl+j+1)*n);
-            uint64_t *dx=up(h),*dir=up(T.ir),*dip=up(T.ip);
-            LaunchINTT_GS(dx,dir,dip,n,q,T.ninv,T.ninv_p,0); cudaDeviceSynchronize();
+            uint64_t *dx=up(h);
+            LaunchINTT_GS(dx,T.ir,T.ip,n,q,T.ninv,T.ninv_p,0);
             cudaMemcpy(pCoeff.data()+(size_t)j*n,dx,B,cudaMemcpyDeviceToHost);
-            cudaFree(dx);cudaFree(dir);cudaFree(dip); }
+            cudaFree(dx); }
         // ApproxSwitchCRTBasis P -> Q
         uint64_t *dsrc=up(pCoeff),*dqhi=up(K.pHatInv),*dqhip=up(K.pHatInvPrec),
                  *dq=up(K.pMod),*dqmp=up(K.pHatModq),*dp=up(K.qMod),*dmlo=up(K.mdBMuLo),*dmhi=up(K.mdBMuHi);
@@ -167,15 +184,15 @@ KeySwitchResult keyswitch_core_resident(
         cudaFree(dsrc);cudaFree(dqhi);cudaFree(dqhip);cudaFree(dq);cudaFree(dqmp);cudaFree(dp);cudaFree(dmlo);cudaFree(dmhi);cudaFree(ddst);
         // NTT back + combine per Q tower
         std::vector<uint64_t> out((size_t)sizeQl*n);
-        for(uint32_t i=0;i<sizeQl;++i){ uint64_t q=K.qMod[i]; RootTab&T=tab(q);
+        for(uint32_t i=0;i<sizeQl;++i){ uint64_t q=K.qMod[i]; DevTab&T=dev_tab(n,q,root_for(q));
             std::vector<uint64_t> h(qSw.begin()+(size_t)i*n, qSw.begin()+(size_t)(i+1)*n);
-            uint64_t *dx=up(h),*dr=up(T.fr),*dpp=up(T.fp);
-            LaunchNTT_CT(dx,dr,dpp,n,q,0); cudaDeviceSynchronize();
+            uint64_t *dx=up(h);
+            LaunchNTT_CT(dx,T.fr,T.fp,n,q,0);
             std::vector<uint64_t> ha(res.begin()+(size_t)i*n, res.begin()+(size_t)(i+1)*n);
             uint64_t *da=up(ha),*dans; cudaMalloc(&dans,B);
-            LaunchModDownCombine(dans,da,dx,K.pInvModq[i],q,n,0); cudaDeviceSynchronize();
+            LaunchModDownCombine(dans,da,dx,K.pInvModq[i],q,n,0);
             cudaMemcpy(out.data()+(size_t)i*n,dans,B,cudaMemcpyDeviceToHost);
-            cudaFree(dx);cudaFree(dr);cudaFree(dpp);cudaFree(da);cudaFree(dans); }
+            cudaFree(dx);cudaFree(da);cudaFree(dans); }
         return out;
     };
 
