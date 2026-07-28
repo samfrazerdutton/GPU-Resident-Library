@@ -38,8 +38,11 @@ static uint64_t smu(uint64_t a,uint64_t b,uint64_t q){return a>=b?a-b:a+q-b;}
 using cd=std::complex<double>;
 
 int main(){
-    const uint32_t n=1024,S=n/2,sizeQ=30,sizeP=2,M=2*n; const uint64_t ns=1;
-    auto npFor=[](uint32_t tw)->uint32_t{ return tw<=2?1u:(tw+1)/2; };
+    const uint32_t n=1024,S=n/2,sizeQ=30,sizeP=9,M=2*n; const uint64_t ns=1;
+    // dnum: alpha=10 towers per part => 3 parts at tw=30 (was alpha=2 => 15 parts).
+    // P must cover a part (10x50=500 bits), hence sizeP=9 x 60 = 540 bits.
+    // At n=32768 this is what makes a rotation key ~61MB instead of ~251MB.
+    auto npFor=[](uint32_t tw)->uint32_t{ uint32_t a=10; return (tw+a-1)/a; };
     std::vector<uint64_t> mod,modP;
     gpufhe::native_primes(mod,1,60,n,{});
     { std::vector<uint64_t> mids; gpufhe::native_primes(mids,sizeQ-1,50,n,mod); for(auto m:mids)mod.push_back(m); }
@@ -63,9 +66,12 @@ int main(){
     for(uint32_t j=0;j<sizeP;++j){KREL.rootModList.push_back(modP[j]);KREL.rootValList.push_back(rootQP[sizeQ+j]);}
     gpufhe::evalkeygen_host(KREL,KPqp.s,KPqp.pkA,KPqp.pkB,PModq,modQP,rootQP,ns,3.19,202);
     std::map<uint32_t,gpufhe::KeySwitchConstants> KROT;
-    uint32_t nKeygen=1;
+    uint32_t nKeygen=1; double tKeygen=0,tC2S=0,tEM=0,tS2C=0;
+    auto NOW=[](){return std::chrono::steady_clock::now();};
+    auto EL=[](auto a){return std::chrono::duration<double>(std::chrono::steady_clock::now()-a).count();};
     auto rotFull=[&](uint32_t k,uint32_t seed)->const gpufhe::KeySwitchConstants&{
         auto it=KROT.find(k); if(it!=KROT.end())return it->second;
+        auto _t=NOW();
         std::vector<uint64_t> sA=KPqp.s;
         gpufhe::automorphism_eval_host(sA,sizeQlP,n,k,modQP,rootQP);
         gpufhe::KeySwitchConstants K; K.n=n;
@@ -73,7 +79,7 @@ int main(){
         for(uint32_t i=0;i<sizeQ;++i){K.rootModList.push_back(mod[i]);K.rootValList.push_back(root[i]);}
         for(uint32_t j=0;j<sizeP;++j){K.rootModList.push_back(modP[j]);K.rootValList.push_back(rootQP[sizeQ+j]);}
         gpufhe::evalkeygen_host_sold(K,KPqp.s,sA,KPqp.pkA,KPqp.pkB,PModq,modQP,rootQP,ns,3.19,seed);
-        ++nKeygen; KROT.emplace(k,std::move(K)); return KROT[k]; };
+        ++nKeygen; tKeygen+=EL(_t); KROT.emplace(k,std::move(K)); return KROT[k]; };
     auto atLevel=[&](const gpufhe::KeySwitchConstants& KF,uint32_t tw)->gpufhe::KeySwitchConstants{
         std::vector<uint64_t> ml(mod.begin(),mod.begin()+tw),rl(root.begin(),root.begin()+tw);
         gpufhe::KeySwitchConstants K; K.n=n;
@@ -197,8 +203,7 @@ int main(){
     // conj branch of the input
     std::vector<uint64_t> j0=R0,j1=R1;
     { auto Kc2=mkKidx(M-1,7300); gpufhe::rotate_ct_host(j0,j1,M-1,Kc2,sizeQ,n,mod,root); }
-    bsgsAdd(R0,R1,false);
-    bsgsAdd(j0,j1,true);
+    { auto _t=NOW(); bsgsAdd(R0,R1,false); bsgsAdd(j0,j1,true); tC2S=EL(_t); }
     std::cout<<"BSGS rotation keys built = "<<Kc.size()<<"\n";
 
     // one rescale -> declared scale q0*Delta_pt/qLast
@@ -254,7 +259,24 @@ int main(){
 
     auto mkKlvl=[&](uint32_t k,uint32_t tw,uint32_t seed)->gpufhe::KeySwitchConstants{
         return atLevel(rotFull(k,seed),tw); };
-    auto buildK=[&](uint32_t tw)->gpufhe::KeySwitchConstants{ return atLevel(KREL,tw); };
+    // CONTROL: regenerate the relin key FRESH at each level (no reuse) to
+    // separate "alpha=10 is broken" from "reuse across a numPart change is broken".
+    auto buildK=[&](uint32_t tw)->gpufhe::KeySwitchConstants{
+        std::vector<uint64_t> ml(mod.begin(),mod.begin()+tw),rl(root.begin(),root.begin()+tw);
+        std::vector<uint64_t> mq(ml); for(auto p:modP)mq.push_back(p);
+        std::vector<uint64_t> rq(rl); for(uint32_t j=0;j<sizeP;++j)rq.push_back(rootQP[sizeQ+j]);
+        auto sl=[&](const std::vector<uint64_t>&src){std::vector<uint64_t> d((size_t)(tw+sizeP)*n);
+            for(uint32_t t=0;t<tw;++t)std::copy(src.begin()+(size_t)t*n,src.begin()+(size_t)(t+1)*n,d.begin()+(size_t)t*n);
+            for(uint32_t j=0;j<sizeP;++j)std::copy(src.begin()+(size_t)(sizeQ+j)*n,src.begin()+(size_t)(sizeQ+j+1)*n,d.begin()+(size_t)(tw+j)*n);
+            return d;};
+        gpufhe::KeySwitchConstants K; K.n=n;
+        gpufhe::compute_keyswitch_constants(K,ml,modP,npFor(tw));
+        for(uint32_t i=0;i<tw;++i){K.rootModList.push_back(ml[i]);K.rootValList.push_back(rl[i]);}
+        for(uint32_t j=0;j<sizeP;++j){K.rootModList.push_back(modP[j]);K.rootValList.push_back(rootQP[sizeQ+j]);}
+        std::vector<uint64_t> PM(tw+sizeP);
+        for(uint32_t t=0;t<tw+sizeP;++t){uint64_t q=mq[t],P=1%q;for(uint32_t j=0;j<sizeP;++j)P=mmu(P,modP[j]%q,q);PM[t]=P;}
+        gpufhe::evalkeygen_host(K,sl(KPqp.s),sl(KPqp.pkA),sl(KPqp.pkB),PM,mq,rq,ns,3.19,202);
+        return K; };
     auto rescIP=[&](std::vector<uint64_t>&a0,std::vector<uint64_t>&a1,uint32_t tw,const gpufhe::KeySwitchConstants&Kx){
         auto Cl=gpufhe::ks_context_create(Kx);
         std::vector<uint64_t> s1,s2; {std::vector<uint64_t> sub(mod.begin(),mod.begin()+tw);
@@ -343,8 +365,10 @@ int main(){
     Ct ctR; ctR.c0=r0; ctR.c1=r1; ctR.tw=nt; ctR.scale=sOut;
     Ct ctI; ctI.c0=i0; ctI.c1=i1; ctI.tw=nt; ctI.scale=sOut;
     std::cout<<"EvalMod on both branches (depth "<<(1+ (degC-1) +1+rDbl)<<" levels each)...\n"<<std::flush;
+    auto _tem=NOW();
     Ct oR=evalMod(ctR, cd{Aaff/2.0,0});
     Ct oI=evalMod(ctI, cd{0,-Aaff/2.0});
+    tEM=EL(_tem);
     std::cout<<"  EvalMod out tw="<<oR.tw<<" scale=2^"<<std::log2(oR.scale)<<"\n";
     { std::vector<uint64_t> mo(mod.begin(),mod.begin()+oR.tw),ro(root.begin(),root.begin()+oR.tw);
       auto KO=gpufhe::keygen_host(n,mo,ro,ns,3.19,101);
@@ -386,8 +410,10 @@ int main(){
             if(g>0)gpufhe::rotate_ct_host(in0,in1,rotAmt(g*n1),kf(g*n1),tw,n,ml,rl);
             if(sfirst){sa0=in0;sa1=in1;sfirst=false;}
             else gpufhe::ct_add_ct_host(sa0,sa1,in0,in1,tw,n,ml);} };
-    bsgsAcc(oR,[&](uint32_t i,uint32_t c){return Went(i,c);});
-    bsgsAcc(oI,[&](uint32_t i,uint32_t c){return Went(i,c+S);});
+    { auto _t=NOW();
+      bsgsAcc(oR,[&](uint32_t i,uint32_t c){return Went(i,c);});
+      bsgsAcc(oI,[&](uint32_t i,uint32_t c){return Went(i,c+S);});
+      tS2C=EL(_t); }
     { auto Kd=buildK(twS); rescIP(sa0,sa1,twS,Kd); }
     uint32_t twF=twS-1;
     double sFinal=oR.scale*Delta_pt/(double)mod[twS-1];
@@ -402,6 +428,11 @@ int main(){
     std::cout<<"\n=== BOOTSTRAP RESULT ===\n";
     std::cout<<"evalkeygen calls total = "<<nKeygen<<" (was ~130 with per-level regeneration)\n";
     std::cout<<"bootstrap wall time = "<<secs<<" s\n";
+    std::cout<<"  keygen (48 keys) = "<<tKeygen<<" s\n";
+    std::cout<<"  C2S              = "<<tC2S<<" s\n";
+    std::cout<<"  EvalMod x2       = "<<tEM<<" s\n";
+    std::cout<<"  S2C              = "<<tS2C<<" s\n";
+    std::cout<<"  other            = "<<(secs-tC2S-tEM-tS2C)<<" s\n";
     std::cout<<"input level tw=1 (q0 only)  ->  output level tw="<<twF<<"\n";
     std::cout<<"final decode scale 2^"<<std::log2(Dfinal)<<"\n";
     std::cout<<"max slot err |boot(z) - z| = "<<eFin<<"\n";
