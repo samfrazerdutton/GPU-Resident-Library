@@ -216,10 +216,13 @@ int main(){
             if(first){acc0=in0;acc1=in1;first=false;}
             else gpufhe::ct_add_ct_host(acc0,acc1,in0,in1,sizeQ,n,mod);} };
 
-    // conj branch of the input
-    std::vector<uint64_t> j0=R0,j1=R1;
-    { auto Kc2=mkKidx(M-1,7300); gpufhe::rotate_ct_host(j0,j1,M-1,Kc2,sizeQ,n,mod,root); }
-    { auto _t=NOW(); bsgsAdd(R0,R1,false); bsgsAdd(j0,j1,true); tC2S=EL(_t); }
+    { auto _t=NOW(); bsgsAdd(R0,R1,false); tC2S=EL(_t); }
+      // NOTE: no conjugate branch. Because rk[c]=5^c = 1 (mod 4), we have
+      // zeta^(S*rk[c]) = i identically, so the B-branch factor 1 + i*i = 0
+      // while the A-branch factor is 1 + i*(-i) = 2. C2S is a PURE C-linear
+      // map y = A*z with A[i][c] = (2/N)*zeta^(-i*rk[c]) -- verified to 2.5e-15.
+      // The old code built conj(ct) and ran 31 baby-step rotations on a branch
+      // whose diagonals were then all skipped as zero. { tC2S=EL(_t); }
     std::cout<<"BSGS rotation keys built = "<<Kc.size()<<"\n";
 
     // one rescale -> declared scale q0*Delta_pt/qLast
