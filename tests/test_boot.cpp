@@ -225,28 +225,11 @@ int main(){
     std::map<uint64_t,gpufhe::KeySwitchConstants> KSC;
     auto keyAt=[&](uint32_t r,uint32_t tw)->gpufhe::KeySwitchConstants&{
         uint64_t kk=((uint64_t)r<<8)|tw; auto it=KSC.find(kk); if(it!=KSC.end())return it->second;
-        // FRESH key at this level, not a level view of the full-QP key: at
-        // alpha=10 a reused key tolerates only a <=1-tower partition mismatch,
-        // and the staged C2S runs at tw=sizeQ, sizeQ-1, sizeQ-2 where the last
-        // part is ragged by up to 9. (Same cause as the sizeQ=32 C2S failure.)
-        uint32_t kx=rotAmt(r);
-        std::vector<uint64_t> ml(mod.begin(),mod.begin()+tw),rl(root.begin(),root.begin()+tw);
-        std::vector<uint64_t> mq(ml); for(auto pp:modP)mq.push_back(pp);
-        std::vector<uint64_t> rq(rl); for(uint32_t j2=0;j2<sizeP;++j2)rq.push_back(rootQP[sizeQ+j2]);
-        auto sl=[&](const std::vector<uint64_t>&src){std::vector<uint64_t> d((size_t)(tw+sizeP)*n);
-            for(uint32_t t2=0;t2<tw;++t2)std::copy(src.begin()+(size_t)t2*n,src.begin()+(size_t)(t2+1)*n,d.begin()+(size_t)t2*n);
-            for(uint32_t j2=0;j2<sizeP;++j2)std::copy(src.begin()+(size_t)(sizeQ+j2)*n,src.begin()+(size_t)(sizeQ+j2+1)*n,d.begin()+(size_t)(tw+j2)*n);
-            return d;};
-        std::vector<uint64_t> sA=KPqp.s;
-        gpufhe::automorphism_eval_host(sA,sizeQlP,n,kx,modQP,rootQP);
-        gpufhe::KeySwitchConstants Kn; Kn.n=n;
-        gpufhe::compute_keyswitch_constants(Kn,ml,modP,npFor(tw));
-        for(uint32_t i2=0;i2<tw;++i2){Kn.rootModList.push_back(ml[i2]);Kn.rootValList.push_back(rl[i2]);}
-        for(uint32_t j2=0;j2<sizeP;++j2){Kn.rootModList.push_back(modP[j2]);Kn.rootValList.push_back(rootQP[sizeQ+j2]);}
-        std::vector<uint64_t> PM(tw+sizeP);
-        for(uint32_t t2=0;t2<tw+sizeP;++t2){uint64_t q2=mq[t2],P2=1%q2;for(uint32_t j2=0;j2<sizeP;++j2)P2=mmu(P2,modP[j2]%q2,q2);PM[t2]=P2;}
-        gpufhe::evalkeygen_host_sold(Kn,sl(KPqp.s),sl(sA),sl(KPqp.pkA),sl(KPqp.pkB),PM,mq,rq,ns,3.19,4000+r);
-        KSC.emplace(kk,std::move(Kn)); return KSC[kk]; };
+        // alpha=2 tolerates key reuse across levels (the last part mismatches by
+        // at most 1 tower); it is alpha=10 that breaks. So take a level VIEW of
+        // one full-QP key instead of regenerating -- fresh keys per level cost
+        // up to 105 keygens here with 14 parts.
+        KSC.emplace(kk,atLevel(rotFull(rotAmt(r),4000+r),tw)); return KSC[kk]; };
     auto rescaleAt=[&](std::vector<uint64_t>& a0,std::vector<uint64_t>& a1,uint32_t tw){
         std::vector<uint64_t> ml(mod.begin(),mod.begin()+tw),rl(root.begin(),root.begin()+tw);
         gpufhe::KeySwitchConstants Kd; Kd.n=n;
