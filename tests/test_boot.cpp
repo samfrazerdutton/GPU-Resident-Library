@@ -276,6 +276,8 @@ int main(){
             gpufhe::ct_mul_pt_host(t0,t1,dE,ctw,n,ml);
             if(fst){a0=t0;a1=t1;fst=false;} else gpufhe::ct_add_ct_host(a0,a1,t0,t1,ctw,n,ml); }
         rescaleAt(a0,a1,ctw);
+        std::cerr<<"    C2S stage "<<g<<" tw="<<ctw<<" parts="<<npFor(ctw)
+                 <<" diags="<<offs.size()<<" keys="<<KSC.size()<<" t="<<EL(_t)<<"s\n";
         csc=csc*dpt/(double)mod[ctw-1]; --ctw; cs0=a0; cs1=a1; }
       tC2S=EL(_t); }
     std::cout<<"C2S: "<<LST<<" FFT stages (radix 2^"<<RST<<"), "<<ndiagTot
@@ -514,6 +516,8 @@ int main(){
             gpufhe::ct_mul_pt_host(t0,t1,dE,stw,n,ml);
             if(fst){a0=t0;a1=t1;fst=false;} else gpufhe::ct_add_ct_host(a0,a1,t0,t1,stw,n,ml); }
         rescaleAt(a0,a1,stw);
+        std::cerr<<"    S2C stage "<<g<<" tw="<<stw<<" parts="<<npFor(stw)
+                 <<" diags="<<offs.size()<<" keys="<<KSC.size()<<" t="<<EL(_t)<<"s\n";
         ssc=ssc*dpt/(double)mod[stw-1]; --stw; sa0=a0; sa1=a1; }
       tS2C=EL(_t); }
     std::cout<<"S2C: "<<LST<<" FFT stages, "<<s2cdiag<<" diagonals vs "<<S<<" dense\n";
