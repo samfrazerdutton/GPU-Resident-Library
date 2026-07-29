@@ -463,43 +463,62 @@ int main(){
     // ---- S2C: z_i = sum_k W[i][k]*oR_k + sum_k W[i][k+S]*oI_k
     auto Went=[&](uint32_t i,uint32_t j)->cd{
         return std::polar(1.0, M_PI*(double)(((uint64_t)j*rk[i])%M)/(double)n); };
-    uint32_t twS=oR.tw; size_t TS=(size_t)twS*n;
-    std::vector<uint64_t> sa0(TS,0),sa1(TS,0); bool sfirst=true;
-    std::map<uint32_t,gpufhe::KeySwitchConstants> KS;
-    auto bsgsAcc=[&](const Ct& X,const std::function<cd(uint32_t,uint32_t)>& Ment){
-        uint32_t tw=X.tw; size_t TT=(size_t)tw*n;
-        std::vector<uint64_t> ml(mod.begin(),mod.begin()+tw),rl(root.begin(),root.begin()+tw);
-        auto kf=[&](uint32_t r)->gpufhe::KeySwitchConstants&{
-            auto it=KS.find(r); if(it!=KS.end())return it->second;
-            KS.emplace(r,mkKlvl(rotAmt(r),tw,5000+r)); return KS[r]; };
-        std::vector<std::vector<uint64_t>> B0(n1),B1(n1);
-        B0[0]=X.c0;B1[0]=X.c1;
-        for(uint32_t b=1;b<n1;++b){B0[b]=X.c0;B1[b]=X.c1;
-            gpufhe::rotate_ct_host(B0[b],B1[b],rotAmt(b),kf(b),tw,n,ml,rl);}
-        for(uint32_t g=0;g<n2;++g){
-            std::vector<uint64_t> in0(TT,0),in1(TT,0); bool ifst=true;
-            for(uint32_t b=0;b<n1;++b){
-                std::vector<cd> d(S); double nz=0;
-                for(uint32_t i=0;i<S;++i){uint32_t rr=(i+S-((g*n1)%S))%S,c=(i+b)%S;
-                    d[i]=Ment(rr,c); nz+=std::abs(d[i]);}
-                if(nz<1e-12)continue;
-                std::vector<int64_t> md; gpufhe::encode_host(md,d,n,Delta_pt);
-                std::vector<uint64_t> dE; gpufhe::pt_to_eval_host(dE,md,tw,n,ml,rl);
-                std::vector<uint64_t> t0=B0[b],t1=B1[b];
-                gpufhe::ct_mul_pt_host(t0,t1,dE,tw,n,ml);
-                if(ifst){in0=t0;in1=t1;ifst=false;}
-                else gpufhe::ct_add_ct_host(in0,in1,t0,t1,tw,n,ml);}
-            if(ifst)continue;
-            if(g>0)gpufhe::rotate_ct_host(in0,in1,rotAmt(g*n1),kf(g*n1),tw,n,ml,rl);
-            if(sfirst){sa0=in0;sa1=in1;sfirst=false;}
-            else gpufhe::ct_add_ct_host(sa0,sa1,in0,in1,tw,n,ml);} };
+    // ---- S2C via the FORWARD FFT stages (mirror of C2S): stage order runs
+    // L-1 -> 0, sub-stages high -> low, butterfly a +/- t*b. It consumes the
+    // bit-reversed order C2S produces, so no brev() indexing is needed.
+    // Both branches ride the SAME stages: fft(oR + i*oI) = fft(oR) + i*fft(oI),
+    // so the i is folded into the I-branch's first-stage diagonals -> the two
+    // merge during stage L-1 and the rest run on one ciphertext. Cost is L+1
+    // transform passes, depth L. Round trip S2C(C2S(z))=z gated at 9.6e-16.
+    auto applyMergedFwd=[&](std::vector<cd>& v,uint32_t g){
+        for(int st=(int)((g+1)*RST)-1; st>=(int)(g*RST); --st){
+            uint32_t h=S>>(st+1); std::vector<cd> o(S);
+            for(uint32_t base=0;base<S;base+=2*h)
+                for(uint32_t k=0;k<h;++k){
+                    cd a=v[base+k],b=v[base+k+h],t=twd(k,(uint32_t)st);
+                    o[base+k]=a+t*b; o[base+k+h]=a-t*b;}
+            v.swap(o);} };
+    auto stageDiagsFwd=[&](uint32_t g,std::vector<uint32_t>& offs,std::vector<std::vector<cd>>& dg){
+        std::vector<std::vector<cd>> acc(S); std::vector<uint8_t> used(S,0);
+        for(uint32_t jj=0;jj<S;++jj){
+            std::vector<cd> u(S,cd{0,0}); u[jj]=1; applyMergedFwd(u,g);
+            for(uint32_t ii=0;ii<S;++ii) if(std::abs(u[ii])>1e-12){
+                uint32_t d=(jj+S-ii)%S;
+                if(!used[d]){used[d]=1;acc[d].assign(S,cd{0,0});}
+                acc[d][ii]=u[ii]; } }
+        offs.clear(); dg.clear();
+        for(uint32_t d=0;d<S;++d) if(used[d]){offs.push_back(d);dg.push_back(acc[d]);} };
+
+    uint32_t stw=oR.tw; double ssc=oR.scale; uint32_t s2cdiag=0;
+    std::vector<uint64_t> sa0,sa1;
     { auto _t=NOW();
-      bsgsAcc(oR,[&](uint32_t i,uint32_t c){return Went(i,brev(c));});
-      bsgsAcc(oI,[&](uint32_t i,uint32_t c){return Went(i,brev(c)+S);});
+      for(int g=(int)LST-1; g>=0; --g){
+        std::vector<uint32_t> offs; std::vector<std::vector<cd>> dg;
+        stageDiagsFwd((uint32_t)g,offs,dg); s2cdiag+=(uint32_t)offs.size();
+        std::vector<uint64_t> ml(mod.begin(),mod.begin()+stw),rl(root.begin(),root.begin()+stw);
+        size_t TT=(size_t)stw*n;
+        std::vector<uint64_t> a0(TT,0),a1(TT,0); bool fst=true;
+        const double dpt = (g>0) ? (double)mod[stw-1] : Delta_pt;   // hold scale flat
+        std::vector<std::pair<const std::vector<uint64_t>*,cd>> srcs0, srcs1;
+        if((uint32_t)g==LST-1){ srcs0={{&oR.c0,cd{1,0}},{&oI.c0,cd{0,1}}};
+                                srcs1={{&oR.c1,cd{1,0}},{&oI.c1,cd{0,1}}}; }
+        else { srcs0={{&sa0,cd{1,0}}}; srcs1={{&sa1,cd{1,0}}}; }
+        for(size_t q2=0;q2<srcs0.size();++q2)
+          for(size_t x=0;x<offs.size();++x){
+            std::vector<cd> dd(S);
+            for(uint32_t i2=0;i2<S;++i2) dd[i2]=dg[x][i2]*srcs0[q2].second;
+            std::vector<int64_t> md; gpufhe::encode_host(md,dd,n,dpt);
+            std::vector<uint64_t> dE; gpufhe::pt_to_eval_host(dE,md,stw,n,ml,rl);
+            std::vector<uint64_t> t0=*srcs0[q2].first, t1=*srcs1[q2].first;
+            if(offs[x]) gpufhe::rotate_ct_host(t0,t1,rotAmt(offs[x]),keyAt(offs[x],stw),stw,n,ml,rl);
+            gpufhe::ct_mul_pt_host(t0,t1,dE,stw,n,ml);
+            if(fst){a0=t0;a1=t1;fst=false;} else gpufhe::ct_add_ct_host(a0,a1,t0,t1,stw,n,ml); }
+        rescaleAt(a0,a1,stw);
+        ssc=ssc*dpt/(double)mod[stw-1]; --stw; sa0=a0; sa1=a1; }
       tS2C=EL(_t); }
-    { auto Kd=buildK(twS); rescIP(sa0,sa1,twS,Kd); }
-    uint32_t twF=twS-1;
-    double sFinal=oR.scale*Delta_pt/(double)mod[twS-1];
+    std::cout<<"S2C: "<<LST<<" FFT stages, "<<s2cdiag<<" diagonals vs "<<S<<" dense\n";
+    uint32_t twF=stw;
+    double sFinal=ssc;
     double Dfinal=sFinal*2*M_PI*Delta_in/(double)q0;
     std::vector<uint64_t> mF(mod.begin(),mod.begin()+twF),rF(root.begin(),root.begin()+twF);
     auto KF=gpufhe::keygen_host(n,mF,rF,ns,3.19,101);
