@@ -60,6 +60,27 @@ int main(int argc,char**argv){
     std::cout<<"n="<<n<<" S="<<S<<" L="<<L<<" radix=2^"<<R<<"\n";
     std::cout<<"  || stages(z) - bitrev(A z) || = "<<e<<"\n";
 
+    // ---- FORWARD stages (= SlotsToCoeffs): reverse stage order, inverted
+    // butterfly. Consumes the bit-reversed vector the inverse stages produce,
+    // so applying inverse then forward must be the identity.
+    auto applyMergedFwd=[&](std::vector<cd>& v,uint32_t g){
+        for(int st=(int)((g+1)*R)-1; st>=(int)(g*R); --st){
+            uint32_t h=S>>(st+1); std::vector<cd> o(S);
+            for(uint32_t base=0;base<S;base+=2*h)
+                for(uint32_t k=0;k<h;++k){
+                    cd a=v[base+k], b=v[base+k+h], t=tw(k,(uint32_t)st);
+                    o[base+k]   = a + t*b;
+                    o[base+k+h] = a - t*b;
+                }
+            v.swap(o);
+        } };
+    {   std::vector<cd> rt=z;
+        for(uint32_t g=0;g<L;++g) applyMerged(rt,g);          // C2S
+        for(int g=(int)L-1; g>=0; --g) applyMergedFwd(rt,(uint32_t)g);  // S2C
+        double e2=0; for(uint32_t i=0;i<S;++i) e2=std::max(e2,std::abs(rt[i]-z[i]));
+        std::cout<<"  || S2C(C2S(z)) - z ||        = "<<e2<<"   (round trip)\n";
+        if(e2>1e-9){ std::cout<<"[FAIL] forward stages are not the inverse\n"; return 1; } }
+
     // diagonal census per merged stage (via unit vectors; fine at sandbox sizes)
     uint32_t total=0;
     for(uint32_t g=0;g<L;++g){
