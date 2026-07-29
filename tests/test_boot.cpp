@@ -40,7 +40,7 @@ using cd=std::complex<double>;
 int main(){
     const uint32_t HW=64;
     gpufhe::set_secret_hamming_weight(HW);   // sparse secret: pins K independent of n
-    const uint32_t n=1024,S=n/2,sizeQ=30,sizeP=2,M=2*n; const uint64_t ns=1;
+    const uint32_t n=8192,S=n/2,sizeQ=30,sizeP=2,M=2*n; const uint64_t ns=1;
     // dnum: alpha=10 towers per part => 3 parts at tw=30 (was alpha=2 => 15 parts).
     // P must cover a part (10x50=500 bits), hence sizeP=9 x 60 = 540 bits.
     // At n=32768 this is what makes a rotation key ~61MB instead of ~251MB.
@@ -201,6 +201,16 @@ int main(){
     // elementwise in slot index, so S2C absorbs it via brev() on its columns.
     uint32_t lgS=0; while((1u<<lgS)<S) ++lgS;
     const uint32_t LST=3, RST=lgS/LST;
+    // LST MUST divide log2(S), or the stages cover only LST*RST bits and the
+    // rest are silently skipped -- that reads as a wrong-but-plausible
+    // diagonal census plus a garbage transform (seen at n=4096: lgS=11 is
+    // prime, LST=3 gave RST=3, covering 9 of 11 bits, C2S err 20.05).
+    // Usable L exist only when log2(S) is composite:
+    //   n=1024  lgS=9  = 3*3      -> L=3
+    //   n=4096  lgS=11 prime      -> L=1 or 11 only (both useless)
+    //   n=8192  lgS=12 = 2^2*3    -> L=2,3,4,6
+    //   n=32768 lgS=14 = 2*7      -> L=2 or 7
+    if(lgS%LST){ std::cout<<"[FAIL] LST="<<LST<<" does not divide log2(S)="<<lgS<<"\n"; return 1; }
     auto brev=[&](uint32_t i){uint32_t r=0;for(uint32_t b=0;b<lgS;++b) if(i&(1u<<b)) r|=1u<<(lgS-1-b); return r;};
     auto twd=[&](uint32_t k,uint32_t st)->cd{ uint64_t e=((uint64_t)rk[k]<<st)%M;
         return std::polar(1.0, 2*M_PI*(double)e/(double)M); };
