@@ -47,7 +47,7 @@ int main(){
     auto npFor=[](uint32_t tw)->uint32_t{ return tw<=2?1u:(tw+1)/2; };  // alpha=2: the partitioning everything was gated at
     std::vector<uint64_t> mod,modP;
     gpufhe::native_primes(mod,1,60,n,{});
-    { std::vector<uint64_t> mids; gpufhe::native_primes(mids,sizeQ-1,50,n,mod); for(auto m:mids)mod.push_back(m); }
+    { std::vector<uint64_t> mids; gpufhe::native_primes(mids,sizeQ-1,55,n,mod); for(auto m:mids)mod.push_back(m); }
     gpufhe::native_primes(modP,sizeP,60,n,mod);
     std::vector<uint64_t> modQP=mod; for(auto p:modP)modQP.push_back(p);
     std::vector<uint64_t> root(sizeQ),rootQP;
@@ -103,7 +103,12 @@ int main(){
     // approximation: need mz/q0 << 1 (cubic term), and we sit at ~2^-9 here
     // versus a tolerance around 0.02, so there is ample room.
     const double Delta_in=std::pow(2.0,54)*std::sqrt((double)n/1024.0)*8.0;
-    const double Delta_pt=std::pow(2.0,40);
+    // EvalMod's working scale must EQUAL the mid prime: mulCt gives
+    // A.scale*B.scale/q, stable only when scale == q. So Delta_pt is FORCED to
+    // q_mid^2/q0 and Delta_w to q_mid -- raising Delta_pt alone made the scale
+    // run away (2^53 -> 2^56 -> 2^62 ...) and wrap. The precision lever is the
+    // MID-PRIME SIZE: 50 -> 55 bits lifts the working scale 32x.
+    const double Delta_pt=std::pow(2.0,50);
 
     // ---- message, encrypt at the BOTTOM level (q0 only)
     std::vector<cd> z(S);
@@ -323,7 +328,7 @@ int main(){
 
 
     // ================== BACK HALF: EvalMod x2 -> S2C -> recover ==================
-    const double Delta_w=std::pow(2.0,50);
+    const double Delta_w=std::pow(2.0,55);
     struct Ct { std::vector<uint64_t> c0,c1; uint32_t tw; double scale; };
 
     auto mkKlvl=[&](uint32_t k,uint32_t tw,uint32_t seed)->gpufhe::KeySwitchConstants{
