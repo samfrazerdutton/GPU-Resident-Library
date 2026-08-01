@@ -6,7 +6,10 @@ struct KeyPairHost {
     std::vector<uint64_t> s;        // sizeQ*n eval
     std::vector<uint64_t> pkA, pkB; // sizeQ*n eval
 };
-void set_secret_hamming_weight(uint32_t h);   // 0 = uniform ternary
+void set_secret_hamming_weight(uint32_t h);
+void rotate_ct_resident(std::vector<uint64_t>&, std::vector<uint64_t>&, uint32_t,
+                        const struct KeySwitchConstants&, uint32_t, uint32_t,
+                        const std::vector<uint64_t>&, const std::vector<uint64_t>&);   // 0 = uniform ternary
 KeyPairHost keygen_host(uint32_t n, const std::vector<uint64_t>& moduli,
                         const std::vector<uint64_t>& roots, uint64_t ns, double sigma,
                         uint64_t seed);

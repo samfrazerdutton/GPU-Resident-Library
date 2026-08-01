@@ -8,6 +8,9 @@
 #include "rescale.h"
 #include <cstring>
 #include <stdexcept>
+#include <map>
+#include <map>
+#include <utility>
 
 namespace gpufhe {
 namespace {
@@ -16,6 +19,13 @@ uint64_t powmod(uint64_t b,uint64_t e,uint64_t q){unsigned __int128 r=1,bb=b%q;w
 uint64_t invmod(uint64_t a,uint64_t q){return powmod(a%q,q-2,q);}
 uint64_t* upv(const std::vector<uint64_t>& h){ uint64_t* d;
     cudaMalloc(&d,h.size()*8); cudaMemcpy(d,h.data(),h.size()*8,cudaMemcpyHostToDevice); return d; }
+// These constants depend only on (n,sizeQl,numPart) -- NOT on the key -- yet
+// every rotation rebuilt ~135 identical allocations. Cache by that tuple; only
+// av/bv stay per-key. Contexts do not own these (destroy must not free them).
+uint64_t* upc(uint64_t key, const std::vector<uint64_t>& h){
+    static std::map<uint64_t,uint64_t*> m;
+    auto it=m.find(key); if(it!=m.end()) return it->second;
+    uint64_t* d=upv(h); m.emplace(key,d); return d; }
 } // anon
 
 DeviceKSContext ks_context_create(const KeySwitchConstants& K){
@@ -27,39 +37,55 @@ DeviceKSContext ks_context_create(const KeySwitchConstants& K){
     // root tables for every modulus in the root list (built like keyswitch.cpp)
     auto br=[](uint32_t v,uint32_t b){uint32_t r=0;for(uint32_t k=0;k<b;k++){r=(r<<1)|(v&1);v>>=1;}return r;};
     uint32_t logn=0; while((1u<<logn)<n)++logn;
+    // Root tables depend only on (n,q) and are IDENTICAL across every context,
+    // but each context was rebuilding and re-uploading all of them: 4 cudaMallocs
+    // per modulus x 32 moduli = 128 allocations per rotation, and the measured
+    // ks_context_create cost was 54 ms of a 170 ms rotation. Cache them for the
+    // process lifetime and share the pointers; contexts no longer own them
+    // (ks_context_destroy must not free these).
+    struct RTab { uint64_t *fr,*fp,*ir,*ip, ninv, ninv_p; };
+    static std::map<std::pair<uint32_t,uint64_t>,RTab> g_rtab;
     for(size_t r=0;r<K.rootModList.size();++r){
-        uint64_t q=K.rootModList[r], root=K.rootValList[r], rootInv=invmod(root,q);
-        std::vector<uint64_t> fr(n),fp(n),ir(n),ip(n),pw(n);
-        auto fill=[&](uint64_t base,std::vector<uint64_t>&tr,std::vector<uint64_t>&tp){
-            pw[0]=1; for(uint32_t i=1;i<n;++i)pw[i]=mulmod(pw[i-1],base,q);
-            for(uint32_t i=0;i<n;++i){uint64_t ri=pw[br(i,logn)];tr[i]=ri;tp[i]=(uint64_t)(((__uint128_t)ri<<64)/q);}};
-        fill(root,fr,fp); fill(rootInv,ir,ip);
+        uint64_t q=K.rootModList[r], root=K.rootValList[r];
+        auto key=std::make_pair(n,q);
+        auto it=g_rtab.find(key);
+        if(it==g_rtab.end()){
+            uint64_t rootInv=invmod(root,q);
+            std::vector<uint64_t> fr(n),fp(n),ir(n),ip(n),pw(n);
+            auto fill=[&](uint64_t base,std::vector<uint64_t>&tr,std::vector<uint64_t>&tp){
+                pw[0]=1; for(uint32_t i=1;i<n;++i)pw[i]=mulmod(pw[i-1],base,q);
+                for(uint32_t i=0;i<n;++i){uint64_t ri=pw[br(i,logn)];tr[i]=ri;tp[i]=(uint64_t)(((__uint128_t)ri<<64)/q);}};
+            fill(root,fr,fp); fill(rootInv,ir,ip);
+            uint64_t ni=invmod(n,q);
+            RTab t{upv(fr),upv(fp),upv(ir),upv(ip),ni,(uint64_t)(((__uint128_t)ni<<64)/q)};
+            it=g_rtab.emplace(key,t).first;
+        }
         C.modList.push_back(q);
-        C.d_fr.push_back(upv(fr)); C.d_fp.push_back(upv(fp));
-        C.d_ir.push_back(upv(ir)); C.d_ip.push_back(upv(ip));
-        uint64_t ni=invmod(n,q);
-        C.ninv.push_back(ni); C.ninv_p.push_back((uint64_t)(((__uint128_t)ni<<64)/q));
+        C.d_fr.push_back(it->second.fr); C.d_fp.push_back(it->second.fp);
+        C.d_ir.push_back(it->second.ir); C.d_ip.push_back(it->second.ip);
+        C.ninv.push_back(it->second.ninv); C.ninv_p.push_back(it->second.ninv_p);
     }
 
     // per-part constants
+    const uint64_t KB=((uint64_t)n<<40)|((uint64_t)K.sizeQl<<32)|((uint64_t)K.numPart<<24);
     C.sizePart=K.sizePart; C.sizeCompl=K.sizeCompl; C.startIdx=K.startIdx;
     for(uint32_t p=0;p<K.numPart;++p){
         C.complModHost.push_back(K.partComplMod[p]);
-        C.d_qhi.push_back(upv(K.partQHatInv[p]));
-        C.d_qhip.push_back(upv(K.partQHatInvPrec[p]));
-        C.d_srcMod.push_back(upv(K.partSrcMod[p]));
-        C.d_qmp.push_back(upv(K.partQHatModp[p]));
-        C.d_complMod.push_back(upv(K.partComplMod[p]));
-        C.d_mlo.push_back(upv(K.partBMuLo[p]));
-        C.d_mhi.push_back(upv(K.partBMuHi[p]));
+        C.d_qhi.push_back(upc(KB|((uint64_t)p<<8)|0,K.partQHatInv[p]));
+        C.d_qhip.push_back(upc(KB|((uint64_t)p<<8)|1,K.partQHatInvPrec[p]));
+        C.d_srcMod.push_back(upc(KB|((uint64_t)p<<8)|2,K.partSrcMod[p]));
+        C.d_qmp.push_back(upc(KB|((uint64_t)p<<8)|3,K.partQHatModp[p]));
+        C.d_complMod.push_back(upc(KB|((uint64_t)p<<8)|4,K.partComplMod[p]));
+        C.d_mlo.push_back(upc(KB|((uint64_t)p<<8)|5,K.partBMuLo[p]));
+        C.d_mhi.push_back(upc(KB|((uint64_t)p<<8)|6,K.partBMuHi[p]));
         C.d_av.push_back(upv(K.av[p]));
         C.d_bv.push_back(upv(K.bv[p]));
     }
 
     // moddown constants
-    C.d_pHatInv=upv(K.pHatInv); C.d_pHatInvPrec=upv(K.pHatInvPrec);
-    C.d_pMod=upv(K.pMod); C.d_pHatModq=upv(K.pHatModq);
-    C.d_qMod=upv(K.qMod); C.d_mdMuLo=upv(K.mdBMuLo); C.d_mdMuHi=upv(K.mdBMuHi);
+    C.d_pHatInv=upc(KB|100,K.pHatInv); C.d_pHatInvPrec=upc(KB|101,K.pHatInvPrec);
+    C.d_pMod=upc(KB|102,K.pMod); C.d_pHatModq=upc(KB|103,K.pHatModq);
+    C.d_qMod=upc(KB|104,K.qMod); C.d_mdMuLo=upc(KB|105,K.mdBMuLo); C.d_mdMuHi=upc(KB|106,K.mdBMuHi);
     C.pInvModqHost=K.pInvModq; C.qModHost=K.qMod; C.pModHost=K.pMod;
     return C;
 }
@@ -77,15 +103,16 @@ DeviceKSWork ks_work_create(const DeviceKSContext& C){
 }
 
 void ks_context_destroy(DeviceKSContext& C){
-    for(auto p:C.d_fr)cudaFree(p); for(auto p:C.d_fp)cudaFree(p);
-    for(auto p:C.d_ir)cudaFree(p); for(auto p:C.d_ip)cudaFree(p);
-    for(auto p:C.d_qhi)cudaFree(p); for(auto p:C.d_qhip)cudaFree(p);
-    for(auto p:C.d_srcMod)cudaFree(p); for(auto p:C.d_qmp)cudaFree(p);
-    for(auto p:C.d_complMod)cudaFree(p); for(auto p:C.d_mlo)cudaFree(p);
-    for(auto p:C.d_mhi)cudaFree(p); for(auto p:C.d_av)cudaFree(p);
+    // NOTE: d_fr/d_fp/d_ir/d_ip point into the process-lifetime root-table
+    // cache and are SHARED across contexts -- freeing them here would corrupt
+    // every context created later. Only the per-context arrays are freed.
+    
+    
+    
+    for(auto p:C.d_av)cudaFree(p);
     for(auto p:C.d_bv)cudaFree(p);
-    cudaFree(C.d_pHatInv);cudaFree(C.d_pHatInvPrec);cudaFree(C.d_pMod);
-    cudaFree(C.d_pHatModq);cudaFree(C.d_qMod);cudaFree(C.d_mdMuLo);cudaFree(C.d_mdMuHi);
+    
+    
 }
 void ks_work_destroy(DeviceKSWork& W){
     cudaFree(W.d_part);cudaFree(W.d_compl);cudaFree(W.d_res0);cudaFree(W.d_res1);

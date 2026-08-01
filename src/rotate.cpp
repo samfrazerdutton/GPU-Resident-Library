@@ -9,6 +9,7 @@
 #include "ntt.h"
 #include "intt.h"
 #include "keyswitch.h"
+#include "keyswitch_resident.h"
 namespace gpufhe {
 namespace {
 uint64_t mm(uint64_t a,uint64_t b,uint64_t q){return(uint64_t)(((unsigned __int128)a*b)%q);}
@@ -88,6 +89,40 @@ void pt_to_eval_host(std::vector<uint64_t>& out, const std::vector<int64_t>& m,
         for(uint32_t k=0;k<n;++k){ long v=(long)m[k]; c[k]=(uint64_t)((v%(long)q+(long)q)%(long)q); } }
     xf_multi(out,towers,n,mod,root,false);
 }
+// RESIDENT rotation. Same result as rotate_ct_host but the keyswitch runs on
+// the fully device-resident path (DeviceKSContext/DeviceKSWork, zero malloc,
+// pure kernel launches) instead of keyswitch_core_resident, which despite its
+// name round-trips host<->device between stages and mallocs per tower per part.
+// The context (eval key + constants + root tables) is uploaded once per call
+// here; if that dominates, cache contexts across calls next.
+void rotate_ct_resident(std::vector<uint64_t>& c0, std::vector<uint64_t>& c1,
+                        uint32_t k, const KeySwitchConstants& Krot,
+                        uint32_t towers, uint32_t n,
+                        const std::vector<uint64_t>& mod, const std::vector<uint64_t>& root)
+{
+    automorphism_eval_host(c0,towers,n,k,mod,root);
+    automorphism_eval_host(c1,towers,n,k,mod,root);
+
+    auto C=ks_context_create(Krot);
+    auto W=ks_work_create(C);
+    const size_t T=(size_t)towers*n, B=T*8;
+    uint64_t *d_a,*d_b0,*d_b1;
+    cudaMalloc(&d_a,B); cudaMalloc(&d_b0,B); cudaMalloc(&d_b1,B);
+    cudaMemcpy(d_a,c1.data(),B,cudaMemcpyHostToDevice);
+    keyswitch_resident(d_a,d_b0,d_b1,C,W,0);
+    cudaDeviceSynchronize();
+    std::vector<uint64_t> ba0(T),ba1(T);
+    cudaMemcpy(ba0.data(),d_b0,B,cudaMemcpyDeviceToHost);
+    cudaMemcpy(ba1.data(),d_b1,B,cudaMemcpyDeviceToHost);
+    cudaFree(d_a);cudaFree(d_b0);cudaFree(d_b1);
+    ks_work_destroy(W); ks_context_destroy(C);
+
+    for(uint32_t t=0;t<towers;++t){ uint64_t q=mod[t];
+        for(uint32_t kk=0;kk<n;++kk){ size_t x=(size_t)t*n+kk;
+            uint64_t s2=c0[x]+ba0[x]; c0[x]=(s2>=q)?s2-q:s2; } }
+    c1=ba1;
+}
+
 // Full homomorphic rotation: sigma_k on (c0,c1), keyswitch sigma(c1) with the
 // rotation key in Krot, output (sigma(c0)+ba0, ba1). k must match Krot's sOld.
 void rotate_ct_host(std::vector<uint64_t>& c0, std::vector<uint64_t>& c1,
