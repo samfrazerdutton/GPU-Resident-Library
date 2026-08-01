@@ -35,6 +35,7 @@ add_library(gpufhe STATIC
   kernels/moddown.cu
   kernels/tensor.cu
   kernels/automorph.cu
+  kernels/stage_acc.cu
 )
 find_package(CUDAToolkit REQUIRED)
 target_include_directories(gpufhe PUBLIC include)
@@ -105,6 +106,7 @@ gpufhe_test(test_c2s_stages tests/test_c2s_stages.cpp)
 gpufhe_test(test_alpha10 tests/test_alpha10.cpp)
 gpufhe_test(test_chain tests/test_chain.cpp)
 gpufhe_test(test_rot_resident tests/test_rot_resident.cpp)
+gpufhe_test(test_stage_acc tests/test_stage_acc.cpp)
 gpufhe_test(test_keyreuse tests/test_keyreuse.cpp)
 gpufhe_test(bench_resident_chain bench/bench_resident_chain.cpp)
 gpufhe_test(bench_batch bench/bench_batch.cpp)
