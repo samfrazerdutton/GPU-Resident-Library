@@ -24,6 +24,8 @@ struct DeviceKSContext {
     uint64_t *d_pHatInv=nullptr,*d_pHatInvPrec=nullptr,*d_pMod=nullptr,
              *d_pHatModq=nullptr,*d_qMod=nullptr,*d_mdMuLo=nullptr,*d_mdMuHi=nullptr;
     std::vector<uint64_t> pInvModqHost, qModHost, pModHost;   // host scalars
+    // for the batched fastcore launch: per-QP-tower modulus and eval-key row
+    uint64_t* d_modsQlP=nullptr; uint32_t* d_keyRow=nullptr;
 };
 
 // Per-stream scratch. One per concurrent keyswitch-in-flight.
@@ -33,6 +35,7 @@ struct DeviceKSWork {
     uint64_t *d_res0=nullptr, *d_res1=nullptr;   // sizeQlP * n
     uint64_t *d_pwork=nullptr;     // sizeP * n
     uint64_t *d_qsw=nullptr;       // sizeQl * n
+    const uint64_t** d_digPtrs=nullptr;   // sizeQlP digit pointers (batched fastcore)
 };
 
 DeviceKSContext ks_context_create(const KeySwitchConstants& K);

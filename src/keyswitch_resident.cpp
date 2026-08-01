@@ -13,6 +13,7 @@
 #include <utility>
 
 namespace gpufhe {
+bool g_ks_batched=true;   // A/B switch for the batched fastcore
 namespace {
 uint64_t mulmod(uint64_t a,uint64_t b,uint64_t q){return(uint64_t)(((unsigned __int128)a*b)%q);}
 uint64_t powmod(uint64_t b,uint64_t e,uint64_t q){unsigned __int128 r=1,bb=b%q;while(e){if(e&1)r=(r*bb)%q;bb=(bb*bb)%q;e>>=1;}return(uint64_t)r;}
@@ -87,6 +88,15 @@ DeviceKSContext ks_context_create(const KeySwitchConstants& K){
     C.d_pMod=upc(KB|102,K.pMod); C.d_pHatModq=upc(KB|103,K.pHatModq);
     C.d_qMod=upc(KB|104,K.qMod); C.d_mdMuLo=upc(KB|105,K.mdBMuLo); C.d_mdMuHi=upc(KB|106,K.mdBMuHi);
     C.pInvModqHost=K.pInvModq; C.qModHost=K.qMod; C.pModHost=K.pMod;
+    {   // constants for the batched fastcore launch (same every call)
+        std::vector<uint64_t> mq(C.sizeQlP); std::vector<uint32_t> kr(C.sizeQlP);
+        const uint32_t dl=C.fullQ-C.sizeQl;
+        for(uint32_t i=0;i<C.sizeQlP;++i){
+            mq[i]=(i<C.sizeQl)? K.qMod[i] : K.pMod[i-C.sizeQl];
+            kr[i]=(i>=C.sizeQl)? i+dl : i; }
+        C.d_modsQlP=upc(KB|200,mq);
+        cudaMalloc(&C.d_keyRow,C.sizeQlP*4);
+        cudaMemcpy(C.d_keyRow,kr.data(),C.sizeQlP*4,cudaMemcpyHostToDevice); }
     return C;
 }
 
@@ -99,6 +109,7 @@ DeviceKSWork ks_work_create(const DeviceKSContext& C){
     cudaMalloc(&W.d_res1,(size_t)C.sizeQlP*n*8);
     cudaMalloc(&W.d_pwork,(size_t)C.sizeP*n*8);
     cudaMalloc(&W.d_qsw,(size_t)C.sizeQl*n*8);
+    cudaMalloc(&W.d_digPtrs,(size_t)C.sizeQlP*sizeof(uint64_t*));
     return W;
 }
 
@@ -116,7 +127,7 @@ void ks_context_destroy(DeviceKSContext& C){
 }
 void ks_work_destroy(DeviceKSWork& W){
     cudaFree(W.d_part);cudaFree(W.d_compl);cudaFree(W.d_res0);cudaFree(W.d_res1);
-    cudaFree(W.d_pwork);cudaFree(W.d_qsw);
+    cudaFree(W.d_pwork);cudaFree(W.d_qsw);cudaFree(W.d_digPtrs);
 }
 
 // modulus -> root-table row
@@ -158,15 +169,34 @@ void keyswitch_resident(const uint64_t* d_a, uint64_t* d_ba0, uint64_t* d_ba1,
             LaunchNTT_CT(W.d_compl+(size_t)j*n, C.d_fr[r], C.d_fp[r], n, q, s);
         }
         // 4. accumulate: digit tower i = d_a (in range) or d_compl (else).
-        for(uint32_t i=0;i<sizeQlP;++i){
-            uint64_t q=(i<sizeQl)? C.qModHost[i] : C.pModHost[i-sizeQl];
-            uint32_t idx=(i>=sizeQl)? i+delta : i;
-            const uint64_t* dig = (i>=st && i<en) ? d_a+(size_t)i*n
-                                : (i<st) ? W.d_compl+(size_t)i*n
-                                         : W.d_compl+(size_t)(i-sp)*n;
-            LaunchKSMultAcc(W.d_res0+(size_t)i*n, W.d_res1+(size_t)i*n,
-                            dig, C.d_bv[part]+(size_t)idx*n, C.d_av[part]+(size_t)idx*n,
-                            q, n, s);
+        // BATCHED: was sizeQlP launches per part (32*15 = 480 per keyswitch at
+        // n=8192/tw=30, each on a single 8192-element tower => launch-bound).
+        // Now one launch per part with grid.y = tower, as tensor.cu does.
+        // The digit source differs per tower (inside the part's range it is d_a,
+        // otherwise d_compl with a shifted index), so pass a pointer array
+        // rather than branching in the kernel.
+        if(!g_ks_batched){
+            for(uint32_t i=0;i<sizeQlP;++i){
+                uint64_t q=(i<sizeQl)? C.qModHost[i] : C.pModHost[i-sizeQl];
+                uint32_t idx=(i>=sizeQl)? i+delta : i;
+                const uint64_t* dig = (i>=st && i<en) ? d_a+(size_t)i*n
+                                    : (i<st) ? W.d_compl+(size_t)i*n
+                                             : W.d_compl+(size_t)(i-sp)*n;
+                LaunchKSMultAcc(W.d_res0+(size_t)i*n, W.d_res1+(size_t)i*n,
+                                dig, C.d_bv[part]+(size_t)idx*n, C.d_av[part]+(size_t)idx*n,
+                                q, n, s);
+            }
+        } else
+        {   std::vector<const uint64_t*> hp(sizeQlP);
+            for(uint32_t i=0;i<sizeQlP;++i)
+                hp[i] = (i>=st && i<en) ? d_a+(size_t)i*n
+                      : (i<st)          ? W.d_compl+(size_t)i*n
+                                        : W.d_compl+(size_t)(i-sp)*n;
+            cudaMemcpyAsync(W.d_digPtrs,hp.data(),sizeQlP*sizeof(uint64_t*),
+                            cudaMemcpyHostToDevice,s);
+            LaunchKSMultAccBatched(W.d_res0, W.d_res1, W.d_digPtrs,
+                                   C.d_bv[part], C.d_av[part],
+                                   C.d_keyRow, C.d_modsQlP, sizeQlP, n, s);
         }
     }
 

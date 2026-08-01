@@ -14,6 +14,7 @@
 #include <chrono>
 #include <algorithm>
 namespace gpufhe {
+extern bool g_ks_batched;
 void encode_host(std::vector<int64_t>&, const std::vector<std::complex<double>>&, uint32_t, double);
 void native_primes(std::vector<uint64_t>&, uint32_t, uint32_t, uint32_t, const std::vector<uint64_t>&);
 uint64_t native_root(uint32_t, uint64_t);
@@ -161,6 +162,44 @@ int main(int argc,char**argv){
         for(size_t i=0;i<b0.size();++i){ if(e0[i]!=b0[i])++bd; if(e1[i]!=b1[i])++bd; }
         std::cout<<"  rotate_ct_device vs resident: "<<bd<<" mismatches, kernels-only "
                  <<td<<" s (excludes context build)\n"; }
+
+    // Clean measurement of keyswitch_resident alone: context/work built ONCE,
+    // then N timed calls. No allocation, no transfer, no host work in the loop
+    // -- so this is the kernel cost with none of the ±25% setup noise.
+    {   auto C3=gpufhe::ks_context_create(K);
+        auto W3=gpufhe::ks_work_create(C3);
+        const size_t TT=(size_t)tw*n, BB=TT*8;
+        uint64_t *da,*d0,*d1;
+        cudaMalloc(&da,BB);cudaMalloc(&d0,BB);cudaMalloc(&d1,BB);
+        cudaMemcpy(da,c1.data(),BB,cudaMemcpyHostToDevice);
+        gpufhe::keyswitch_resident(da,d0,d1,C3,W3,0); cudaDeviceSynchronize(); // warm
+        std::vector<double> v;
+        for(uint32_t r=0;r<15;++r){
+            auto p0=std::chrono::steady_clock::now();
+            gpufhe::keyswitch_resident(da,d0,d1,C3,W3,0);
+            cudaDeviceSynchronize();
+            v.push_back(std::chrono::duration<double>(
+                std::chrono::steady_clock::now()-p0).count()); }
+        std::sort(v.begin(),v.end());
+        std::cout<<"  keyswitch BATCHED  x15: min "<<v.front()<<"  med "<<v[7]
+                 <<"  max "<<v.back()<<" s\n";
+        // A/B in the SAME run, same warm context: the only honest comparison,
+        // since every earlier "before" number was a single shot in the noise.
+        gpufhe::g_ks_batched=false;
+        gpufhe::keyswitch_resident(da,d0,d1,C3,W3,0); cudaDeviceSynchronize();
+        std::vector<double> w;
+        for(uint32_t r=0;r<15;++r){
+            auto p1=std::chrono::steady_clock::now();
+            gpufhe::keyswitch_resident(da,d0,d1,C3,W3,0);
+            cudaDeviceSynchronize();
+            w.push_back(std::chrono::duration<double>(
+                std::chrono::steady_clock::now()-p1).count()); }
+        std::sort(w.begin(),w.end());
+        std::cout<<"  keyswitch PER-TOWER x15: min "<<w.front()<<"  med "<<w[7]
+                 <<"  max "<<w.back()<<" s   (batched/per-tower = "<<v[7]/w[7]<<")\n";
+        gpufhe::g_ks_batched=true;
+        cudaFree(da);cudaFree(d0);cudaFree(d1);
+        gpufhe::ks_work_destroy(W3); gpufhe::ks_context_destroy(C3); }
 
     size_t diff=0;
     for(size_t i=0;i<a0.size();++i){ if(a0[i]!=b0[i])++diff; if(a1[i]!=b1[i])++diff; }
