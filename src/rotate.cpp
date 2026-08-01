@@ -121,15 +121,21 @@ void rotate_ct_resident(std::vector<uint64_t>& c0, std::vector<uint64_t>& c1,
                         uint32_t towers, uint32_t n,
                         const std::vector<uint64_t>& mod, const std::vector<uint64_t>& root)
 {
-    automorphism_eval_host(c0,towers,n,k,mod,root);
-    automorphism_eval_host(c1,towers,n,k,mod,root);
-
+    // Fully device-side now: both automorphisms run as kernels on data that
+    // was uploaded once, instead of two host permutes (~19 ms) bracketing the
+    // keyswitch. c0 needs its automorphism too, so it rides along on device.
     auto C=ks_context_create(Krot);
     auto W=ks_work_create(C);
     const size_t T=(size_t)towers*n, B=T*8;
-    uint64_t *d_a,*d_b0,*d_b1;
+    uint64_t *d_a,*d_b0,*d_b1,*d_c0,*d_sc;
     cudaMalloc(&d_a,B); cudaMalloc(&d_b0,B); cudaMalloc(&d_b1,B);
+    cudaMalloc(&d_c0,B); cudaMalloc(&d_sc,(size_t)n*8);
     cudaMemcpy(d_a,c1.data(),B,cudaMemcpyHostToDevice);
+    cudaMemcpy(d_c0,c0.data(),B,cudaMemcpyHostToDevice);
+    automorphism_eval_device(d_a ,towers,n,k,mod,root,d_sc,0);
+    automorphism_eval_device(d_c0,towers,n,k,mod,root,d_sc,0);
+    cudaMemcpy(c0.data(),d_c0,B,cudaMemcpyDeviceToHost);
+    cudaFree(d_c0); cudaFree(d_sc);
     keyswitch_resident(d_a,d_b0,d_b1,C,W,0);
     cudaDeviceSynchronize();
     std::vector<uint64_t> ba0(T),ba1(T);
