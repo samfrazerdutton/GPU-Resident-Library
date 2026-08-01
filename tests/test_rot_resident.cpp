@@ -119,6 +119,24 @@ int main(int argc,char**argv){
         gpufhe::automorphism_eval_host(v,tw,n,(uint32_t)k,mod,root);
         std::cout<<"    automorphism x1   : "<<EL(p7)<<" s  (x2 per rotation)\n"; }
 
+    // GATE: device automorphism must be BIT-IDENTICAL to the host one.
+    {   auto hv=c1; 
+        gpufhe::automorphism_eval_host(hv,tw,n,(uint32_t)k,mod,root);
+        std::vector<uint64_t> dv=c1;
+        const size_t TT=(size_t)tw*n;
+        uint64_t *d_v,*d_sc;
+        cudaMalloc(&d_v,TT*8); cudaMalloc(&d_sc,(size_t)n*8);
+        cudaMemcpy(d_v,dv.data(),TT*8,cudaMemcpyHostToDevice);
+        auto pa=std::chrono::steady_clock::now();
+        gpufhe::automorphism_eval_device(d_v,tw,n,(uint32_t)k,mod,root,d_sc,0);
+        cudaDeviceSynchronize();
+        double tdev=std::chrono::duration<double>(std::chrono::steady_clock::now()-pa).count();
+        cudaMemcpy(dv.data(),d_v,TT*8,cudaMemcpyDeviceToHost);
+        cudaFree(d_v); cudaFree(d_sc);
+        size_t bad=0; for(size_t i=0;i<hv.size();++i) if(hv[i]!=dv[i]) ++bad;
+        std::cout<<"  automorphism device vs host: "<<bad<<" mismatches, device "
+                 <<tdev<<" s\n"; }
+
     size_t diff=0;
     for(size_t i=0;i<a0.size();++i){ if(a0[i]!=b0[i])++diff; if(a1[i]!=b1[i])++diff; }
     std::cout<<"n="<<n<<" tw="<<tw<<" parts="<<numPart<<"\n";

@@ -34,6 +34,7 @@ add_library(gpufhe STATIC
   kernels/ks_fastcore.cu
   kernels/moddown.cu
   kernels/tensor.cu
+  kernels/automorph.cu
 )
 find_package(CUDAToolkit REQUIRED)
 target_include_directories(gpufhe PUBLIC include)

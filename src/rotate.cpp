@@ -10,6 +10,7 @@
 #include "intt.h"
 #include "keyswitch.h"
 #include "keyswitch_resident.h"
+#include "automorph.h"
 namespace gpufhe {
 namespace {
 uint64_t mm(uint64_t a,uint64_t b,uint64_t q){return(uint64_t)(((unsigned __int128)a*b)%q);}
@@ -60,6 +61,26 @@ void xf_multi(std::vector<uint64_t>& h, uint32_t towers, uint32_t n,
     cudaMemcpy(h.data(),dx,T*8,cudaMemcpyDeviceToHost);
 }
 } // anon
+
+// DEVICE automorphism: INTT -> permute kernel -> NTT, all on device pointers.
+// Needs one n-sized scratch buffer (the permute cannot be done in place).
+// Root tables come from the same process-lifetime dev_tab cache the host
+// version uses, so this adds no setup cost.
+void automorphism_eval_device(uint64_t* d_v, uint32_t towers, uint32_t n,
+                              uint32_t k, const std::vector<uint64_t>& mod,
+                              const std::vector<uint64_t>& root,
+                              uint64_t* d_scratch, cudaStream_t s)
+{
+    for(uint32_t t=0;t<towers;++t){
+        uint64_t q=mod[t]; DevTab&D=dev_tab(n,q,root[t]);
+        uint64_t* col=d_v+(size_t)t*n;
+        LaunchINTT_GS(col,D.ir,D.ip,n,q,D.ninv,D.ninv_p,s);
+        cudaMemsetAsync(d_scratch,0,(size_t)n*8,s);
+        LaunchAutomorphPermute(d_scratch,col,n,(uint64_t)k,q,s);
+        cudaMemcpyAsync(col,d_scratch,(size_t)n*8,cudaMemcpyDeviceToDevice,s);
+        LaunchNTT_CT(col,D.fr,D.fp,n,q,s);
+    }
+}
 
 // In-place automorphism on a towers*n eval-form poly.
 void automorphism_eval_host(std::vector<uint64_t>& v, uint32_t towers, uint32_t n,

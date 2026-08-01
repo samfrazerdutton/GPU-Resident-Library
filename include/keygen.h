@@ -1,4 +1,5 @@
 #pragma once
+#include <cuda_runtime.h>   // cudaStream_t for the device automorphism
 #include <cstdint>
 #include <vector>
 namespace gpufhe {
@@ -7,6 +8,9 @@ struct KeyPairHost {
     std::vector<uint64_t> pkA, pkB; // sizeQ*n eval
 };
 void set_secret_hamming_weight(uint32_t h);
+void automorphism_eval_device(uint64_t*, uint32_t, uint32_t, uint32_t,
+                              const std::vector<uint64_t>&, const std::vector<uint64_t>&,
+                              uint64_t*, cudaStream_t);
 void rotate_ct_resident(std::vector<uint64_t>&, std::vector<uint64_t>&, uint32_t,
                         const struct KeySwitchConstants&, uint32_t, uint32_t,
                         const std::vector<uint64_t>&, const std::vector<uint64_t>&);   // 0 = uniform ternary
