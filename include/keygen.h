@@ -8,6 +8,11 @@ struct KeyPairHost {
     std::vector<uint64_t> pkA, pkB; // sizeQ*n eval
 };
 void set_secret_hamming_weight(uint32_t h);
+void rotate_ct_device(uint64_t*, uint64_t*, uint32_t,
+                      const struct DeviceKSContext&, struct DeviceKSWork&,
+                      uint32_t, uint32_t,
+                      const std::vector<uint64_t>&, const std::vector<uint64_t>&,
+                      uint64_t*, uint64_t*, uint64_t*, cudaStream_t);
 void automorphism_eval_device(uint64_t*, uint32_t, uint32_t, uint32_t,
                               const std::vector<uint64_t>&, const std::vector<uint64_t>&,
                               uint64_t*, cudaStream_t);

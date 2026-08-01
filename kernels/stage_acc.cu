@@ -35,3 +35,22 @@ extern "C" void LaunchPtMulAcc(uint64_t* d_acc0, uint64_t* d_acc1,
     uint32_t blocks = (n + 255) / 256;
     ptmulacc_kernel<<<blocks, 256, 0, s>>>(d_acc0, d_acc1, d_b0, d_b1, d_d, q, n);
 }
+
+// a[k] = (a[k] + b[k]) mod q, one tower. Used for the keyswitch combine step
+// (c0 += ba0) so a rotation never has to leave the device.
+__global__ void addinto_kernel(uint64_t* __restrict__ a,
+                               const uint64_t* __restrict__ b,
+                               uint64_t q, uint32_t n)
+{
+    uint32_t k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= n) return;
+    uint64_t s = a[k] + b[k];
+    a[k] = (s >= q) ? s - q : s;
+}
+
+extern "C" void LaunchAddInto(uint64_t* d_a, const uint64_t* d_b,
+                              uint64_t q, uint32_t n, cudaStream_t s)
+{
+    uint32_t blocks = (n + 255) / 256;
+    addinto_kernel<<<blocks, 256, 0, s>>>(d_a, d_b, q, n);
+}

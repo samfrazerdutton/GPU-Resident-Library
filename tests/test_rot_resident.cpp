@@ -137,6 +137,31 @@ int main(int argc,char**argv){
         std::cout<<"  automorphism device vs host: "<<bad<<" mismatches, device "
                  <<tdev<<" s\n"; }
 
+    // GATE: pure device-pointer rotation vs the resident one. Same three ops,
+    // only the memory management differs, so it must be BIT-IDENTICAL. This is
+    // the primitive the stage-resident loop calls per diagonal.
+    {   std::vector<uint64_t> e0=c0,e1=c1;
+        auto C2=gpufhe::ks_context_create(K);
+        auto W2=gpufhe::ks_work_create(C2);
+        const size_t TT=(size_t)tw*n, BB=TT*8;
+        uint64_t *dc0,*dc1,*dsc,*db0,*db1;
+        cudaMalloc(&dc0,BB);cudaMalloc(&dc1,BB);cudaMalloc(&dsc,(size_t)n*8);
+        cudaMalloc(&db0,BB);cudaMalloc(&db1,BB);
+        cudaMemcpy(dc0,e0.data(),BB,cudaMemcpyHostToDevice);
+        cudaMemcpy(dc1,e1.data(),BB,cudaMemcpyHostToDevice);
+        auto pd=std::chrono::steady_clock::now();
+        gpufhe::rotate_ct_device(dc0,dc1,(uint32_t)k,C2,W2,tw,n,mod,root,dsc,db0,db1,0);
+        cudaDeviceSynchronize();
+        double td=std::chrono::duration<double>(std::chrono::steady_clock::now()-pd).count();
+        cudaMemcpy(e0.data(),dc0,BB,cudaMemcpyDeviceToHost);
+        cudaMemcpy(e1.data(),dc1,BB,cudaMemcpyDeviceToHost);
+        cudaFree(dc0);cudaFree(dc1);cudaFree(dsc);cudaFree(db0);cudaFree(db1);
+        gpufhe::ks_work_destroy(W2); gpufhe::ks_context_destroy(C2);
+        size_t bd=0;
+        for(size_t i=0;i<b0.size();++i){ if(e0[i]!=b0[i])++bd; if(e1[i]!=b1[i])++bd; }
+        std::cout<<"  rotate_ct_device vs resident: "<<bd<<" mismatches, kernels-only "
+                 <<td<<" s (excludes context build)\n"; }
+
     size_t diff=0;
     for(size_t i=0;i<a0.size();++i){ if(a0[i]!=b0[i])++diff; if(a1[i]!=b1[i])++diff; }
     std::cout<<"n="<<n<<" tw="<<tw<<" parts="<<numPart<<"\n";

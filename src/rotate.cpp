@@ -11,6 +11,7 @@
 #include "keyswitch.h"
 #include "keyswitch_resident.h"
 #include "automorph.h"
+#include "stage_acc.h"
 namespace gpufhe {
 namespace {
 uint64_t mm(uint64_t a,uint64_t b,uint64_t q){return(uint64_t)(((unsigned __int128)a*b)%q);}
@@ -110,6 +111,26 @@ void pt_to_eval_host(std::vector<uint64_t>& out, const std::vector<int64_t>& m,
         for(uint32_t k=0;k<n;++k){ long v=(long)m[k]; c[k]=(uint64_t)((v%(long)q+(long)q)%(long)q); } }
     xf_multi(out,towers,n,mod,root,false);
 }
+// PURE DEVICE-POINTER rotation: nothing crosses PCIe, no allocation, no sync.
+// Caller owns the context/work/scratch and the ciphertext already lives on the
+// GPU. This is what lets a whole transform stage stay resident: every diagonal
+// rotates the SAME uploaded ciphertext, so the loop can run entirely on device.
+void rotate_ct_device(uint64_t* d_c0, uint64_t* d_c1, uint32_t k,
+                      const DeviceKSContext& C, DeviceKSWork& W,
+                      uint32_t towers, uint32_t n,
+                      const std::vector<uint64_t>& mod,
+                      const std::vector<uint64_t>& root,
+                      uint64_t* d_scratch, uint64_t* d_b0, uint64_t* d_b1,
+                      cudaStream_t s)
+{
+    automorphism_eval_device(d_c0,towers,n,k,mod,root,d_scratch,s);
+    automorphism_eval_device(d_c1,towers,n,k,mod,root,d_scratch,s);
+    keyswitch_resident(d_c1,d_b0,d_b1,C,W,s);
+    for(uint32_t t=0;t<towers;++t)
+        LaunchAddInto(d_c0+(size_t)t*n, d_b0+(size_t)t*n, mod[t], n, s);
+    cudaMemcpyAsync(d_c1,d_b1,(size_t)towers*n*8,cudaMemcpyDeviceToDevice,s);
+}
+
 // RESIDENT rotation. Same result as rotate_ct_host but the keyswitch runs on
 // the fully device-resident path (DeviceKSContext/DeviceKSWork, zero malloc,
 // pure kernel launches) instead of keyswitch_core_resident, which despite its
