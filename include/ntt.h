@@ -8,3 +8,8 @@
 extern "C" void LaunchNTT_CT(uint64_t* d_x,
                              const uint64_t* d_roots, const uint64_t* d_precon,
                              uint32_t n, uint64_t q, cudaStream_t s);
+extern "C" void LaunchNTT_CT_Batched(uint64_t* d_x,
+                                     const uint64_t* const* d_roots,
+                                     const uint64_t* const* d_precon,
+                                     const uint64_t* d_mods,
+                                     uint32_t towers, uint32_t n, cudaStream_t s);
