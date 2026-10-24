@@ -91,6 +91,99 @@ __global__ void scale_ninv(uint64_t* __restrict__ x, uint64_t n_inv,
 
 static uint32_t ilog2_u(uint32_t v) { uint32_t k = 0; while ((1u << k) < v) k++; return k; }
 
+// ---- TOWER-BATCHED variants: grid.y = tower. Each launch covers every tower
+// instead of one, collapsing per-tower launches into one. Per-tower state
+// (modulus, inverse-root tables, n^{-1}) comes from device arrays indexed by
+// blockIdx.y; the data is towers*n contiguous, so tower t starts at x + t*n.
+// blockIdx.x keeps its exact meaning in all kernels, so the index math is
+// untouched. Mirrors ct_stage_b/ct_shared_tail_b/LaunchNTT_CT_Batched in
+// kernels/ntt_ct.cu, plus a new per-tower scale_ninv_b (INTT-only need).
+__global__ void gs_stage_b(uint64_t* x,
+                           const uint64_t* const* invroots,
+                           const uint64_t* const* invprecon,
+                           const uint64_t* mods,
+                           uint32_t n, uint32_t m, uint32_t t, uint32_t logt) {
+    const uint32_t tw = blockIdx.y;
+    uint64_t* xt = x + (size_t)tw * n;
+    const uint64_t* ir = invroots[tw];
+    const uint64_t* ip = invprecon[tw];
+    const uint64_t q = mods[tw];
+    const uint32_t nbf = n >> 1;
+    for (uint32_t bf = blockIdx.x * blockDim.x + threadIdx.x;
+         bf < nbf; bf += gridDim.x * blockDim.x) {
+        const uint32_t i   = bf >> logt;
+        const uint32_t off = bf & (t - 1);
+        const uint32_t j1  = (i << (logt + 1)) + off;
+        const uint32_t j2  = j1 + t;
+        const uint64_t omega  = ir[i + m];
+        const uint64_t pomega = ip[i + m];
+        const uint64_t lo = xt[j1];
+        const uint64_t hi = xt[j2];
+        uint64_t sum = lo + hi; if (sum >= q) sum -= q;
+        uint64_t dif = lo; if (dif < hi) dif += q; dif -= hi;
+        dif = shoup_mulmod(dif, omega, pomega, q);
+        xt[j1] = sum; xt[j2] = dif;
+    }
+}
+
+__global__ void gs_shared_head_b(uint64_t* x,
+                                 const uint64_t* const* invroots,
+                                 const uint64_t* const* invprecon,
+                                 const uint64_t* mods,
+                                 uint32_t n, uint32_t m_start, uint32_t t_end) {
+    extern __shared__ uint64_t sh[];
+    const uint32_t tw = blockIdx.y;
+    uint64_t* xt = x + (size_t)tw * n;
+    const uint64_t* ir = invroots[tw];
+    const uint64_t* ip = invprecon[tw];
+    const uint64_t q = mods[tw];
+    const uint32_t span = t_end << 1;
+    const uint32_t base = blockIdx.x * span;
+
+    for (uint32_t k = threadIdx.x; k < span; k += blockDim.x)
+        sh[k] = xt[base + k];
+    __syncthreads();
+
+    // Early GS stages: t from 1 up to t_end, m from m_start down.
+    uint32_t m = m_start;
+    for (uint32_t t = 1; t <= t_end; t <<= 1, m >>= 1) {
+        for (uint32_t bf = threadIdx.x; bf < (span >> 1); bf += blockDim.x) {
+            const uint32_t blocks_in_span = span / (t << 1);
+            const uint32_t sub = bf / t;
+            const uint32_t off = bf & (t - 1);
+            const uint32_t j1  = sub * (t << 1) + off;
+            const uint32_t j2  = j1 + t;
+            const uint32_t gi  = m + blockIdx.x * blocks_in_span + sub;
+            const uint64_t omega  = ir[gi];
+            const uint64_t pomega = ip[gi];
+            const uint64_t lo = sh[j1];
+            const uint64_t hi = sh[j2];
+            uint64_t sum = lo + hi; if (sum >= q) sum -= q;
+            uint64_t dif = lo; if (dif < hi) dif += q; dif -= hi;
+            dif = shoup_mulmod(dif, omega, pomega, q);
+            sh[j1] = sum; sh[j2] = dif;
+        }
+        __syncthreads();
+    }
+
+    for (uint32_t k = threadIdx.x; k < span; k += blockDim.x)
+        xt[base + k] = sh[k];
+}
+
+__global__ void scale_ninv_b(uint64_t* x,
+                             const uint64_t* n_inv,
+                             const uint64_t* n_inv_precon,
+                             const uint64_t* mods,
+                             uint32_t n) {
+    const uint32_t tw = blockIdx.y;
+    uint64_t* xt = x + (size_t)tw * n;
+    const uint64_t q = mods[tw];
+    const uint64_t ninv = n_inv[tw];
+    const uint64_t ninvp = n_inv_precon[tw];
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) xt[idx] = shoup_mulmod(xt[idx], ninv, ninvp, q);
+}
+
 extern "C" void LaunchINTT_GS(uint64_t* d_x,
                              const uint64_t* d_invroots, const uint64_t* d_invprecon,
                              uint32_t n, uint64_t q,
@@ -118,4 +211,40 @@ extern "C" void LaunchINTT_GS(uint64_t* d_x,
 
     const int bf = (int)((n + th - 1) / th);
     scale_ninv<<<bf, th, 0, s>>>(d_x, n_inv, n_inv_precon, n, q);
+}
+
+extern "C" void LaunchINTT_GS_Batched(uint64_t* d_x,
+                                      const uint64_t* const* d_invroots,
+                                      const uint64_t* const* d_invprecon,
+                                      const uint64_t* d_mods,
+                                      const uint64_t* d_n_inv,
+                                      const uint64_t* d_n_inv_precon,
+                                      uint32_t towers, uint32_t n, cudaStream_t s) {
+    const int th  = 256;
+    const uint32_t SPAN = (uint32_t)th * 2;      // 512 elements/block
+    const uint32_t t_end = SPAN >> 1;            // 256: largest t fusing in shared
+    const int nbf = (int)(n >> 1);
+    const int bl  = (nbf + th - 1) / th;
+
+    // Early stages (t=1..t_end) fused in shared memory: m from n/2 down.
+    const int spans = (int)(n / SPAN);
+    const size_t shbytes = SPAN * sizeof(uint64_t);
+    dim3 g_head(spans, towers);
+    gs_shared_head_b<<<g_head, th, shbytes, s>>>(d_x, d_invroots, d_invprecon, d_mods,
+                                                 n, n >> 1, t_end);
+
+    // Late stages (t > t_end) per-stage global. After the shared head, the next
+    // stage has t = SPAN (=2*t_end) and m = (n/2) >> log2(SPAN).
+    uint32_t m = (n >> 1) >> ilog2_u(SPAN);      // m after the shared stages
+    for (uint32_t t = SPAN; m >= 1; m >>= 1, t <<= 1) {
+        uint32_t logt = ilog2_u(t);
+        dim3 g_stage(bl, towers);
+        gs_stage_b<<<g_stage, th, 0, s>>>(d_x, d_invroots, d_invprecon, d_mods,
+                                         n, m, t, logt);
+        if (m == 1) break;
+    }
+
+    const int bf = (int)((n + th - 1) / th);
+    dim3 g_scale(bf, towers);
+    scale_ninv_b<<<g_scale, th, 0, s>>>(d_x, d_n_inv, d_n_inv_precon, d_mods, n);
 }
