@@ -85,10 +85,24 @@ KeySwitchResult keyswitch_core_resident(
         uint64_t *dsrc; cudaMalloc(&dsrc,(size_t)sizePart*n*8);
         cudaMemcpy(dsrc,aTowers.data()+(size_t)startIdx*n,(size_t)sizePart*n*8,
                    cudaMemcpyHostToDevice);
+        std::vector<uint64_t*> h_ir(sizePart), h_ip(sizePart);
+        std::vector<uint64_t>  h_ninv(sizePart), h_ninv_p(sizePart);
         for (uint32_t i=0;i<sizePart;++i){
             uint64_t q=K.partSrcMod[part][i]; DevTab&T=dev_tab(n,q,root_for(q));
-            LaunchINTT_GS(dsrc+(size_t)i*n,T.ir,T.ip,n,q,T.ninv,T.ninv_p,0);
+            h_ir[i]=T.ir; h_ip[i]=T.ip; h_ninv[i]=T.ninv; h_ninv_p[i]=T.ninv_p;
         }
+        uint64_t **d_ir=nullptr,**d_ip=nullptr;
+        cudaMalloc(&d_ir, sizePart*sizeof(uint64_t*));
+        cudaMalloc(&d_ip, sizePart*sizeof(uint64_t*));
+        cudaMemcpy(d_ir, h_ir.data(), sizePart*sizeof(uint64_t*), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_ip, h_ip.data(), sizePart*sizeof(uint64_t*), cudaMemcpyHostToDevice);
+        uint64_t *d_srcMod = up(K.partSrcMod[part]);
+        uint64_t *d_ninv    = up(h_ninv);
+        uint64_t *d_ninv_p  = up(h_ninv_p);
+        LaunchINTT_GS_Batched(dsrc,
+            (const uint64_t* const*)d_ir, (const uint64_t* const*)d_ip,
+            d_srcMod, d_ninv, d_ninv_p, sizePart, n, 0);
+        cudaFree(d_ir); cudaFree(d_ip); cudaFree(d_srcMod); cudaFree(d_ninv); cudaFree(d_ninv_p);
         // ApproxSwitchCRTBasis partQ -> complement (dsrc already resident)
         uint64_t *dqhi=up(K.partQHatInv[part]),*dqhip=up(K.partQHatInvPrec[part]),
                  *dq=up(K.partSrcMod[part]),*dqmp=up(K.partQHatModp[part]),
@@ -96,10 +110,21 @@ KeySwitchResult keyswitch_core_resident(
         uint64_t* ddst; cudaMalloc(&ddst,(size_t)sizeCompl*n*8);
         LaunchApproxSwitchCRTBasis(dsrc,ddst,dqhi,dqhip,dq,dqmp,dp,dmlo,dmhi,sizePart,sizeCompl,n,0);
         // NTT complement back to eval, in place on ddst
-        for(uint32_t j=0;j<sizeCompl;++j){
+        std::vector<uint64_t*> h_fr(sizeCompl), h_fp(sizeCompl);
+        for (uint32_t j=0;j<sizeCompl;++j){
             uint64_t q=K.partComplMod[part][j]; DevTab&T=dev_tab(n,q,root_for(q));
-            LaunchNTT_CT(ddst+(size_t)j*n,T.fr,T.fp,n,q,0);
+            h_fr[j]=T.fr; h_fp[j]=T.fp;
         }
+        uint64_t **d_fr=nullptr,**d_fp=nullptr;
+        cudaMalloc(&d_fr, sizeCompl*sizeof(uint64_t*));
+        cudaMalloc(&d_fp, sizeCompl*sizeof(uint64_t*));
+        cudaMemcpy(d_fr, h_fr.data(), sizeCompl*sizeof(uint64_t*), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_fp, h_fp.data(), sizeCompl*sizeof(uint64_t*), cudaMemcpyHostToDevice);
+        uint64_t *d_complMod = up(K.partComplMod[part]);
+        LaunchNTT_CT_Batched(ddst,
+            (const uint64_t* const*)d_fr, (const uint64_t* const*)d_fp,
+            d_complMod, sizeCompl, n, 0);
+        cudaFree(d_fr); cudaFree(d_fp); cudaFree(d_complMod);
         cudaDeviceSynchronize();
         std::vector<uint64_t> complEval((size_t)sizeCompl*n);
         cudaMemcpy(complEval.data(),ddst,(size_t)sizeCompl*n*8,cudaMemcpyDeviceToHost);
