@@ -287,7 +287,7 @@ int main(){
             std::vector<int64_t> md; gpufhe::encode_host(md,dg[x],n,dpt);
             std::vector<uint64_t> dE; gpufhe::pt_to_eval_host(dE,md,ctw,n,ml,rl);
             std::vector<uint64_t> t0=cs0,t1=cs1;
-            if(offs[x]) gpufhe::rotate_ct_host(t0,t1,rotAmt(offs[x]),keyAt(offs[x],ctw),ctw,n,ml,rl);
+            if(offs[x]) gpufhe::rotate_ct_resident(t0,t1,rotAmt(offs[x]),keyAt(offs[x],ctw),ctw,n,ml,rl);
             gpufhe::ct_mul_pt_host(t0,t1,dE,ctw,n,ml);
             if(fst){a0=t0;a1=t1;fst=false;} else gpufhe::ct_add_ct_host(a0,a1,t0,t1,ctw,n,ml); }
         rescaleAt(a0,a1,ctw);
@@ -527,7 +527,7 @@ int main(){
             std::vector<int64_t> md; gpufhe::encode_host(md,dd,n,dpt);
             std::vector<uint64_t> dE; gpufhe::pt_to_eval_host(dE,md,stw,n,ml,rl);
             std::vector<uint64_t> t0=*srcs0[q2].first, t1=*srcs1[q2].first;
-            if(offs[x]) gpufhe::rotate_ct_host(t0,t1,rotAmt(offs[x]),keyAt(offs[x],stw),stw,n,ml,rl);
+            if(offs[x]) gpufhe::rotate_ct_resident(t0,t1,rotAmt(offs[x]),keyAt(offs[x],stw),stw,n,ml,rl);
             gpufhe::ct_mul_pt_host(t0,t1,dE,stw,n,ml);
             if(fst){a0=t0;a1=t1;fst=false;} else gpufhe::ct_add_ct_host(a0,a1,t0,t1,stw,n,ml); }
         rescaleAt(a0,a1,stw);
