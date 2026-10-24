@@ -12,6 +12,7 @@
 #include <vector>
 #include <random>
 #include <cmath>
+#include <map>
 #include <cuda_runtime.h>
 
 namespace gpufhe {
@@ -22,16 +23,36 @@ uint64_t submod(uint64_t a,uint64_t b,uint64_t q){return a>=b?a-b:a+q-b;}
 uint64_t* up(const std::vector<uint64_t>&h){uint64_t*d;cudaMalloc(&d,h.size()*8);cudaMemcpy(d,h.data(),h.size()*8,cudaMemcpyHostToDevice);return d;}
 uint64_t powmod(uint64_t b,uint64_t e,uint64_t q){unsigned __int128 r=1,bb=b%q;while(e){if(e&1)r=(r*bb)%q;bb=(bb*bb)%q;e>>=1;}return(uint64_t)r;}
 uint64_t invmod(uint64_t a,uint64_t q){return powmod(a%q,q-2,q);}
-void ntt_tower(std::vector<uint64_t>&h,uint32_t n,uint64_t q,uint64_t root){
+
+// PERF: ntt_tower is called 3x per tower per part (u, e0, e1) with the same
+// (n,q,root), but used to rebuild the root table on CPU and re-upload it to
+// the device on every call. Cache the device-resident forward-only table by
+// (n,q) for the process lifetime, mirroring keyswitch.cpp's DevTab/dev_tab
+// pattern (kept as a separate, private cache here -- this file never does
+// INTT, only LaunchNTT_CT forward transforms).
+struct EkDevTab { uint64_t* fr=nullptr; uint64_t* fp=nullptr; };
+EkDevTab build_ek_tab(uint32_t n, uint64_t q, uint64_t root){
     auto br=[](uint32_t v,uint32_t b){uint32_t r=0;for(uint32_t k=0;k<b;k++){r=(r<<1)|(v&1);v>>=1;}return r;};
     uint32_t logn=0;while((1u<<logn)<n)++logn;
     std::vector<uint64_t> fr(n),fp(n),pw(n);pw[0]=1;
     for(uint32_t i=1;i<n;++i)pw[i]=mulmod(pw[i-1],root,q);
     for(uint32_t i=0;i<n;++i){uint64_t r=pw[br(i,logn)];fr[i]=r;fp[i]=(uint64_t)(((__uint128_t)r<<64)/q);}
-    uint64_t*dx=up(h),*dr=up(fr),*dp=up(fp);
-    LaunchNTT_CT(dx,dr,dp,n,q,0);cudaDeviceSynchronize();
+    EkDevTab T; T.fr=up(fr); T.fp=up(fp);
+    return T;
+}
+EkDevTab& ek_dev_tab(uint32_t n, uint64_t q, uint64_t root){
+    static std::map<std::pair<uint32_t,uint64_t>,EkDevTab> ekCache;
+    auto key=std::make_pair(n,q);
+    auto it=ekCache.find(key);
+    if(it!=ekCache.end()) return it->second;
+    return ekCache.emplace(key,build_ek_tab(n,q,root)).first->second;
+}
+void ntt_tower(std::vector<uint64_t>&h,uint32_t n,uint64_t q,uint64_t root){
+    EkDevTab& T = ek_dev_tab(n, q, root);
+    uint64_t* dx = up(h);
+    LaunchNTT_CT(dx,T.fr,T.fp,n,q,0);cudaDeviceSynchronize();
     cudaMemcpy(h.data(),dx,(size_t)n*8,cudaMemcpyDeviceToHost);
-    cudaFree(dx);cudaFree(dr);cudaFree(dp);
+    cudaFree(dx);
 }
 } // anon
 
