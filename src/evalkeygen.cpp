@@ -24,12 +24,12 @@ uint64_t* up(const std::vector<uint64_t>&h){uint64_t*d;cudaMalloc(&d,h.size()*8)
 uint64_t powmod(uint64_t b,uint64_t e,uint64_t q){unsigned __int128 r=1,bb=b%q;while(e){if(e&1)r=(r*bb)%q;bb=(bb*bb)%q;e>>=1;}return(uint64_t)r;}
 uint64_t invmod(uint64_t a,uint64_t q){return powmod(a%q,q-2,q);}
 
-// PERF: ntt_tower is called 3x per tower per part (u, e0, e1) with the same
-// (n,q,root), but used to rebuild the root table on CPU and re-upload it to
-// the device on every call. Cache the device-resident forward-only table by
-// (n,q) for the process lifetime, mirroring keyswitch.cpp's DevTab/dev_tab
-// pattern (kept as a separate, private cache here -- this file never does
-// INTT, only LaunchNTT_CT forward transforms).
+// PERF: root/precon table cache by (n,q) for the process lifetime, mirroring
+// keyswitch.cpp's DevTab/dev_tab pattern (kept as a separate, private cache
+// here -- this file never does INTT, only LaunchNTT_CT forward transforms).
+// The data path is also batched: per part, u/e0/e1 are each uploaded once,
+// transformed once across all sizeQlP towers via LaunchNTT_CT_Batched, and
+// downloaded once, instead of one upload/sync/download per tower per buffer.
 struct EkDevTab { uint64_t* fr=nullptr; uint64_t* fp=nullptr; };
 EkDevTab build_ek_tab(uint32_t n, uint64_t q, uint64_t root){
     auto br=[](uint32_t v,uint32_t b){uint32_t r=0;for(uint32_t k=0;k<b;k++){r=(r<<1)|(v&1);v>>=1;}return r;};
@@ -46,13 +46,6 @@ EkDevTab& ek_dev_tab(uint32_t n, uint64_t q, uint64_t root){
     auto it=ekCache.find(key);
     if(it!=ekCache.end()) return it->second;
     return ekCache.emplace(key,build_ek_tab(n,q,root)).first->second;
-}
-void ntt_tower(std::vector<uint64_t>&h,uint32_t n,uint64_t q,uint64_t root){
-    EkDevTab& T = ek_dev_tab(n, q, root);
-    uint64_t* dx = up(h);
-    LaunchNTT_CT(dx,T.fr,T.fp,n,q,0);cudaDeviceSynchronize();
-    cudaMemcpy(h.data(),dx,(size_t)n*8,cudaMemcpyDeviceToHost);
-    cudaFree(dx);
 }
 } // anon
 
@@ -80,6 +73,18 @@ void evalkeygen_host_sold(KeySwitchConstants& K,
     std::mt19937_64 rng(seed);
     std::normal_distribution<double> gauss(0.0,sigma);
 
+    std::vector<uint64_t*> h_fr(sizeQlP), h_fp(sizeQlP);
+    for(uint32_t t=0;t<sizeQlP;++t){
+        EkDevTab& T = ek_dev_tab(n, modQP[t], rootQP[t]);
+        h_fr[t]=T.fr; h_fp[t]=T.fp;
+    }
+    uint64_t **d_fr=nullptr, **d_fp=nullptr;
+    cudaMalloc(&d_fr, sizeQlP*sizeof(uint64_t*));
+    cudaMalloc(&d_fp, sizeQlP*sizeof(uint64_t*));
+    cudaMemcpy(d_fr, h_fr.data(), sizeQlP*sizeof(uint64_t*), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_fp, h_fp.data(), sizeQlP*sizeof(uint64_t*), cudaMemcpyHostToDevice);
+    uint64_t* d_modQP = up(modQP);
+
     for(uint32_t part=0; part<numPart; ++part){
         uint32_t startIdx=alpha*part;
         uint32_t sizePart=(sizeQl>startIdx+alpha)?alpha:(sizeQl-startIdx);
@@ -92,13 +97,27 @@ void evalkeygen_host_sold(KeySwitchConstants& K,
         for(uint32_t k=0;k<n;++k){ uc[k]=(int)(rng()%3)-1;
             e0c[k]=(int)std::lround(gauss(rng)); e1c[k]=(int)std::lround(gauss(rng)); }
 
-        for(uint32_t t=0;t<sizeQlP;++t){ uint64_t q=modQP[t], rt=rootQP[t];
-            // embed u,e0,e1 into this tower (coeff), NTT to eval
-            std::vector<uint64_t> uT(n),e0T(n),e1T(n);
+        // embed u,e0,e1 into every tower (coeff), batched into contiguous buffers
+        std::vector<uint64_t> uBuf((size_t)sizeQlP*n), e0Buf((size_t)sizeQlP*n), e1Buf((size_t)sizeQlP*n);
+        for(uint32_t t=0;t<sizeQlP;++t){ uint64_t q=modQP[t];
+            uint64_t* uT=uBuf.data()+(size_t)t*n; uint64_t* e0T=e0Buf.data()+(size_t)t*n; uint64_t* e1T=e1Buf.data()+(size_t)t*n;
             for(uint32_t k=0;k<n;++k){ long uv=uc[k]; uT[k]=(uint64_t)((uv%(long)q+(long)q)%(long)q);
                 long a0=e0c[k]; e0T[k]=(uint64_t)((a0%(long)q+(long)q)%(long)q);
                 long a1=e1c[k]; e1T[k]=(uint64_t)((a1%(long)q+(long)q)%(long)q); }
-            ntt_tower(uT,n,q,rt); ntt_tower(e0T,n,q,rt); ntt_tower(e1T,n,q,rt);
+        }
+        // NTT to eval: one upload/transform/download per buffer, across all towers
+        uint64_t *d_u=up(uBuf), *d_e0=up(e0Buf), *d_e1=up(e1Buf);
+        LaunchNTT_CT_Batched(d_u, (const uint64_t* const*)d_fr,(const uint64_t* const*)d_fp,d_modQP,sizeQlP,n,0);
+        LaunchNTT_CT_Batched(d_e0,(const uint64_t* const*)d_fr,(const uint64_t* const*)d_fp,d_modQP,sizeQlP,n,0);
+        LaunchNTT_CT_Batched(d_e1,(const uint64_t* const*)d_fr,(const uint64_t* const*)d_fp,d_modQP,sizeQlP,n,0);
+        cudaDeviceSynchronize();
+        cudaMemcpy(uBuf.data(), d_u, (size_t)sizeQlP*n*8,cudaMemcpyDeviceToHost);
+        cudaMemcpy(e0Buf.data(),d_e0,(size_t)sizeQlP*n*8,cudaMemcpyDeviceToHost);
+        cudaMemcpy(e1Buf.data(),d_e1,(size_t)sizeQlP*n*8,cudaMemcpyDeviceToHost);
+        cudaFree(d_u); cudaFree(d_e0); cudaFree(d_e1);
+
+        for(uint32_t t=0;t<sizeQlP;++t){ uint64_t q=modQP[t];
+            const uint64_t* uT=uBuf.data()+(size_t)t*n; const uint64_t* e0T=e0Buf.data()+(size_t)t*n; const uint64_t* e1T=e1Buf.data()+(size_t)t*n;
             for(uint32_t k=0;k<n;++k){
                 uint64_t p1u=mulmod(pkA_QP[(size_t)t*n+k],uT[k],q);   // newp1 = a
                 uint64_t p0u=mulmod(pkB_QP[(size_t)t*n+k],uT[k],q);   // newp0 = b
@@ -114,6 +133,7 @@ void evalkeygen_host_sold(KeySwitchConstants& K,
             }
         }
     }
+    cudaFree(d_fr); cudaFree(d_fp); cudaFree(d_modQP);
 }
 
 // relin wrapper: sOld = s^2
