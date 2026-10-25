@@ -351,6 +351,19 @@ int main(){
         for(uint32_t t=0;t<tw+sizeP;++t){uint64_t q=mq[t],P=1%q;for(uint32_t j=0;j<sizeP;++j)P=mmu(P,modP[j]%q,q);PM[t]=P;}
         gpufhe::evalkeygen_host(K,sl(KPqp.s),sl(KPqp.pkA),sl(KPqp.pkB),PM,mq,rq,ns,3.19,202);
         return K; };
+    // Structural-only constants for rescale: rescale_resident_raw never reads
+    // K.av/K.bv (it's pure NTT/INTT + modulus combine), so skip evalkeygen_host
+    // entirely when the caller only needs rescIP. Mirrors rescaleAt's own
+    // zero-filled-av/bv pattern above, just as a reusable builder.
+    auto buildKStruct=[&](uint32_t tw)->gpufhe::KeySwitchConstants{
+        std::vector<uint64_t> ml(mod.begin(),mod.begin()+tw),rl(root.begin(),root.begin()+tw);
+        gpufhe::KeySwitchConstants K; K.n=n;
+        gpufhe::compute_keyswitch_constants(K,ml,modP,npFor(tw));
+        for(uint32_t i=0;i<tw;++i){K.rootModList.push_back(ml[i]);K.rootValList.push_back(rl[i]);}
+        for(uint32_t j=0;j<sizeP;++j){K.rootModList.push_back(modP[j]);K.rootValList.push_back(rootQP[sizeQ+j]);}
+        K.av.assign(K.numPart,{}); K.bv.assign(K.numPart,{}); K.evalKeyTowers=tw+sizeP;
+        for(uint32_t p=0;p<K.numPart;++p){K.av[p].assign((size_t)(tw+sizeP)*n,0);K.bv[p].assign((size_t)(tw+sizeP)*n,0);}
+        return K; };
     auto rescIP=[&](std::vector<uint64_t>&a0,std::vector<uint64_t>&a1,uint32_t tw,const gpufhe::KeySwitchConstants&Kx){
         auto Cl=gpufhe::ks_context_create(Kx);
         std::vector<uint64_t> s1,s2; {std::vector<uint64_t> sub(mod.begin(),mod.begin()+tw);
@@ -402,7 +415,7 @@ int main(){
         std::vector<uint64_t> ml(mod.begin(),mod.begin()+A.tw),rl(root.begin(),root.begin()+A.tw);
         std::vector<uint64_t> e2; gpufhe::pt_to_eval_host(e2,m2,A.tw,n,ml,rl);
         gpufhe::ct_mul_pt_host(o.c0,o.c1,e2,A.tw,n,ml);
-        auto Kl=buildK(A.tw); rescIP(o.c0,o.c1,A.tw,Kl);
+        auto Kl=buildKStruct(A.tw); rescIP(o.c0,o.c1,A.tw,Kl);
         o.tw=A.tw-1; o.scale=A.scale*Delta_w/(double)mod[A.tw-1]; return o; };
 
     // K = max|a_k/q0| grows like sqrt(n): uniform ternary s has ~n/3 nonzero
@@ -447,7 +460,7 @@ int main(){
             gpufhe::ct_mul_pt_host(t.c0,t.c1,cE,low,n,ml);
             if(f1){acc.c0=t.c0;acc.c1=t.c1;acc.scale=t.scale*Delta_w;f1=false;}
             else gpufhe::ct_add_ct_host(acc.c0,acc.c1,t.c0,t.c1,low,n,ml); }
-        { auto Kd=buildK(low); rescIP(acc.c0,acc.c1,low,Kd);
+        { auto Kd=buildKStruct(low); rescIP(acc.c0,acc.c1,low,Kd);
           acc.scale/=(double)mod[low-1]; acc.tw=low-1; }
         subK(acc,cd{-cc[0],0});
         for(uint32_t j=1;j<=rDbl;++j){ Ct sq=mulCt(acc,acc); x2(sq); subK(sq,cd{1,0}); acc=sq; }
