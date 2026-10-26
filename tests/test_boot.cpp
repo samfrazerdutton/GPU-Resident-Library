@@ -337,6 +337,17 @@ int main(){
     // CONTROL: regenerate the relin key FRESH at each level (no reuse) to
     // separate "alpha=10 is broken" from "reuse across a numPart change is broken".
     auto buildK=[&](uint32_t tw)->gpufhe::KeySwitchConstants{
+        // buildK(tw) is a pure function of tw alone: every capture above is
+        // fixed for this bootstrap run and the evalkeygen_host seed below
+        // (202) is a hardcoded literal, so two calls with the same tw are
+        // byte-for-byte identical. EvalMod's R and I branches independently
+        // walk the exact same descending sequence of tw values (same starting
+        // tw, same degC/rDbl), so every tw here is regenerated twice with no
+        // difference whatsoever. Cache by tw (process-lifetime, same pattern
+        // as g_rtab/upc elsewhere in this codebase) instead of regenerating.
+        static std::map<uint32_t,gpufhe::KeySwitchConstants> g_buildK_cache;
+        auto cit=g_buildK_cache.find(tw);
+        if(cit!=g_buildK_cache.end()) return cit->second;
         std::vector<uint64_t> ml(mod.begin(),mod.begin()+tw),rl(root.begin(),root.begin()+tw);
         std::vector<uint64_t> mq(ml); for(auto p:modP)mq.push_back(p);
         std::vector<uint64_t> rq(rl); for(uint32_t j=0;j<sizeP;++j)rq.push_back(rootQP[sizeQ+j]);
@@ -351,6 +362,7 @@ int main(){
         std::vector<uint64_t> PM(tw+sizeP);
         for(uint32_t t=0;t<tw+sizeP;++t){uint64_t q=mq[t],P=1%q;for(uint32_t j=0;j<sizeP;++j)P=mmu(P,modP[j]%q,q);PM[t]=P;}
         gpufhe::evalkeygen_host(K,sl(KPqp.s),sl(KPqp.pkA),sl(KPqp.pkB),PM,mq,rq,ns,3.19,202);
+        g_buildK_cache.emplace(tw,K);
         return K; };
     // Structural-only constants for rescale: rescale_resident_raw never reads
     // K.av/K.bv (it's pure NTT/INTT + modulus combine), so skip evalkeygen_host
