@@ -110,6 +110,11 @@ DeviceKSWork ks_work_create(const DeviceKSContext& C){
     cudaMalloc(&W.d_pwork,(size_t)C.sizeP*n*8);
     cudaMalloc(&W.d_qsw,(size_t)C.sizeQl*n*8);
     cudaMalloc(&W.d_digPtrs,(size_t)C.sizeQlP*sizeof(uint64_t*));
+    cudaMalloc(&W.d_rootsA,(size_t)C.sizeQlP*sizeof(uint64_t*));
+    cudaMalloc(&W.d_rootsB,(size_t)C.sizeQlP*sizeof(uint64_t*));
+    cudaMalloc(&W.d_towerMods,(size_t)C.sizeQlP*8);
+    cudaMalloc(&W.d_nInv,(size_t)C.sizeQlP*8);
+    cudaMalloc(&W.d_nInvPrecon,(size_t)C.sizeQlP*8);
     return W;
 }
 
@@ -128,6 +133,7 @@ void ks_context_destroy(DeviceKSContext& C){
 void ks_work_destroy(DeviceKSWork& W){
     cudaFree(W.d_part);cudaFree(W.d_compl);cudaFree(W.d_res0);cudaFree(W.d_res1);
     cudaFree(W.d_pwork);cudaFree(W.d_qsw);cudaFree(W.d_digPtrs);
+    cudaFree(W.d_rootsA);cudaFree(W.d_rootsB);cudaFree(W.d_towerMods);cudaFree(W.d_nInv);cudaFree(W.d_nInvPrecon);
 }
 
 // modulus -> root-table row
@@ -153,10 +159,21 @@ void keyswitch_resident(const uint64_t* d_a, uint64_t* d_ba0, uint64_t* d_ba1,
         // 1. copy part slice (keep d_a intact), INTT each tower in place
         cudaMemcpyAsync(W.d_part, d_a+(size_t)st*n, (size_t)sp*n*8,
                         cudaMemcpyDeviceToDevice, s);
-        for(uint32_t i=0;i<sp;++i){
-            uint64_t q=C.qModHost[st+i]; int r=row_of(C,q);
-            LaunchINTT_GS(W.d_part+(size_t)i*n, C.d_ir[r], C.d_ip[r],
-                          n, q, C.ninv[r], C.ninv_p[r], s);
+        {
+            std::vector<const uint64_t*> hir(sp),hip(sp);
+            std::vector<uint64_t> hmod(sp),hninv(sp),hninvp(sp);
+            for(uint32_t i=0;i<sp;++i){
+                uint64_t q=C.qModHost[st+i]; int r=row_of(C,q);
+                hir[i]=C.d_ir[r]; hip[i]=C.d_ip[r];
+                hmod[i]=q; hninv[i]=C.ninv[r]; hninvp[i]=C.ninv_p[r];
+            }
+            cudaMemcpyAsync(W.d_rootsA,hir.data(),sp*sizeof(uint64_t*),cudaMemcpyHostToDevice,s);
+            cudaMemcpyAsync(W.d_rootsB,hip.data(),sp*sizeof(uint64_t*),cudaMemcpyHostToDevice,s);
+            cudaMemcpyAsync(W.d_towerMods,hmod.data(),sp*8,cudaMemcpyHostToDevice,s);
+            cudaMemcpyAsync(W.d_nInv,hninv.data(),sp*8,cudaMemcpyHostToDevice,s);
+            cudaMemcpyAsync(W.d_nInvPrecon,hninvp.data(),sp*8,cudaMemcpyHostToDevice,s);
+            LaunchINTT_GS_Batched(W.d_part, W.d_rootsA, W.d_rootsB, W.d_towerMods,
+                                  W.d_nInv, W.d_nInvPrecon, sp, n, s);
         }
         // 2. basis convert partQ -> complement
         LaunchApproxSwitchCRTBasis(W.d_part, W.d_compl,
@@ -164,9 +181,17 @@ void keyswitch_resident(const uint64_t* d_a, uint64_t* d_ba0, uint64_t* d_ba1,
             C.d_qmp[part], C.d_complMod[part], C.d_mlo[part], C.d_mhi[part],
             sp, sc, n, s);
         // 3. NTT each complement tower back to eval
-        for(uint32_t j=0;j<sc;++j){
-            uint64_t q=C.complModHost[part][j]; int r=row_of(C,q);
-            LaunchNTT_CT(W.d_compl+(size_t)j*n, C.d_fr[r], C.d_fp[r], n, q, s);
+        {
+            std::vector<const uint64_t*> hfr(sc),hfp(sc);
+            std::vector<uint64_t> hmod(sc);
+            for(uint32_t j=0;j<sc;++j){
+                uint64_t q=C.complModHost[part][j]; int r=row_of(C,q);
+                hfr[j]=C.d_fr[r]; hfp[j]=C.d_fp[r]; hmod[j]=q;
+            }
+            cudaMemcpyAsync(W.d_rootsA,hfr.data(),sc*sizeof(uint64_t*),cudaMemcpyHostToDevice,s);
+            cudaMemcpyAsync(W.d_rootsB,hfp.data(),sc*sizeof(uint64_t*),cudaMemcpyHostToDevice,s);
+            cudaMemcpyAsync(W.d_towerMods,hmod.data(),sc*8,cudaMemcpyHostToDevice,s);
+            LaunchNTT_CT_Batched(W.d_compl, W.d_rootsA, W.d_rootsB, W.d_towerMods, sc, n, s);
         }
         // 4. accumulate: digit tower i = d_a (in range) or d_compl (else).
         // BATCHED: was sizeQlP launches per part (32*15 = 480 per keyswitch at
@@ -204,18 +229,40 @@ void keyswitch_resident(const uint64_t* d_a, uint64_t* d_ba0, uint64_t* d_ba1,
     auto moddown=[&](uint64_t* d_res, uint64_t* d_out){
         cudaMemcpyAsync(W.d_pwork, d_res+(size_t)sizeQl*n, (size_t)sizeP*n*8,
                         cudaMemcpyDeviceToDevice, s);
-        for(uint32_t j=0;j<sizeP;++j){
-            uint64_t q=C.pModHost[j]; int r=row_of(C,q);
-            LaunchINTT_GS(W.d_pwork+(size_t)j*n, C.d_ir[r], C.d_ip[r],
-                          n, q, C.ninv[r], C.ninv_p[r], s);
+        {
+            std::vector<const uint64_t*> hir(sizeP),hip(sizeP);
+            std::vector<uint64_t> hmod(sizeP),hninv(sizeP),hninvp(sizeP);
+            for(uint32_t j=0;j<sizeP;++j){
+                uint64_t q=C.pModHost[j]; int r=row_of(C,q);
+                hir[j]=C.d_ir[r]; hip[j]=C.d_ip[r];
+                hmod[j]=q; hninv[j]=C.ninv[r]; hninvp[j]=C.ninv_p[r];
+            }
+            cudaMemcpyAsync(W.d_rootsA,hir.data(),sizeP*sizeof(uint64_t*),cudaMemcpyHostToDevice,s);
+            cudaMemcpyAsync(W.d_rootsB,hip.data(),sizeP*sizeof(uint64_t*),cudaMemcpyHostToDevice,s);
+            cudaMemcpyAsync(W.d_towerMods,hmod.data(),sizeP*8,cudaMemcpyHostToDevice,s);
+            cudaMemcpyAsync(W.d_nInv,hninv.data(),sizeP*8,cudaMemcpyHostToDevice,s);
+            cudaMemcpyAsync(W.d_nInvPrecon,hninvp.data(),sizeP*8,cudaMemcpyHostToDevice,s);
+            LaunchINTT_GS_Batched(W.d_pwork, W.d_rootsA, W.d_rootsB, W.d_towerMods,
+                                  W.d_nInv, W.d_nInvPrecon, sizeP, n, s);
         }
         LaunchApproxSwitchCRTBasis(W.d_pwork, W.d_qsw,
             C.d_pHatInv, C.d_pHatInvPrec, C.d_pMod,
             C.d_pHatModq, C.d_qMod, C.d_mdMuLo, C.d_mdMuHi,
             sizeP, sizeQl, n, s);
+        {
+            std::vector<const uint64_t*> hfr(sizeQl),hfp(sizeQl);
+            std::vector<uint64_t> hmod(sizeQl);
+            for(uint32_t i=0;i<sizeQl;++i){
+                uint64_t q=C.qModHost[i]; int r=row_of(C,q);
+                hfr[i]=C.d_fr[r]; hfp[i]=C.d_fp[r]; hmod[i]=q;
+            }
+            cudaMemcpyAsync(W.d_rootsA,hfr.data(),sizeQl*sizeof(uint64_t*),cudaMemcpyHostToDevice,s);
+            cudaMemcpyAsync(W.d_rootsB,hfp.data(),sizeQl*sizeof(uint64_t*),cudaMemcpyHostToDevice,s);
+            cudaMemcpyAsync(W.d_towerMods,hmod.data(),sizeQl*8,cudaMemcpyHostToDevice,s);
+            LaunchNTT_CT_Batched(W.d_qsw, W.d_rootsA, W.d_rootsB, W.d_towerMods, sizeQl, n, s);
+        }
         for(uint32_t i=0;i<sizeQl;++i){
-            uint64_t q=C.qModHost[i]; int r=row_of(C,q);
-            LaunchNTT_CT(W.d_qsw+(size_t)i*n, C.d_fr[r], C.d_fp[r], n, q, s);
+            uint64_t q=C.qModHost[i];
             LaunchModDownCombine(d_out+(size_t)i*n, d_res+(size_t)i*n,
                                  W.d_qsw+(size_t)i*n, C.pInvModqHost[i], q, n, s);
         }

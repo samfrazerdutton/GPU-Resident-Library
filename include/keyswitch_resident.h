@@ -36,6 +36,11 @@ struct DeviceKSWork {
     uint64_t *d_pwork=nullptr;     // sizeP * n
     uint64_t *d_qsw=nullptr;       // sizeQl * n
     const uint64_t** d_digPtrs=nullptr;   // sizeQlP digit pointers (batched fastcore)
+    const uint64_t** d_rootsA=nullptr;   // roots/invroots ptr array, sizeQlP entries (upper bound)
+    const uint64_t** d_rootsB=nullptr;   // precon/invprecon ptr array, sizeQlP entries
+    uint64_t* d_towerMods=nullptr;       // per-tower modulus, sizeQlP entries
+    uint64_t* d_nInv=nullptr;            // per-tower n_inv (INTT only), sizeQlP entries
+    uint64_t* d_nInvPrecon=nullptr;      // per-tower n_inv_precon (INTT only), sizeQlP entries
 };
 
 DeviceKSContext ks_context_create(const KeySwitchConstants& K);
