@@ -6,6 +6,7 @@
 #include "keyswitch.h"
 #include "keyswitch_resident.h"
 #include "keygen.h"
+#include "rns_arith.h"
 #include <cuda_runtime.h>
 #include <iostream>
 #include <vector>
@@ -381,12 +382,26 @@ int main(){
     auto mulCt=[&](const Ct&A,const Ct&B)->Ct{
         uint32_t tw=A.tw; size_t TT=(size_t)tw*n;
         std::vector<uint64_t> t0(TT),t1(TT),t2(TT);
-        for(uint32_t t=0;t<tw;++t){uint64_t q=mod[t];
-            for(uint32_t k=0;k<n;++k){size_t x=(size_t)t*n+k;
-                t0[x]=mmu(A.c0[x],B.c0[x],q);
-                uint64_t p1=mmu(A.c0[x],B.c1[x],q),p2=mmu(A.c1[x],B.c0[x],q);
-                uint64_t sm2=p1+p2; t1[x]=(sm2>=q)?sm2-q:sm2;
-                t2[x]=mmu(A.c1[x],B.c1[x],q);}}
+        {   // RNS tensor product (t0=a0*b0, t1=a0*b1+a1*b0, t2=a1*b1), batched
+            // across all tw towers on the GPU -- was a CPU loop of 4 128-bit
+            // mmu() calls per element (up to tw*n = 245760 elements).
+            uint64_t *d_a0,*d_a1,*d_b0,*d_b1,*d_t0,*d_t1,*d_t2;
+            cudaMalloc(&d_a0,TT*8);cudaMalloc(&d_a1,TT*8);
+            cudaMalloc(&d_b0,TT*8);cudaMalloc(&d_b1,TT*8);
+            cudaMalloc(&d_t0,TT*8);cudaMalloc(&d_t1,TT*8);cudaMalloc(&d_t2,TT*8);
+            cudaMemcpy(d_a0,A.c0.data(),TT*8,cudaMemcpyHostToDevice);
+            cudaMemcpy(d_a1,A.c1.data(),TT*8,cudaMemcpyHostToDevice);
+            cudaMemcpy(d_b0,B.c0.data(),TT*8,cudaMemcpyHostToDevice);
+            cudaMemcpy(d_b1,B.c1.data(),TT*8,cudaMemcpyHostToDevice);
+            LaunchCtTensorBatched(d_a0,d_a1,d_b0,d_b1,d_t0,d_t1,d_t2,
+                                  mod.data(),tw,n,0);
+            cudaDeviceSynchronize();
+            cudaMemcpy(t0.data(),d_t0,TT*8,cudaMemcpyDeviceToHost);
+            cudaMemcpy(t1.data(),d_t1,TT*8,cudaMemcpyDeviceToHost);
+            cudaMemcpy(t2.data(),d_t2,TT*8,cudaMemcpyDeviceToHost);
+            cudaFree(d_a0);cudaFree(d_a1);cudaFree(d_b0);cudaFree(d_b1);
+            cudaFree(d_t0);cudaFree(d_t1);cudaFree(d_t2);
+        }
         auto Kl=buildK(tw); auto R=gpufhe::keyswitch_core_resident(t2,Kl);
         std::vector<uint64_t> r0b(TT),r1b(TT);
         for(uint32_t t=0;t<tw;++t){uint64_t q=mod[t];
