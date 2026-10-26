@@ -51,17 +51,30 @@ GPUs").
 
 ## Active hypothesis / next action (see NEXT_SESSION.md for exact commands)
 
+**Important late-session finding: this session's GPU/measurement
+environment has drifted substantially over many hours of continuous use**
+(fresh baseline re-measurements of the UNCHANGED, already-proven
+`rotate_ct_resident` code now show 71-76s for that bucket / 130-140s total
+bootstrap, vs. 62-66s / 114-115s measured earlier THIS SAME SESSION on
+IDENTICAL code). This is almost certainly thermal/clock throttling
+accumulating on a Max-Q mobile GPU under sustained load, not a code issue.
+**Any single-run sequential comparison from this point forward in a long
+session is unreliable** — a fresh session (cold GPU) or interleaved/
+repeated-trial measurement is required to validate anything further.
+
 Three ranked, literature-grounded experiments queued (see
 `EXPERIMENT_LEDGER.md`'s "Round 2" table and `NEXT_SESSION.md`):
 1. Make `rotate_ct_resident` actually resident (hoist context/key out of
-   the BSGS loop) — lowest risk, pure refactor, **in progress now**.
+   the BSGS loop) — **attempted, built, bit-exact, but measurement was
+   inconclusive due to the environmental drift above; reverted, not
+   disproven.** Re-test first in a fresh session.
 2. Eval-domain automorphism as a precomputed index permutation (removes
-   the INTT→permute→NTT round trip entirely).
+   the INTT→permute→NTT round trip entirely) — not yet attempted.
 3. Correct-order rotation hoisting (OpenFHE's method: permute the QP-basis
    output after key-switch, not the decomposed digits; regenerate keys
    with the ψ_{k⁻¹}(s) convention) — now understood to require ZERO
    changes to the approximate basis conversion, unlike today's failed
-   attempt #1.
+   attempt #1. Not yet attempted.
 
 Separately, and NOT yet started: the KROT/KSC bounded-cache redesign
 (blocking any n-scaling work) and the n=65536/uniform-ternary parameter
