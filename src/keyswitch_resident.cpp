@@ -18,8 +18,10 @@ namespace {
 uint64_t mulmod(uint64_t a,uint64_t b,uint64_t q){return(uint64_t)(((unsigned __int128)a*b)%q);}
 uint64_t powmod(uint64_t b,uint64_t e,uint64_t q){unsigned __int128 r=1,bb=b%q;while(e){if(e&1)r=(r*bb)%q;bb=(bb*bb)%q;e>>=1;}return(uint64_t)r;}
 uint64_t invmod(uint64_t a,uint64_t q){return powmod(a%q,q-2,q);}
-uint64_t* upv(const std::vector<uint64_t>& h){ uint64_t* d;
-    cudaMalloc(&d,h.size()*8); cudaMemcpy(d,h.data(),h.size()*8,cudaMemcpyHostToDevice); return d; }
+uint64_t* upv(const std::vector<uint64_t>& h, cudaStream_t s=0){ uint64_t* d;
+    cudaMalloc(&d,h.size()*8);
+    cudaMemcpyAsync(d,h.data(),h.size()*8,cudaMemcpyHostToDevice,s);
+    return d; }
 // These constants depend only on (n,sizeQl,numPart) -- NOT on the key -- yet
 // every rotation rebuilt ~135 identical allocations. Cache by that tuple; only
 // av/bv stay per-key. Contexts do not own these (destroy must not free them).
@@ -29,7 +31,7 @@ uint64_t* upc(uint64_t key, const std::vector<uint64_t>& h){
     uint64_t* d=upv(h); m.emplace(key,d); return d; }
 } // anon
 
-DeviceKSContext ks_context_create(const KeySwitchConstants& K){
+DeviceKSContext ks_context_create(const KeySwitchConstants& K, cudaStream_t s){
     DeviceKSContext C;
     C.n=K.n; C.sizeQl=K.sizeQl; C.sizeP=K.sizeP; C.sizeQlP=K.sizeQl+K.sizeP;
     C.numPart=K.numPart; C.fullQ=K.fullQ;
@@ -79,8 +81,8 @@ DeviceKSContext ks_context_create(const KeySwitchConstants& K){
         C.d_complMod.push_back(upc(KB|((uint64_t)p<<8)|4,K.partComplMod[p]));
         C.d_mlo.push_back(upc(KB|((uint64_t)p<<8)|5,K.partBMuLo[p]));
         C.d_mhi.push_back(upc(KB|((uint64_t)p<<8)|6,K.partBMuHi[p]));
-        C.d_av.push_back(upv(K.av[p]));
-        C.d_bv.push_back(upv(K.bv[p]));
+        C.d_av.push_back(upv(K.av[p], s));
+        C.d_bv.push_back(upv(K.bv[p], s));
     }
 
     // moddown constants
@@ -96,7 +98,8 @@ DeviceKSContext ks_context_create(const KeySwitchConstants& K){
             kr[i]=(i>=C.sizeQl)? i+dl : i; }
         C.d_modsQlP=upc(KB|200,mq);
         cudaMalloc(&C.d_keyRow,C.sizeQlP*4);
-        cudaMemcpy(C.d_keyRow,kr.data(),C.sizeQlP*4,cudaMemcpyHostToDevice); }
+        // kr is pageable; cudaMemcpyAsync falls back to sync here -- do not pin kr without adding an explicit cudaStreamSynchronize first.
+        cudaMemcpyAsync(C.d_keyRow,kr.data(),C.sizeQlP*4,cudaMemcpyHostToDevice,s); }
     return C;
 }
 

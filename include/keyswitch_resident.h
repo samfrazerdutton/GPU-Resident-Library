@@ -43,7 +43,7 @@ struct DeviceKSWork {
     uint64_t* d_nInvPrecon=nullptr;      // per-tower n_inv_precon (INTT only), sizeQlP entries
 };
 
-DeviceKSContext ks_context_create(const KeySwitchConstants& K);
+DeviceKSContext ks_context_create(const KeySwitchConstants& K, cudaStream_t s=0);
 DeviceKSWork    ks_work_create(const DeviceKSContext& C);
 void ks_context_destroy(DeviceKSContext& C);
 void ks_work_destroy(DeviceKSWork& W);
