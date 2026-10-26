@@ -15,6 +15,8 @@
 #include <map>
 #include <functional>
 #include <chrono>
+#include <sys/resource.h>
+static double rssMB(){ struct rusage ru; getrusage(RUSAGE_SELF,&ru); return ru.ru_maxrss/1024.0; }
 namespace gpufhe {
 void encode_host(std::vector<int64_t>&, const std::vector<std::complex<double>>&, uint32_t, double);
 void decode_host(std::vector<std::complex<double>>&, const std::vector<int64_t>&, uint32_t, double);
@@ -309,6 +311,8 @@ int main(){
       tC2S=EL(_t); }
     std::cout<<"C2S: "<<LST<<" FFT stages (radix 2^"<<RST<<"), "<<ndiagTot
              <<" diagonals vs "<<S<<" dense, rotation keys="<<KSC.size()<<"\n";
+    std::cout<<"  [mem] after C2S: KROT="<<KROT.size()<<" KSC="<<KSC.size()
+             <<" peak RSS="<<rssMB()<<" MB\n";
     uint32_t nt=ctw; size_t T2=(size_t)nt*n; (void)T2;
     std::vector<uint64_t> y0=cs0,y1=cs1;
     const double sOut=csc;
@@ -520,6 +524,8 @@ int main(){
     Ct oI=evalMod(ctI, cd{0,-Aaff/2.0});
     tEM=EL(_tem);
     std::cout<<"  EvalMod out tw="<<oR.tw<<" scale=2^"<<std::log2(oR.scale)<<"\n";
+    std::cout<<"  [mem] after EvalMod: KROT="<<KROT.size()<<" KSC="<<KSC.size()
+             <<" peak RSS="<<rssMB()<<" MB\n";
     { std::vector<uint64_t> mo(mod.begin(),mod.begin()+oR.tw),ro(root.begin(),root.begin()+oR.tw);
       auto KO=gpufhe::keygen_host(n,mo,ro,ns,3.19,101);
       std::vector<int64_t> d; gpufhe::decrypt_host(d,oR.c0,oR.c1,KO.s,n,mo,ro);
@@ -592,6 +598,8 @@ int main(){
                  <<" diags="<<offs.size()<<" keys="<<KSC.size()<<" t="<<EL(_t)<<"s\n";
         ssc=ssc*dpt/(double)mod[stw-1]; --stw; sa0=a0; sa1=a1; }
       tS2C=EL(_t); }
+    std::cout<<"  [mem] after S2C: KROT="<<KROT.size()<<" KSC="<<KSC.size()
+             <<" peak RSS="<<rssMB()<<" MB\n";
     std::cout<<"S2C: "<<LST<<" FFT stages, "<<s2cdiag<<" diagonals vs "<<S<<" dense\n";
     uint32_t twF=stw;
     double sFinal=ssc;
