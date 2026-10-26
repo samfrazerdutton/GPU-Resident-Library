@@ -28,12 +28,13 @@ void evalkeygen_host_sold(struct KeySwitchConstants& K,
     const std::vector<uint64_t>& sQP, const std::vector<uint64_t>& sOld,
     const std::vector<uint64_t>& pkA_QP, const std::vector<uint64_t>& pkB_QP,
     const std::vector<uint64_t>& PModq_QP, const std::vector<uint64_t>& modQP,
-    const std::vector<uint64_t>& rootQP, uint64_t ns, double sigma, uint64_t seed);
+    const std::vector<uint64_t>& rootQP, uint64_t ns, double sigma, uint64_t seed,
+    cudaStream_t s = 0);
 void evalkeygen_host(struct KeySwitchConstants& K,
     const std::vector<uint64_t>& sQP, const std::vector<uint64_t>& pkA_QP,
     const std::vector<uint64_t>& pkB_QP, const std::vector<uint64_t>& PModq_QP,
     const std::vector<uint64_t>& modQP, const std::vector<uint64_t>& rootQP,
-    uint64_t ns, double sigma, uint64_t seed);
+    uint64_t ns, double sigma, uint64_t seed, cudaStream_t s = 0);
 
 
 void encrypt_host(std::vector<uint64_t>& c0, std::vector<uint64_t>& c1,

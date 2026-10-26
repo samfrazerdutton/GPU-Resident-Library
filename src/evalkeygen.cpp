@@ -61,7 +61,8 @@ void evalkeygen_host_sold(KeySwitchConstants& K,
                      const std::vector<uint64_t>& PModq_QP,   // P mod (each QP modulus) -- but P*s2 only added in Q range
                      const std::vector<uint64_t>& modQP,
                      const std::vector<uint64_t>& rootQP,
-                     uint64_t ns, double sigma, uint64_t seed)
+                     uint64_t ns, double sigma, uint64_t seed,
+                     cudaStream_t s)
 {
     const uint32_t n=K.n, sizeQlP=(uint32_t)modQP.size();
     const uint32_t sizeQl=K.sizeQl, alpha=K.alpha, numPart=K.numPart;
@@ -81,9 +82,10 @@ void evalkeygen_host_sold(KeySwitchConstants& K,
     uint64_t **d_fr=nullptr, **d_fp=nullptr;
     cudaMalloc(&d_fr, sizeQlP*sizeof(uint64_t*));
     cudaMalloc(&d_fp, sizeQlP*sizeof(uint64_t*));
-    cudaMemcpy(d_fr, h_fr.data(), sizeQlP*sizeof(uint64_t*), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_fp, h_fp.data(), sizeQlP*sizeof(uint64_t*), cudaMemcpyHostToDevice);
-    uint64_t* d_modQP = up(modQP);
+    cudaMemcpyAsync(d_fr, h_fr.data(), sizeQlP*sizeof(uint64_t*), cudaMemcpyHostToDevice, s);
+    cudaMemcpyAsync(d_fp, h_fp.data(), sizeQlP*sizeof(uint64_t*), cudaMemcpyHostToDevice, s);
+    uint64_t* d_modQP; cudaMalloc(&d_modQP, modQP.size()*8);
+    cudaMemcpyAsync(d_modQP, modQP.data(), modQP.size()*8, cudaMemcpyHostToDevice, s);
 
     for(uint32_t part=0; part<numPart; ++part){
         uint32_t startIdx=alpha*part;
@@ -106,14 +108,23 @@ void evalkeygen_host_sold(KeySwitchConstants& K,
                 long a1=e1c[k]; e1T[k]=(uint64_t)((a1%(long)q+(long)q)%(long)q); }
         }
         // NTT to eval: one upload/transform/download per buffer, across all towers
-        uint64_t *d_u=up(uBuf), *d_e0=up(e0Buf), *d_e1=up(e1Buf);
-        LaunchNTT_CT_Batched(d_u, (const uint64_t* const*)d_fr,(const uint64_t* const*)d_fp,d_modQP,sizeQlP,n,0);
-        LaunchNTT_CT_Batched(d_e0,(const uint64_t* const*)d_fr,(const uint64_t* const*)d_fp,d_modQP,sizeQlP,n,0);
-        LaunchNTT_CT_Batched(d_e1,(const uint64_t* const*)d_fr,(const uint64_t* const*)d_fp,d_modQP,sizeQlP,n,0);
-        cudaDeviceSynchronize();
-        cudaMemcpy(uBuf.data(), d_u, (size_t)sizeQlP*n*8,cudaMemcpyDeviceToHost);
-        cudaMemcpy(e0Buf.data(),d_e0,(size_t)sizeQlP*n*8,cudaMemcpyDeviceToHost);
-        cudaMemcpy(e1Buf.data(),d_e1,(size_t)sizeQlP*n*8,cudaMemcpyDeviceToHost);
+        uint64_t *d_u,*d_e0,*d_e1;
+        cudaMalloc(&d_u, (size_t)sizeQlP*n*8); cudaMalloc(&d_e0,(size_t)sizeQlP*n*8); cudaMalloc(&d_e1,(size_t)sizeQlP*n*8);
+        cudaMemcpyAsync(d_u, uBuf.data(), (size_t)sizeQlP*n*8,cudaMemcpyHostToDevice,s);
+        cudaMemcpyAsync(d_e0,e0Buf.data(),(size_t)sizeQlP*n*8,cudaMemcpyHostToDevice,s);
+        cudaMemcpyAsync(d_e1,e1Buf.data(),(size_t)sizeQlP*n*8,cudaMemcpyHostToDevice,s);
+        LaunchNTT_CT_Batched(d_u, (const uint64_t* const*)d_fr,(const uint64_t* const*)d_fp,d_modQP,sizeQlP,n,s);
+        LaunchNTT_CT_Batched(d_e0,(const uint64_t* const*)d_fr,(const uint64_t* const*)d_fp,d_modQP,sizeQlP,n,s);
+        LaunchNTT_CT_Batched(d_e1,(const uint64_t* const*)d_fr,(const uint64_t* const*)d_fp,d_modQP,sizeQlP,n,s);
+        // Downloads are issued async on the SAME stream as the uploads/kernels
+        // above, so stream ordering alone guarantees they start only after the
+        // batched NTTs finish -- the explicit sync below is only to block the
+        // HOST until the data has actually landed in uBuf/e0Buf/e1Buf, since the
+        // combine loop right after reads them directly as host memory.
+        cudaMemcpyAsync(uBuf.data(), d_u, (size_t)sizeQlP*n*8,cudaMemcpyDeviceToHost,s);
+        cudaMemcpyAsync(e0Buf.data(),d_e0,(size_t)sizeQlP*n*8,cudaMemcpyDeviceToHost,s);
+        cudaMemcpyAsync(e1Buf.data(),d_e1,(size_t)sizeQlP*n*8,cudaMemcpyDeviceToHost,s);
+        cudaStreamSynchronize(s);
         cudaFree(d_u); cudaFree(d_e0); cudaFree(d_e1);
 
         for(uint32_t t=0;t<sizeQlP;++t){ uint64_t q=modQP[t];
@@ -144,13 +155,14 @@ void evalkeygen_host(KeySwitchConstants& K,
                      const std::vector<uint64_t>& PModq_QP,
                      const std::vector<uint64_t>& modQP,
                      const std::vector<uint64_t>& rootQP,
-                     uint64_t ns, double sigma, uint64_t seed)
+                     uint64_t ns, double sigma, uint64_t seed,
+                     cudaStream_t s)
 {
     const uint32_t n=K.n, sizeQlP=(uint32_t)modQP.size();
     std::vector<uint64_t> s2(sQP.size());
     for(uint32_t t=0;t<sizeQlP;++t){ uint64_t q=modQP[t];
         for(uint32_t k=0;k<n;++k) s2[(size_t)t*n+k]=mulmod(sQP[(size_t)t*n+k],sQP[(size_t)t*n+k],q); }
-    evalkeygen_host_sold(K,sQP,s2,pkA_QP,pkB_QP,PModq_QP,modQP,rootQP,ns,sigma,seed);
+    evalkeygen_host_sold(K,sQP,s2,pkA_QP,pkB_QP,PModq_QP,modQP,rootQP,ns,sigma,seed,s);
 }
 
 } // namespace gpufhe
