@@ -2,10 +2,68 @@
 
 All numbers below are from real, executed runs of `tests/test_boot.cpp` on this
 machine: NVIDIA GeForce RTX 2060 (mobile/Max-Q class), CUDA 13.2, driver 595.97,
-under WSL2 Ubuntu. Ring dimension n=8192, sizeQ=30 initial towers, sizeP=10,
-security target per the existing hybrid_security.py/lwe_security.py estimators
-(unchanged by any work in this log — no security parameter was ever reduced).
-`npFor` scaling gives up to numPart=15 digit decomposition parts at the top level.
+under WSL2 Ubuntu. Ring dimension n=8192, sizeQ=30 towers (1 x 60-bit + 29 x
+55-bit), sizeP=2 (2 x 60-bit), for log2(QP)=1775 total. **No security parameter
+was ever changed by any work in this log** — but see "Security reality check"
+below: this parameter set was never actually validated against this repo's own
+estimators before this check, and it is not close to 128-bit secure. Every
+number in this file is a correctness/performance measurement of a DEMO
+parameter set, not a secure one. `npFor` scaling gives up to numPart=15 digit
+decomposition parts at the top level.
+
+## Security reality check (n=8192, log2(QP)=1775, sparse secret h=64)
+
+Ran this repo's own two literature-calibrated estimators (`tools/lwe_security.py`,
+`tools/hybrid_security.py` — both validated against published reference tables
+and real cryptanalysis papers, see their own docstrings) against the actual
+parameters `tests/test_boot.cpp` uses, not the toy sizes their built-in
+`--validate`/`--calibrate` self-tests use:
+
+```
+$ python3 tools/hybrid_security.py 8192 1775 64
+n=8192 log2(QP)=1775 h=64: 51 classical bits   (binding attack: hybrid dual+MITM)
+$ python3 tools/lwe_security.py 8192 1775 64
+n=8192 log2(QP)=1775 sparse h=64: 47 classical / 46 quantum bits (primal, upper bound)
+```
+
+**51 bits of classical security, ~46 quantum-adjusted.** Not 128-bit. Not even
+80-bit. This is a real, concrete result from this repo's own validated tooling,
+not a guess — and it is NOT a regression from any change in this log: these
+parameters were never checked against this tooling before now. The cause is
+basic LWE parameter scaling, nothing exotic: at n=8192 this repo's own
+`lwe_security.py --validate` shows only ~218 bits of modulus budget gives
+128-bit security for a UNIFORM secret; log2(QP)=1775 here is over 8x that
+budget, chosen purely to give the bootstrap circuit enough levels to survive
+CoeffsToSlots -> EvalMod -> SlotsToCoeffs, with no security check performed
+against it. Checked what ring dimension WOULD actually secure this same
+1775-bit budget at the same sparse-secret hardness:
+
+```
+n= 8192 -> 51 bits     n=32768 -> 55 bits      n=65536 -> 90 bits
+n=16384 -> 52 bits     n=131072 -> 134 bits  (>= 128-bit threshold)
+```
+
+Reaching genuine 128-bit security at this circuit's depth needs roughly
+**n=131072 — 16x this session's n=8192.** Checked the other direction too: even
+at n=8192's own validated 218-bit "128-bit-uniform" budget, the sparse secret
+(h=64) this repo actually uses only reaches 85 bits via the hybrid attack, and
+it gets worse as the budget grows (69 bits at 300, 57 at 400, 51 at 500+) — so
+a real fix at n=8192 would also need a much shallower circuit (far fewer
+towers/levels), not just a different n.
+
+**This does not invalidate any optimization work in this log.** Every
+technique (NTT/INTT batching, resident keyswitch, root-table/key caching,
+hoisted rotations) is parameter-size-agnostic — it applies identically at
+n=131072, it is just more expensive there (NTT cost scales ~O(n log n), so
+roughly a 16x-21x per-tower cost increase moving n=8192 -> 131072, before
+counting that a properly-shallow or properly-sized circuit might also need a
+different tower count). What this DOES invalidate is treating any wall-clock
+number in this file as "how fast post-quantum encryption runs" — it is
+currently "how fast this specific insecure demo circuit runs." A genuinely
+secure full bootstrap at comparable depth will be substantially slower than
+everything measured in this log, on any hardware, including a datacenter GPU
+without this session's WSL2 clock-throttling constraint. That is cryptographic
+reality, not an engineering gap to optimize away.
 
 Every row's correctness is `max slot err |boot(z) - z|` after a full
 encrypt -> deplete -> bootstrap -> decrypt round trip, compared against OpenFHE as
