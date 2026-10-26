@@ -50,14 +50,49 @@ uint64_t* scratch(size_t bytes){
     if(bytes>cap){ if(buf) cudaFree(buf); cudaMalloc(&buf,bytes); cap=bytes; }
     return buf;
 }
+// Small per-tower metadata (root-table ptrs, moduli, ninv) for the batched
+// launch below. Reusable static scratch, grown on demand, never freed --
+// same doctrine as scratch() above (per-call malloc/free of small blocks
+// regressed this exact file once before).
+uint64_t** scratchPtrArr(uint64_t**& buf, size_t& cap, size_t count){
+    if(count>cap){ if(buf) cudaFree(buf); cudaMalloc(&buf,count*sizeof(uint64_t*)); cap=count; }
+    return buf;
+}
+uint64_t* scratchU64Arr(uint64_t*& buf, size_t& cap, size_t count){
+    if(count>cap){ if(buf) cudaFree(buf); cudaMalloc(&buf,count*8); cap=count; }
+    return buf;
+}
 void xf_multi(std::vector<uint64_t>& h, uint32_t towers, uint32_t n,
               const std::vector<uint64_t>& mod, const std::vector<uint64_t>& root, bool inv){
     const size_t T=(size_t)towers*n;
     uint64_t* dx=scratch(T*8);
     cudaMemcpy(dx,h.data(),T*8,cudaMemcpyHostToDevice);
+    // Batch every tower into one kernel launch (grid.y=tower) instead of a
+    // per-tower loop of LaunchNTT_CT/LaunchINTT_GS -- this call (pt_to_eval_host's
+    // transform) measured as 30s of a ~118s bootstrap, the dominant unbatched
+    // leftover from before this session's NTT/INTT batching work.
+    static uint64_t **d_rA=nullptr,**d_rB=nullptr; static size_t capA=0,capB=0;
+    static uint64_t *d_md=nullptr,*d_ni=nullptr,*d_nip=nullptr; static size_t capMd=0,capNi=0,capNip=0;
+    scratchPtrArr(d_rA,capA,towers); scratchPtrArr(d_rB,capB,towers);
+    scratchU64Arr(d_md,capMd,towers); scratchU64Arr(d_ni,capNi,towers); scratchU64Arr(d_nip,capNip,towers);
+    std::vector<const uint64_t*> hrA(towers),hrB(towers);
+    std::vector<uint64_t> hmd(towers),hni(towers),hnip(towers);
     for(uint32_t t=0;t<towers;++t){ uint64_t q=mod[t]; DevTab&D=dev_tab(n,q,root[t]);
-        if(inv) LaunchINTT_GS(dx+(size_t)t*n,D.ir,D.ip,n,q,D.ninv,D.ninv_p,0);
-        else    LaunchNTT_CT (dx+(size_t)t*n,D.fr,D.fp,n,q,0); }
+        hmd[t]=q;
+        if(inv){ hrA[t]=D.ir; hrB[t]=D.ip; hni[t]=D.ninv; hnip[t]=D.ninv_p; }
+        else   { hrA[t]=D.fr; hrB[t]=D.fp; } }
+    cudaMemcpy(d_rA,hrA.data(),(size_t)towers*sizeof(uint64_t*),cudaMemcpyHostToDevice);
+    cudaMemcpy(d_rB,hrB.data(),(size_t)towers*sizeof(uint64_t*),cudaMemcpyHostToDevice);
+    cudaMemcpy(d_md,hmd.data(),(size_t)towers*8,cudaMemcpyHostToDevice);
+    if(inv){
+        cudaMemcpy(d_ni,hni.data(),(size_t)towers*8,cudaMemcpyHostToDevice);
+        cudaMemcpy(d_nip,hnip.data(),(size_t)towers*8,cudaMemcpyHostToDevice);
+        LaunchINTT_GS_Batched(dx,(const uint64_t* const*)d_rA,(const uint64_t* const*)d_rB,
+                              d_md,d_ni,d_nip,towers,n,0);
+    } else {
+        LaunchNTT_CT_Batched(dx,(const uint64_t* const*)d_rA,(const uint64_t* const*)d_rB,
+                             d_md,towers,n,0);
+    }
     cudaDeviceSynchronize();
     cudaMemcpy(h.data(),dx,T*8,cudaMemcpyDeviceToHost);
 }

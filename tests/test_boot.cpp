@@ -70,6 +70,11 @@ int main(){
     gpufhe::evalkeygen_host(KREL,KPqp.s,KPqp.pkA,KPqp.pkB,PModq,modQP,rootQP,ns,3.19,202);
     std::map<uint32_t,gpufhe::KeySwitchConstants> KROT;
     uint32_t nKeygen=1; double tKeygen=0,tC2S=0,tEM=0,tS2C=0;
+    // Lightweight standing diagnostic: splits C2S/S2C's per-diagonal loop body
+    // into pt_to_eval_host (plaintext encode+GPU-NTT), rotate_ct_resident
+    // (GPU keyswitch), and the CPU ct_mul_pt_host+ct_add_ct_host accumulate,
+    // so future changes can be targeted by measurement instead of guesswork.
+    double g_tPtEval=0,g_tRot=0,g_tCpuAcc=0;
     auto NOW=[](){return std::chrono::steady_clock::now();};
     auto EL=[](auto a){return std::chrono::duration<double>(std::chrono::steady_clock::now()-a).count();};
     auto rotFull=[&](uint32_t k,uint32_t seed)->const gpufhe::KeySwitchConstants&{
@@ -285,12 +290,18 @@ int main(){
         // being dropped; only the last stage does the 2^60 -> 2^50 step.
         const double dpt = (g+1<LST) ? (double)mod[ctw-1] : Delta_pt;
         for(size_t x=0;x<offs.size();++x){
+            auto _tp=NOW();
             std::vector<int64_t> md; gpufhe::encode_host(md,dg[x],n,dpt);
             std::vector<uint64_t> dE; gpufhe::pt_to_eval_host(dE,md,ctw,n,ml,rl);
+            g_tPtEval+=EL(_tp);
             std::vector<uint64_t> t0=cs0,t1=cs1;
+            auto _tr=NOW();
             if(offs[x]) gpufhe::rotate_ct_resident(t0,t1,rotAmt(offs[x]),keyAt(offs[x],ctw),ctw,n,ml,rl);
+            g_tRot+=EL(_tr);
+            auto _ta=NOW();
             gpufhe::ct_mul_pt_host(t0,t1,dE,ctw,n,ml);
-            if(fst){a0=t0;a1=t1;fst=false;} else gpufhe::ct_add_ct_host(a0,a1,t0,t1,ctw,n,ml); }
+            if(fst){a0=t0;a1=t1;fst=false;} else gpufhe::ct_add_ct_host(a0,a1,t0,t1,ctw,n,ml);
+            g_tCpuAcc+=EL(_ta); }
         rescaleAt(a0,a1,ctw);
         std::cerr<<"    C2S stage "<<g<<" tw="<<ctw<<" parts="<<npFor(ctw)
                  <<" diags="<<offs.size()<<" keys="<<KSC.size()<<" t="<<EL(_t)<<"s\n";
@@ -562,14 +573,20 @@ int main(){
         else { srcs0={{&sa0,cd{1,0}}}; srcs1={{&sa1,cd{1,0}}}; }
         for(size_t q2=0;q2<srcs0.size();++q2)
           for(size_t x=0;x<offs.size();++x){
+            auto _tp=NOW();
             std::vector<cd> dd(S);
             for(uint32_t i2=0;i2<S;++i2) dd[i2]=dg[x][i2]*srcs0[q2].second;
             std::vector<int64_t> md; gpufhe::encode_host(md,dd,n,dpt);
             std::vector<uint64_t> dE; gpufhe::pt_to_eval_host(dE,md,stw,n,ml,rl);
+            g_tPtEval+=EL(_tp);
             std::vector<uint64_t> t0=*srcs0[q2].first, t1=*srcs1[q2].first;
+            auto _tr=NOW();
             if(offs[x]) gpufhe::rotate_ct_resident(t0,t1,rotAmt(offs[x]),keyAt(offs[x],stw),stw,n,ml,rl);
+            g_tRot+=EL(_tr);
+            auto _ta=NOW();
             gpufhe::ct_mul_pt_host(t0,t1,dE,stw,n,ml);
-            if(fst){a0=t0;a1=t1;fst=false;} else gpufhe::ct_add_ct_host(a0,a1,t0,t1,stw,n,ml); }
+            if(fst){a0=t0;a1=t1;fst=false;} else gpufhe::ct_add_ct_host(a0,a1,t0,t1,stw,n,ml);
+            g_tCpuAcc+=EL(_ta); }
         rescaleAt(a0,a1,stw);
         std::cerr<<"    S2C stage "<<g<<" tw="<<stw<<" parts="<<npFor(stw)
                  <<" diags="<<offs.size()<<" keys="<<KSC.size()<<" t="<<EL(_t)<<"s\n";
@@ -593,6 +610,8 @@ int main(){
     std::cout<<"  C2S              = "<<tC2S<<" s\n";
     std::cout<<"  EvalMod x2       = "<<tEM<<" s\n";
     std::cout<<"  S2C              = "<<tS2C<<" s\n";
+    std::cout<<"  [profiling] C2S+S2C per-diagonal breakdown: pt_to_eval_host="<<g_tPtEval
+             <<"s  rotate_ct_resident="<<g_tRot<<"s  CPU ct_mul/add="<<g_tCpuAcc<<"s\n";
     std::cout<<"  other            = "<<(secs-tC2S-tEM-tS2C)<<" s\n";
     std::cout<<"input level tw=1 (q0 only)  ->  output level tw="<<twF<<"\n";
     std::cout<<"final decode scale 2^"<<std::log2(Dfinal)<<"\n";
