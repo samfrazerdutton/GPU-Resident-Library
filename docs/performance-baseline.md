@@ -22,28 +22,53 @@ measured with the shell's own `time`, CUDA work included, not a kernel-only figu
 | 4 | 132.25 s | -5.5% | 5.47871e-4 | evalkeygen round 2: batch per-part NTT data upload/download |
 | 5 | 123.033 s | -7.0% | 5.47871e-4 | skip evalkeygen for rescale-only KeySwitchConstants |
 | — | 123.961 s | ~0%† | 5.47871e-4 | TESTED AND REVERTED: CPU->GPU diagonal accumulation (correct, no measured win) |
-| 6 | pending | — | — | batch keyswitch_resident's own decompose/moddown loops |
-| 7 | pending | — | — | async eval-key uploads in ks_context_create |
+| — | 128.253 s | ~0%† | 5.47871e-4 | async evalkeygen data uploads (keygen phase) -- correct, kept, attribution error (clock-throttling evidence was from a different function) |
+| 6+7 | 120.123 s | -2.4% vs step 5 | 5.47871e-4 | batch keyswitch_resident's own decompose/moddown loops + async ks_context_create uploads + stream threading in rotate_ct_resident |
+| — | 125-129 s | ~0%† | 5.47871e-4 | TESTED AND REVERTED: pinned host staging buffers for ks_context_create's av/bv uploads -- 2-buffer alternation forced a host sync almost immediately with no work to overlap, net negative, not kept |
+| 8 | 118-126 s | ~0%† | 5.47871e-4 | move EvalMod's ct*ct RNS tensor product from CPU to GPU -- honest no-op, the CPU loop (0.58s of total, see profiling below) was never the bottleneck |
+| 9 | 114.6-126 s | real win in EvalMod | 5.47871e-4 | cache buildK(tw) relin keys across EvalMod's R/I branches (they walk an identical deterministic tw sequence) -- EvalMod x2 dropped from 17.7-18.4s to a consistent 14.9-15.1s across two runs |
+| 10 | 114.6-114.9 s | ~consistent | 5.47871e-4 | batch xf_multi's (pt_to_eval_host) per-tower NTT/INTT loop -- correct and kept, but the targeted bucket itself barely moved (30.1s -> 29.5-29.6s); the total's drop may be partly ordinary clock-state variance, reported honestly rather than overclaimed |
 
-† Within this setup's observed run-to-run noise band (~1-3s). Kept step 2 because
-it is strictly correct and reduces launch count with zero downside, even though it
-didn't move the measured number. Step 4's intermediate entry is listed as a
-reverted experiment, not a numbered step, for the same reason — report the honest
-result either way, not just the wins.
+† Within this setup's observed run-to-run noise band (now understood to be wider
+than first thought — up to ±8s on identical code, tracked to WSL2 GPU clock
+throttling, see below). Kept each † row because it is strictly correct and
+either reduces launch count or removes genuinely CPU-bound work, even when the
+measured number didn't move. Rows marked "TESTED AND REVERTED" are listed as
+unnumbered entries, not steps, for the same reason — report the honest result
+either way, not just the wins; a reverted step is not a completed one.
 
-**Net so far: 191.0s -> 123.033s, a verified 35.6% reduction. Error did not move by
-a single bit across any change** (every row's error column is byte-identical:
-0.000547871). This is the actual gate — every change above was reverted
-immediately if it broke this, no exceptions.
+**Net so far: 191.0s -> ~114.6-115s most recently measured, roughly a 40% reduction.
+Error did not move by a single bit across any change** (every row's error column
+is byte-identical: 0.000547871, now twelve consecutive changes with zero drift).
+This is the actual gate — every change above was reverted immediately if it broke
+this, no exceptions.
 
-## What the stage breakdown looks like at the 123.033s checkpoint
+## Where the time actually goes (profiled, not guessed)
+
+Added standing timing instrumentation to C2S/S2C's per-diagonal loop body
+(`g_tPtEval`/`g_tRot`/`g_tCpuAcc` in `tests/test_boot.cpp`) rather than keep
+guessing at the next lever. Measured split of C2S+S2C's combined ~100s:
 
 ```
-keygen (48 keys) = 40.2408 s
-C2S              = 72.0925 s
-EvalMod x2       = 17.8066 s
-S2C              = 32.377 s
-other            = 1.68513 s
+rotate_ct_resident (GPU keyswitch)        : 62.7-65.7 s
+pt_to_eval_host (plaintext encode+GPU-NTT): 29.5-30.1 s
+CPU ct_mul_pt_host + ct_add_ct_host       : 0.57-0.58 s
+```
+
+This directly explains the earlier CPU->GPU diagonal-accumulation revert: that
+CPU loop was only ever 0.5-0.6% of the bootstrap's total time, so moving it to
+the GPU could never have produced a measurable win. `rotate_ct_resident` is the
+genuine dominant cost and is already on the fully-resident, batched, cached path
+from earlier this session.
+
+## What the stage breakdown looks like at the most recent checkpoint
+
+```
+keygen (48 keys) = 38-42 s
+C2S              = 66-73 s
+EvalMod x2       = 14.9-15.1 s   (down from 17.7-18.4 s after the buildK cache)
+S2C              = 30-36 s
+other            = ~1.7-1.9 s
 ```
 
 C2S + S2C account for ~85% of total time. Independently re-derived (not just
@@ -70,10 +95,22 @@ Windows sides and refused for lack of elevated privileges in this session (this
 machine's own README already notes "WSL2 blocks GPU clock locking" as a known
 constraint for benchmarking on this exact setup).
 
-The most direct, concrete cause identified so far: `ks_context_create`'s per-
-rotation eval-key upload (`upv()`, used for `K.av`/`K.bv`, tens of MB per call,
-~150 calls across a bootstrap) uses plain synchronous `cudaMemcpy` with no stream
-argument at all — the host thread blocks on every single rotation's key upload.
-Converting this to `cudaMemcpyAsync` on a real stream is in progress as of this
-writing; see the board for current status and this file's next revision for the
-measured before/after.
+`ks_context_create`'s per-rotation eval-key upload (`upv()`, used for
+`K.av`/`K.bv`) was converted from synchronous `cudaMemcpy` to `cudaMemcpyAsync`
+on a real stream (rows 6+7 above) — a real but modest 2.4% gain. A follow-up
+attempt to make that upload *genuinely* async by staging through pinned
+(`cudaMallocHost`) host memory (plain `cudaMemcpyAsync` on pageable memory still
+blocks in practice) was built, verified bit-exact, and measured as a **real
+regression** (125-129s vs the 120.123s baseline) — the 2-buffer alternating
+design forced a host-side sync almost immediately with no intervening work to
+hide the transfer behind, so it paid for an extra memcpy and event-sync overhead
+for nothing. Reverted, not committed.
+
+The clock-throttling root cause itself remains environmental and unresolved:
+`nvidia-smi -lgc 2100,2100` still refuses for lack of elevated privileges on
+both WSL and native Windows in this session, and was not retried. Every
+subsequent round's honest results (above) are consistent with this: changes
+that reduce genuinely redundant GPU work (the buildK cache) produce real wins;
+changes that only restructure already-necessary GPU work (batching, async
+uploads, pinned staging) produce marginal-to-negative results, because the
+underlying compute is throttled regardless of how it's dispatched.
