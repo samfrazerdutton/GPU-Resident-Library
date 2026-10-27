@@ -61,15 +61,42 @@ rather than abandoned or faked.
    circuit.** See `SECURITY_ASSESSMENT.md` for the full corrected analysis
    — this supersedes the prior revision's recommendation.
 
-5. **Eval-domain automorphism: real win, committed (`0043af3`).** Derived
-   and INDEPENDENTLY validated (GPU-free Python reference, 20 trials)
-   that this codebase's exact NTT convention makes Galois automorphism a
-   pure eval-domain permutation (no sign flip, no modular arithmetic) —
-   replaced the INTT→permute→NTT round trip with one gather kernel. Caught
-   a real async-host-buffer-lifetime bug via the standalone test before it
-   reached production. 40/40 bit-exact at n=8192. **Measured: rotate
-   bucket down to 55-60s (was 62-82s), total bootstrap down to 108-114s —
-   the lowest this entire session.**
+5. **Eval-domain automorphism: real win in `rotate_ct_resident` itself,
+   committed (`0043af3`) — but this round found that function is NOT
+   actually what `test_boot`'s hot loop calls, correcting a mis-
+   attributed measurement.** Derived and INDEPENDENTLY validated (GPU-free
+   Python reference, 20 trials) that this codebase's exact NTT convention
+   makes Galois automorphism a pure eval-domain permutation (no sign flip,
+   no modular arithmetic) — replaced the INTT→permute→NTT round trip with
+   one gather kernel in `rotate_ct_resident`. Caught a real async-host-
+   buffer-lifetime bug via the standalone test before it reached
+   production. 40/40 bit-exact at n=8192.
+
+   **Correction (this round):** direct code reading found `tests/
+   test_boot.cpp`'s actual C2S/S2C hot loop never calls `rotate_ct_resident`
+   at all — it has its own separate, already-existing `StageRotCtx`/
+   `stageRotDiag` mechanism (stage-resident base ciphertext + stream,
+   predates this session) that was still calling the OLD, slow
+   `automorphism_eval_device` directly. The "rotate bucket down to 55-60s
+   (was 62-82s), total bootstrap down to 108-114s" figure previously
+   recorded here could not have come from this fix, since the hot loop
+   never exercised the changed function — that number reflected something
+   else (likely ordinary thermal variance, mis-attributed). Fixed
+   `stageRotDiag` to call `automorphism_eval_fast_device` (and resized its
+   scratch buffer from n-sized to towers*n-sized, which the fast path
+   requires — the old n-sized buffer would have been a silent out-of-
+   bounds bug if swapped in naively). Verified bit-exact (`max slot err =
+   5.47871e-4`, identical to before) via a temporary side-by-side build of
+   the pre-fix function, interleaved: **old=116.4s (1 run); new=114.3s,
+   110.3s (2 runs) — a real but SMALL ~2-6s total / ~3-7s rotate-bucket
+   improvement, not the dramatic figure previously claimed.** A clean
+   same-run-position comparison (old run #2) was attempted but hit
+   OOM three times in a row near this machine's ~10GB ceiling (test_boot's
+   own ~8.1GB peak RSS leaves only ~2GB margin) — GPU/host memory were
+   confirmed clean between attempts (not a stuck resource), so this is
+   accepted as genuine near-ceiling flakiness, not a bug. The temporary
+   comparison binary and its CMakeLists.txt entry were removed after use
+   (not part of the lasting codebase).
 
 6. **keyswitch_resident split into ks_accumulate_qp + ks_moddown,
    committed (`2080aa0`).** Safe mechanical extraction (zero behavior

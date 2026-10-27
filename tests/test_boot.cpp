@@ -343,7 +343,11 @@ int main(){
                           cudaFree(R.d_scratch);cudaFree(R.d_b0);cudaFree(R.d_b1);}
             cudaMalloc(&R.d_base0,need);cudaMalloc(&R.d_base1,need);
             cudaMalloc(&R.d_w0,need);cudaMalloc(&R.d_w1,need);
-            cudaMalloc(&R.d_scratch,(size_t)n*8);cudaMalloc(&R.d_b0,need);cudaMalloc(&R.d_b1,need);
+            // towers*n sized, NOT n-sized: automorphism_eval_fast_device
+            // batches all towers in one gather launch (see its own comment
+            // in src/rotate.cpp), unlike the old per-tower automorphism_eval_device
+            // this used to call, which only needed one n-sized scratch tower.
+            cudaMalloc(&R.d_scratch,need);cudaMalloc(&R.d_b0,need);cudaMalloc(&R.d_b1,need);
             R.cap=need;
         }
         cudaStreamCreate(&R.s);
@@ -360,8 +364,15 @@ int main(){
         size_t B=(size_t)towers*n*8;
         cudaMemcpyAsync(R.d_w0,R.d_base0,B,cudaMemcpyDeviceToDevice,R.s);
         cudaMemcpyAsync(R.d_w1,R.d_base1,B,cudaMemcpyDeviceToDevice,R.s);
-        gpufhe::automorphism_eval_device(R.d_w0,towers,n,k,ml,rl,R.d_scratch,R.s);
-        gpufhe::automorphism_eval_device(R.d_w1,towers,n,k,ml,rl,R.d_scratch,R.s);
+        // Eval-domain permutation (validated bit-exact against
+        // automorphism_eval_device at n=8192, tests/test_automorph_eval_fast.cpp)
+        // -- this call site was still on the old INTT->permute->NTT path,
+        // never updated when rotate_ct_resident got this fix (commit 0043af3),
+        // because this stage-resident loop doesn't go through rotate_ct_resident
+        // at all. (rl is now unused for this call -- the fast path is
+        // modulus-independent; ml is still needed below for the final combine.)
+        gpufhe::automorphism_eval_fast_device(R.d_w0,towers,n,k,R.d_scratch,R.s);
+        gpufhe::automorphism_eval_fast_device(R.d_w1,towers,n,k,R.d_scratch,R.s);
         auto C=gpufhe::ks_context_create(Krot,R.s);
         gpufhe::keyswitch_resident(R.d_w1,R.d_b0,R.d_b1,C,R.W,R.s);
         gpufhe::ks_context_destroy(C);
