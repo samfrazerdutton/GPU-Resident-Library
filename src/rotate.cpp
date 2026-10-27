@@ -118,6 +118,52 @@ void automorphism_eval_device(uint64_t* d_v, uint32_t towers, uint32_t n,
     }
 }
 
+namespace {
+uint32_t bitrev32(uint32_t v, uint32_t bits){ uint32_t r=0; for(uint32_t k=0;k<bits;++k){ r=(r<<1)|(v&1); v>>=1; } return r; }
+// Host-side permutation map for eval-domain automorphism sigma_k on an
+// n-point negacyclic NTT with standard-order-in/bit-reversed-out convention
+// (this codebase's exact convention -- see kernels/automorph_eval.cu for the
+// full derivation and the independent GPU-free validation that motivated it,
+// logged in research/EXPERIMENT_LEDGER.md). Depends only on (n,k), not on
+// any modulus -- cached process-lifetime like the root tables.
+uint32_t* autoPermMap(uint32_t n, uint32_t k, cudaStream_t s){
+    static std::map<std::pair<uint32_t,uint32_t>,uint32_t*> cache;
+    auto key=std::make_pair(n,k);
+    auto it=cache.find(key); if(it!=cache.end()) return it->second;
+    uint32_t logn=0; while((1u<<logn)<n)++logn;
+    std::vector<uint32_t> h(n);
+    const uint32_t M=2*n;
+    for(uint32_t p=0;p<n;++p){
+        uint32_t j=bitrev32(p,logn);
+        uint64_t e=((uint64_t)(2*j+1)*k)%M;              // always odd (k, 2j+1 both odd)
+        uint32_t jp=(uint32_t)((e-1)/2);
+        h[p]=bitrev32(jp,logn);
+    }
+    uint32_t* d; cudaMalloc(&d,(size_t)n*4);
+    // SYNCHRONOUS deliberately: h is a stack-local vector destroyed when this
+    // function returns. cudaMemcpyAsync does not guarantee the host source is
+    // read before that happens (the classic pageable-async-source bug) --
+    // this upload is one-time and cached (never repeated for the same (n,k)),
+    // so there is no hot-loop cost to paying for a sync copy here.
+    cudaMemcpy(d,h.data(),(size_t)n*4,cudaMemcpyHostToDevice);
+    cache.emplace(key,d);
+    return d;
+}
+} // anon
+
+// Eval-domain automorphism: pure gather, no INTT/NTT, no sign flip, no
+// modular arithmetic at all (the permutation is modulus-independent). d_scratch
+// must be towers*n sized (NOT n-sized like automorphism_eval_device's scratch --
+// this does all towers in one batched launch, not a per-tower loop, so the
+// gather output for every tower must land somewhere before the D2D copy back).
+void automorphism_eval_fast_device(uint64_t* d_v, uint32_t towers, uint32_t n,
+                                   uint32_t k, uint64_t* d_scratch, cudaStream_t s)
+{
+    uint32_t* map=autoPermMap(n,k,s);
+    LaunchAutoEvalPermuteBatched(d_scratch,d_v,map,towers,n,s);
+    cudaMemcpyAsync(d_v,d_scratch,(size_t)towers*n*8,cudaMemcpyDeviceToDevice,s);
+}
+
 // In-place automorphism on a towers*n eval-form poly.
 void automorphism_eval_host(std::vector<uint64_t>& v, uint32_t towers, uint32_t n,
                             uint32_t k, const std::vector<uint64_t>& mod,
@@ -186,11 +232,18 @@ void rotate_ct_resident(std::vector<uint64_t>& c0, std::vector<uint64_t>& c1,
     const size_t T=(size_t)towers*n, B=T*8;
     uint64_t *d_a,*d_b0,*d_b1,*d_c0,*d_sc;
     cudaMalloc(&d_a,B); cudaMalloc(&d_b0,B); cudaMalloc(&d_b1,B);
-    cudaMalloc(&d_c0,B); cudaMalloc(&d_sc,(size_t)n*8);
+    // d_sc grown to towers*n (was n) -- automorphism_eval_fast_device does
+    // all towers in one batched gather, so its scratch must hold every
+    // tower at once, unlike the old per-tower-loop automorphism_eval_device.
+    cudaMalloc(&d_c0,B); cudaMalloc(&d_sc,B);
     cudaMemcpyAsync(d_a,c1.data(),B,cudaMemcpyHostToDevice,s);
     cudaMemcpyAsync(d_c0,c0.data(),B,cudaMemcpyHostToDevice,s);
-    automorphism_eval_device(d_a ,towers,n,k,mod,root,d_sc,s);
-    automorphism_eval_device(d_c0,towers,n,k,mod,root,d_sc,s);
+    // Eval-domain permutation replaces INTT->permute->NTT: validated bit-exact
+    // against automorphism_eval_device at real scale (n=8192, 40 randomized
+    // rotation amounts, see tests/test_automorph_eval_fast.cpp) before being
+    // wired in here.
+    automorphism_eval_fast_device(d_a ,towers,n,k,d_sc,s);
+    automorphism_eval_fast_device(d_c0,towers,n,k,d_sc,s);
     cudaMemcpyAsync(c0.data(),d_c0,B,cudaMemcpyDeviceToHost,s);
     cudaStreamSynchronize(s);
     cudaFree(d_c0); cudaFree(d_sc);

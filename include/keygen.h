@@ -16,6 +16,11 @@ void rotate_ct_device(uint64_t*, uint64_t*, uint32_t,
 void automorphism_eval_device(uint64_t*, uint32_t, uint32_t, uint32_t,
                               const std::vector<uint64_t>&, const std::vector<uint64_t>&,
                               uint64_t*, cudaStream_t);
+// Eval-domain automorphism via precomputed index permutation (no INTT/NTT,
+// no modulus dependency). d_scratch must be towers*n sized. See
+// src/rotate.cpp / kernels/automorph_eval.cu for the derivation.
+void automorphism_eval_fast_device(uint64_t*, uint32_t, uint32_t, uint32_t,
+                                   uint64_t*, cudaStream_t);
 void rotate_ct_resident(std::vector<uint64_t>&, std::vector<uint64_t>&, uint32_t,
                         const struct KeySwitchConstants&, uint32_t, uint32_t,
                         const std::vector<uint64_t>&, const std::vector<uint64_t>&);   // 0 = uniform ternary
