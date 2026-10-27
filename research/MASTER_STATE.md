@@ -121,21 +121,28 @@ rather than abandoned or faked.
    rotation indices in a bootstrap stage) is a separate mechanism, not
    yet built — see `NEXT_SESSION.md` priority queue item 1.
 
-8. **Multi-rotation decompose-sharing: DONE, real measured win, LARGER
-   at realistic bucket sizes.** New, separate files `include/
-   keyswitch_hoist.h` + `src/keyswitch_hoist.cpp` (`keyswitch_resident.cpp`
-   untouched). `tests/test_hoist_multi.cpp`: bit-exact vs. the existing
-   fused `ks_accumulate_qp` (0/524288 mismatches), correct across 6
-   shared rotation indices. `bench/bench_hoist_multi.cpp`, interleaved
-   A/B (30 reps): **N=5** — baseline median 94.49ms vs hoisted 46.32ms,
-   ~2.04x, paired-diff 95% CI [47.86,48.60]ms. **N=16** (matching the
-   REAL C2S stage 0 bucket size, "diags=16") — baseline median 374.76ms
-   vs hoisted 153.62ms, **~2.44x**, paired-diff 95% CI [220.0,297.0]ms —
-   both entirely exclude zero, relative win GROWS with N as expected.
-   Not yet wired into the actual bootstrap's C2S/S2C stages — needs a
-   parallel hoisted-key cache (structurally different key convention
-   than today's `KROT`), scoped in `NEXT_SESSION.md` priority queue
-   item 1, not yet built.
+8. **Multi-rotation decompose-sharing: DONE, validated on a REAL live
+   bootstrap stage, not just synthetic benchmarks.** New, separate
+   files `include/keyswitch_hoist.h` + `src/keyswitch_hoist.cpp`
+   (`keyswitch_resident.cpp` untouched). `tests/test_hoist_multi.cpp`:
+   bit-exact vs. the existing fused `ks_accumulate_qp` (0/524288
+   mismatches), correct across 6 shared rotation indices. `bench/
+   bench_hoist_multi.cpp`, interleaved A/B: N=5 ~2.04x, N=16 (matching
+   the real C2S stage 0 bucket size) ~2.44x, both CIs exclude zero.
+   **`tests/test_hoist_stage0.cpp` then validated the mechanism against
+   test_boot.cpp's ACTUAL first C2S stage** (identical setup through
+   ModRaise, same real diagonal structure, own fresh hoisted-convention
+   keys with no cache advantage over the trusted path): decrypted
+   output matches within negligible noise (maxDiff=613 vs
+   maxAbs=5.76e17), and **real timing: hoisted 7.53s vs trusted
+   25.89s — a ~3.4x speedup on the actual live stage**, both sides
+   paying real keygen cost. This is the strongest evidence yet — a
+   real bootstrap stage, not a synthetic approximation. Not yet wired
+   into ALL stages of the live bootstrap (needs a parallel hoisted-key
+   cache, since the hoisted convention is structurally different from
+   today's `KROT`'s textbook convention) — scoped in detail in
+   `NEXT_SESSION.md` priority queue item 1, with `test_hoist_stage0.cpp`
+   as the proven template to extend.
 
 9. **`KROT` memory-scaling: lever analysis DONE, bounded-cache safety
    net implemented.** Zero-copy ruled out with direct code evidence

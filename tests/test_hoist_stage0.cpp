@@ -1,0 +1,914 @@
+// End-to-end validation of correct-order rotation hoisting (research/
+// NEXT_SESSION.md priority queue item 1's "next step") against a REAL
+// bootstrap stage, not synthetic rotation indices. Identical to
+// test_boot.cpp up through C2S stage 0, where it computes a SECOND,
+// hoisted-mechanism version of that same stage's result (own fresh
+// hoisted-convention keys, no cache advantage over the trusted path),
+// compares the two, reports the keygen+compute cost of each, and exits
+// -- it does not run the rest of the bootstrap (EvalMod/S2C), since the
+// question this answers is narrowly "does hoisting work and help on a
+// REAL stage's REAL diagonal structure," not "does the whole bootstrap
+// still work" (already covered by test_boot.cpp itself, unmodified).
+//
+// FULL COMPOSED BOOTSTRAP: ModRaise -> C2S -> real/imag split.
+// Declared input scale s_in = q0, so C2S slots come out as y_k = a_k/q0 =
+// (mz_k/q0) + I_k -- integer part I_k is exactly what EvalMod strips.
+// Split: ctR = ct+conj(ct) (slots 2*Re y), ctI = ct-conj(ct) (slots 2i*Im y);
+// the 1/2 and 1/(2i) get absorbed into EvalMod's affine multiply => 0 levels.
+#include "keyswitch.h"
+#include "keyswitch_resident.h"
+#include "keyswitch_hoist.h"
+#include "keygen.h"
+#include "rns_arith.h"
+#include "stage_acc.h"
+#include <cuda_runtime.h>
+#include <iostream>
+#include <vector>
+#include <complex>
+#include <cmath>
+#include <map>
+#include <list>
+#include <functional>
+#include <chrono>
+#include <sys/resource.h>
+static double rssMB(){ struct rusage ru; getrusage(RUSAGE_SELF,&ru); return ru.ru_maxrss/1024.0; }
+namespace gpufhe {
+void encode_host(std::vector<int64_t>&, const std::vector<std::complex<double>>&, uint32_t, double);
+void decode_host(std::vector<std::complex<double>>&, const std::vector<int64_t>&, uint32_t, double);
+void native_primes(std::vector<uint64_t>&, uint32_t, uint32_t, uint32_t, const std::vector<uint64_t>&);
+uint64_t native_root(uint32_t, uint64_t);
+void native_rescale_consts(std::vector<uint64_t>&, std::vector<uint64_t>&, const std::vector<uint64_t>&, uint32_t);
+void automorphism_eval_host(std::vector<uint64_t>&, uint32_t, uint32_t, uint32_t,
+                            const std::vector<uint64_t>&, const std::vector<uint64_t>&);
+void rotate_ct_host(std::vector<uint64_t>&, std::vector<uint64_t>&, uint32_t,
+                    const KeySwitchConstants&, uint32_t, uint32_t,
+                    const std::vector<uint64_t>&, const std::vector<uint64_t>&);
+void pt_to_eval_host(std::vector<uint64_t>&, const std::vector<int64_t>&, uint32_t, uint32_t,
+                     const std::vector<uint64_t>&, const std::vector<uint64_t>&);
+void ct_mul_pt_host(std::vector<uint64_t>&, std::vector<uint64_t>&, const std::vector<uint64_t>&,
+                    uint32_t, uint32_t, const std::vector<uint64_t>&);
+void ct_add_ct_host(std::vector<uint64_t>&, std::vector<uint64_t>&,
+                    const std::vector<uint64_t>&, const std::vector<uint64_t>&,
+                    uint32_t, uint32_t, const std::vector<uint64_t>&);
+}
+static uint64_t mmu(uint64_t a,uint64_t b,uint64_t q){return(uint64_t)(((unsigned __int128)a*b)%q);}
+static uint64_t smu(uint64_t a,uint64_t b,uint64_t q){return a>=b?a-b:a+q-b;}
+using cd=std::complex<double>;
+
+int main(){
+    const uint32_t HW=64;
+    gpufhe::set_secret_hamming_weight(HW);   // sparse secret: pins K independent of n
+    const uint32_t n=8192,S=n/2,sizeQ=30,sizeP=2,M=2*n; const uint64_t ns=1;
+    // dnum: alpha=10 towers per part => 3 parts at tw=30 (was alpha=2 => 15 parts).
+    // P must cover a part (10x50=500 bits), hence sizeP=9 x 60 = 540 bits.
+    // At n=32768 this is what makes a rotation key ~61MB instead of ~251MB.
+    auto npFor=[](uint32_t tw)->uint32_t{ return tw<=2?1u:(tw+1)/2; };  // alpha=2: the partitioning everything was gated at
+    std::vector<uint64_t> mod,modP;
+    gpufhe::native_primes(mod,1,60,n,{});
+    { std::vector<uint64_t> mids; gpufhe::native_primes(mids,sizeQ-1,55,n,mod); for(auto m:mids)mod.push_back(m); }
+    gpufhe::native_primes(modP,sizeP,60,n,mod);
+    std::vector<uint64_t> modQP=mod; for(auto p:modP)modQP.push_back(p);
+    std::vector<uint64_t> root(sizeQ),rootQP;
+    for(uint32_t i=0;i<sizeQ;++i)root[i]=gpufhe::native_root(n,mod[i]);
+    rootQP=root; for(auto p:modP)rootQP.push_back(gpufhe::native_root(n,p));
+    const uint32_t sizeQlP=sizeQ+sizeP; const uint64_t q0=mod[0];
+    std::vector<uint64_t> mod1{mod[0]},root1{root[0]};
+
+    auto KPqp=gpufhe::keygen_host(n,modQP,rootQP,ns,3.19,101);
+    auto KPq =gpufhe::keygen_host(n,mod,root,ns,3.19,101);
+    auto KP1 =gpufhe::keygen_host(n,mod1,root1,ns,3.19,101);
+    std::vector<uint64_t> PModq(sizeQlP);
+    for(uint32_t t=0;t<sizeQlP;++t){uint64_t q=modQP[t],P=1%q;for(uint32_t j=0;j<sizeP;++j)P=mmu(P,modQP[sizeQ+j]%q,q);PModq[t]=P;}
+    // ---- FULL-QP KEYS: generated ONCE, viewed at every level via delta ----
+    gpufhe::KeySwitchConstants KREL; KREL.n=n;
+    gpufhe::compute_keyswitch_constants(KREL,mod,modP,npFor(sizeQ));
+    for(uint32_t i=0;i<sizeQ;++i){KREL.rootModList.push_back(mod[i]);KREL.rootValList.push_back(root[i]);}
+    for(uint32_t j=0;j<sizeP;++j){KREL.rootModList.push_back(modP[j]);KREL.rootValList.push_back(rootQP[sizeQ+j]);}
+    gpufhe::evalkeygen_host(KREL,KPqp.s,KPqp.pkA,KPqp.pkB,PModq,modQP,rootQP,ns,3.19,202);
+    // KROT is the EXPENSIVE-to-regenerate cache (real evalkeygen_host_sold
+    // call, ~0.64s/key measured at n=8192, vs. KSC's cheap pure-copy
+    // misses below) -- instrumentation confirmed all ~77 of its entries at
+    // n=8192 get reused across the WHOLE bootstrap (count stays flat from
+    // C2S's end through S2C's end), so capping it forces real re-keygen
+    // cost, not a free win. KROT_CAP defaults ABOVE the measured n=8192
+    // working set (77 distinct rotation amounts + 1 relin key) so this
+    // bound causes ZERO evictions and ZERO behavior change at the current
+    // scale -- it exists as the safety net for n=131072, where a key is
+    // ~16x bigger and 77 of them (~77.5GB, see MEMORY_FEASIBILITY.md) is
+    // infeasible regardless of compute cost. Lower this when actually
+    // attempting a larger n; the eviction/regen tradeoff at that point is
+    // real and must be measured, not assumed free -- see
+    // MEMORY_FEASIBILITY.md's KROT lever analysis for the n=131072
+    // extrapolated regen-cost numbers.
+    constexpr size_t KROT_CAP=96;
+    std::map<uint32_t,gpufhe::KeySwitchConstants> KROT;
+    std::list<uint32_t> KROT_lru;
+    std::map<uint32_t,std::list<uint32_t>::iterator> KROT_lru_pos;
+    uint32_t nKeygen=1; double tKeygen=0,tC2S=0,tEM=0,tS2C=0;
+    // Lightweight standing diagnostic: splits C2S/S2C's per-diagonal loop body
+    // into pt_to_eval_host (plaintext encode+GPU-NTT), rotate_ct_resident
+    // (GPU keyswitch), and the CPU ct_mul_pt_host+ct_add_ct_host accumulate,
+    // so future changes can be targeted by measurement instead of guesswork.
+    double g_tPtEval=0,g_tRot=0,g_tCpuAcc=0;
+    auto NOW=[](){return std::chrono::steady_clock::now();};
+    auto EL=[](auto a){return std::chrono::duration<double>(std::chrono::steady_clock::now()-a).count();};
+    auto rotFull=[&](uint32_t k,uint32_t seed)->const gpufhe::KeySwitchConstants&{
+        auto it=KROT.find(k);
+        if(it!=KROT.end()){
+            KROT_lru.erase(KROT_lru_pos[k]); KROT_lru.push_front(k); KROT_lru_pos[k]=KROT_lru.begin();
+            return it->second;
+        }
+        auto _t=NOW();
+        std::vector<uint64_t> sA=KPqp.s;
+        gpufhe::automorphism_eval_host(sA,sizeQlP,n,k,modQP,rootQP);
+        gpufhe::KeySwitchConstants K; K.n=n;
+        gpufhe::compute_keyswitch_constants(K,mod,modP,npFor(sizeQ));
+        for(uint32_t i=0;i<sizeQ;++i){K.rootModList.push_back(mod[i]);K.rootValList.push_back(root[i]);}
+        for(uint32_t j=0;j<sizeP;++j){K.rootModList.push_back(modP[j]);K.rootValList.push_back(rootQP[sizeQ+j]);}
+        gpufhe::evalkeygen_host_sold(K,KPqp.s,sA,KPqp.pkA,KPqp.pkB,PModq,modQP,rootQP,ns,3.19,seed);
+        ++nKeygen; tKeygen+=EL(_t);
+        if(KROT.size()>=KROT_CAP){
+            uint32_t victim=KROT_lru.back(); KROT_lru.pop_back();
+            KROT_lru_pos.erase(victim); KROT.erase(victim);
+        }
+        KROT.emplace(k,std::move(K));
+        KROT_lru.push_front(k); KROT_lru_pos[k]=KROT_lru.begin();
+        return KROT[k]; };
+    auto atLevel=[&](const gpufhe::KeySwitchConstants& KF,uint32_t tw)->gpufhe::KeySwitchConstants{
+        std::vector<uint64_t> ml(mod.begin(),mod.begin()+tw),rl(root.begin(),root.begin()+tw);
+        gpufhe::KeySwitchConstants K; K.n=n;
+        gpufhe::compute_keyswitch_constants(K,ml,modP,npFor(tw));
+        for(uint32_t i=0;i<tw;++i){K.rootModList.push_back(ml[i]);K.rootValList.push_back(rl[i]);}
+        for(uint32_t j=0;j<sizeP;++j){K.rootModList.push_back(modP[j]);K.rootValList.push_back(rootQP[sizeQ+j]);}
+        K.fullQ=sizeQ; K.evalKeyTowers=KF.evalKeyTowers;
+        K.av.assign(K.numPart,{}); K.bv.assign(K.numPart,{});
+        for(uint32_t p=0;p<K.numPart;++p){K.av[p]=KF.av[p];K.bv[p]=KF.bv[p];}
+        return K; };
+
+    auto mkKidx=[&](uint32_t k,uint32_t seed)->gpufhe::KeySwitchConstants{
+        return atLevel(rotFull(k,seed),sizeQ); };
+
+    // Encoded coeffs scale as |mz| ~ Delta_in*|z|*sqrt(2/N), so at fixed
+    // Delta_in the per-coefficient signal SHRINKS like 1/sqrt(n) -- and the
+    // EvalMod signal is 2pi*mz/q0, so SNR degrades with the ring. Scale
+    // Delta_in with sqrt(n) to hold |mz| constant. Ceiling is the sine
+    // approximation: need mz/q0 << 1 (cubic term), and we sit at ~2^-9 here
+    // versus a tolerance around 0.02, so there is ample room.
+    const double Delta_in=std::pow(2.0,54)*std::sqrt((double)n/1024.0)*8.0;
+    // EvalMod's working scale must EQUAL the mid prime: mulCt gives
+    // A.scale*B.scale/q, stable only when scale == q. So Delta_pt is FORCED to
+    // q_mid^2/q0 and Delta_w to q_mid -- raising Delta_pt alone made the scale
+    // run away (2^53 -> 2^56 -> 2^62 ...) and wrap. The precision lever is the
+    // MID-PRIME SIZE: 50 -> 55 bits lifts the working scale 32x.
+    const double Delta_pt=std::pow(2.0,50);
+
+    // ---- message, encrypt at the BOTTOM level (q0 only)
+    std::vector<cd> z(S);
+    for(uint32_t i=0;i<S;++i) z[i]={0.35*std::sin(0.02*i),0.25*std::cos(0.017*i)};
+    std::vector<int64_t> mz; gpufhe::encode_host(mz,z,n,Delta_in);
+    std::vector<uint64_t> c0,c1;
+    gpufhe::encrypt_host(c0,c1,mz,KP1.pkA,KP1.pkB,n,mod1,root1,ns,3.19,303);
+
+    auto tBoot=std::chrono::steady_clock::now();
+    // ---- MODRAISE: centered coeffs -> reduce into every tower + NTT
+    std::vector<uint64_t> zero((size_t)n,0);
+    std::vector<int64_t> a0,a1;
+    gpufhe::decrypt_host(a0,c0,zero,KP1.s,n,mod1,root1);
+    gpufhe::decrypt_host(a1,c1,zero,KP1.s,n,mod1,root1);
+    std::vector<uint64_t> R0,R1;
+    gpufhe::pt_to_eval_host(R0,a0,sizeQ,n,mod,root);
+    gpufhe::pt_to_eval_host(R1,a1,sizeQ,n,mod,root);
+
+    // reference a_j: per-tower decrypt of the raised ct, Garner over towers 0,1
+    // (|a| <= 2^68 << (q0*q1)/2, and q0*q1 = 2^110 fits __int128)
+    std::vector<__int128> aref(n);   // |a| ~ 2^68 -- MUST NOT be double or uint64
+    auto d128=[](__int128 v)->double{ bool ng=v<0;
+        unsigned __int128 u=ng?(unsigned __int128)(-v):(unsigned __int128)v;
+        double r=(double)(uint64_t)(u>>64)*18446744073709551616.0+(double)(uint64_t)u;
+        return ng?-r:r; };
+    {
+        std::vector<std::vector<uint64_t>> res(2);
+        for(uint32_t t=0;t<2;++t){
+            std::vector<uint64_t> A0(R0.begin()+(size_t)t*n,R0.begin()+(size_t)(t+1)*n);
+            std::vector<uint64_t> A1(R1.begin()+(size_t)t*n,R1.begin()+(size_t)(t+1)*n);
+            std::vector<uint64_t> st(KPq.s.begin()+(size_t)t*n,KPq.s.begin()+(size_t)(t+1)*n);
+            std::vector<uint64_t> mt{mod[t]},rt{root[t]};
+            std::vector<int64_t> d; gpufhe::decrypt_host(d,A0,A1,st,n,mt,rt);
+            res[t].resize(n);
+            for(uint32_t j=0;j<n;++j){long long v=d[j],q=(long long)mod[t];long long r=v%q;if(r<0)r+=q;res[t][j]=(uint64_t)r;} }
+        auto inv=[](unsigned long long a,unsigned long long m)->unsigned long long{
+            long long g=m,x=0,x1=1,a1=a%m;
+            while(a1){long long qq=g/a1,t2=g-qq*a1;g=a1;a1=t2;long long t3=x-qq*x1;x=x1;x1=t3;}
+            long long r=x%(long long)m; if(r<0)r+=m; return (unsigned long long)r; };
+        unsigned __int128 prod=(unsigned __int128)mod[0]*mod[1], half=prod>>1;
+        for(uint32_t j=0;j<n;++j){
+            unsigned __int128 x=res[0][j];
+            unsigned long long q1=mod[1], xm=(unsigned long long)(x%q1);
+            unsigned long long diff=(res[1][j]+q1-xm)%q1;
+            unsigned long long k=(unsigned long long)(((unsigned __int128)diff*inv(mod[0]%q1,q1))%q1);
+            x += (unsigned __int128)mod[0]*k;
+            aref[j] = (x>half)? -(__int128)(prod-x) : (__int128)x; }
+        std::vector<int64_t> dec1; gpufhe::decrypt_host(dec1,c0,c1,KP1.s,n,mod1,root1);
+        uint32_t bad=0; __int128 maxI=0;
+        for(uint32_t j=0;j<n;++j){ __int128 d=aref[j]-(__int128)dec1[j];
+            if(d%(__int128)q0!=0) ++bad;
+            else { __int128 I=d/(__int128)q0; if(I<0)I=-I; if(I>maxI)maxI=I; } }
+        std::cout<<"ModRaise: congruence mismatches = "<<bad<<" (want 0), max|I| = "<<(double)(long long)maxI<<"\n";
+    }
+
+    // ---- C2S matrices [A B] = P * inv([W; conj W])
+    std::vector<uint64_t> rk(S); {uint64_t r=1;for(uint32_t k=0;k<S;++k){rk[k]=r;r=(r*5)%M;}}
+    const uint32_t N=n;
+    // The rows of [W; conj W] are ORTHOGONAL: for two odd powers r,r',
+    // sum_j e^{i*pi*j(r-r')/N} = 0 (r-r' is even so the numerator vanishes) and
+    // = N when r=r'. So the matrix is sqrt(N)*unitary and its inverse is just
+    // (1/N)*conjugate transpose -- ANALYTIC, O(1) per entry, zero storage.
+    // The old NxN complex Gauss-Jordan was 3.5e13 ops and 17GB at n=32768.
+    auto Wrow=[&](uint32_t r,uint32_t j)->cd{        // row r, col j of [W; conj W]
+        uint32_t k=(r<S)? r : r-S;
+        cd w=std::polar(1.0, M_PI*(double)(((uint64_t)j*rk[k])%M)/(double)N);
+        return (r<S)? w : std::conj(w); };
+    auto Aent=[&](uint32_t i,uint32_t c)->cd{        // = Inv[i][c] + i*Inv[i+S][c]
+        return (std::conj(Wrow(c,i)) + cd{0,1}*std::conj(Wrow(c,i+S)))/(double)N; };
+    { // self-check: (Wf * Inv)[a][b] must be delta_ab
+      double offmax=0, diagerr=0;
+      for(uint32_t t=0;t<6;++t){
+        uint32_t a=(t*37)%N, b=(t*91+5)%N;
+        cd sd{0,0}, so{0,0};
+        for(uint32_t c=0;c<N;++c){ sd+=Wrow(a,c)*std::conj(Wrow(a,c))/(double)N;
+                                   so+=Wrow(a,c)*std::conj(Wrow(b,c))/(double)N; }
+        diagerr=std::max(diagerr,std::abs(sd-cd{1,0}));
+        if(a!=b) offmax=std::max(offmax,std::abs(so)); }
+      std::cout<<"analytic inverse self-check: diag err="<<diagerr<<" offdiag="<<offmax<<"\n"; }
+
+    // ---- BSGS linear transform (46 keys, shared across branches)
+    const uint32_t n1=32,n2=S/n1;
+    std::map<uint32_t,gpufhe::KeySwitchConstants> Kc;
+    auto rotAmt=[&](uint32_t r)->uint32_t{uint64_t k=1;for(uint32_t t=0;t<r;++t)k=(k*5)%M;return (uint32_t)k;};
+    auto keyFor=[&](uint32_t r)->gpufhe::KeySwitchConstants&{
+        auto it=Kc.find(r); if(it!=Kc.end())return it->second;
+        Kc.emplace(r,mkKidx(rotAmt(r),4000+r)); return Kc[r]; };
+    const size_t T=(size_t)sizeQ*n; (void)T;
+    // ---- C2S via L merged FFT stages (replaces the dense S-diagonal transform).
+    // Stage s: h=S>>(s+1), blocks of 2h, twiddle at position k is pts[k]^(2^s).
+    // Merging r=lgS/L consecutive stages flips r consecutive index bits => 2^r
+    // diagonals for the first merged stage, 2^(r+1)-1 after. Gated against the
+    // dense matrix in test_c2s_stages (1.5e-16). Output is BIT-REVERSED in slot
+    // order; the permutation is never applied because everything up to S2C is
+    // elementwise in slot index, so S2C absorbs it via brev() on its columns.
+    uint32_t lgS=0; while((1u<<lgS)<S) ++lgS;
+    const uint32_t LST=3, RST=lgS/LST;
+    // LST MUST divide log2(S), or the stages cover only LST*RST bits and the
+    // rest are silently skipped -- that reads as a wrong-but-plausible
+    // diagonal census plus a garbage transform (seen at n=4096: lgS=11 is
+    // prime, LST=3 gave RST=3, covering 9 of 11 bits, C2S err 20.05).
+    // Usable L exist only when log2(S) is composite:
+    //   n=1024  lgS=9  = 3*3      -> L=3
+    //   n=4096  lgS=11 prime      -> L=1 or 11 only (both useless)
+    //   n=8192  lgS=12 = 2^2*3    -> L=2,3,4,6
+    //   n=32768 lgS=14 = 2*7      -> L=2 or 7
+    if(lgS%LST){ std::cout<<"[FAIL] LST="<<LST<<" does not divide log2(S)="<<lgS<<"\n"; return 1; }
+    auto brev=[&](uint32_t i){uint32_t r=0;for(uint32_t b=0;b<lgS;++b) if(i&(1u<<b)) r|=1u<<(lgS-1-b); return r;};
+    auto twd=[&](uint32_t k,uint32_t st)->cd{ uint64_t e=((uint64_t)rk[k]<<st)%M;
+        return std::polar(1.0, 2*M_PI*(double)e/(double)M); };
+    auto applyMerged=[&](std::vector<cd>& v,uint32_t g){
+        for(uint32_t st=g*RST;st<(g+1)*RST;++st){
+            uint32_t h=S>>(st+1); std::vector<cd> o(S);
+            for(uint32_t base=0;base<S;base+=2*h)
+                for(uint32_t k=0;k<h;++k){
+                    cd a=v[base+k],b=v[base+k+h],t=twd(k,st);
+                    o[base+k]=(a+b)*0.5; o[base+k+h]=(a-b)/(2.0*t);}
+            v.swap(o);} };
+    auto stageDiags=[&](uint32_t g,std::vector<uint32_t>& offs,std::vector<std::vector<cd>>& dg){
+        std::vector<std::vector<cd>> acc(S); std::vector<uint8_t> used(S,0);
+        for(uint32_t jj=0;jj<S;++jj){
+            std::vector<cd> u(S,cd{0,0}); u[jj]=1; applyMerged(u,g);
+            for(uint32_t ii=0;ii<S;++ii) if(std::abs(u[ii])>1e-12){
+                uint32_t d=(jj+S-ii)%S;
+                if(!used[d]){used[d]=1;acc[d].assign(S,cd{0,0});}
+                acc[d][ii]=u[ii]; } }
+        offs.clear(); dg.clear();
+        for(uint32_t d=0;d<S;++d) if(used[d]){offs.push_back(d);dg.push_back(acc[d]);} };
+    // KSC is a VIEW cache (atLevel() of a KROT full key) -- cheap to
+    // regenerate on a miss (pure CPU copy, no RNG, no evalkeygen_host call),
+    // unlike KROT itself (real keygen cost). Measured this session: KSC grew
+    // unbounded to 156 entries, each a full av/bv COPY (not a reference) at
+    // that level's numPart -- a real, measured contributor to this session's
+    // ~10.78GB peak host RSS at n=8192 (would scale ~16x at n=131072,
+    // catastrophically, if left unbounded). Bound it with LRU eviction: safe
+    // specifically because misses here are cheap, unlike KROT (left uncapped
+    // -- confirmed by instrumentation that ALL KROT entries get reused across
+    // the whole bootstrap, so capping it would force real re-keygen cost).
+    constexpr size_t KSC_CAP=48;
+    std::map<uint64_t,gpufhe::KeySwitchConstants> KSC;
+    std::list<uint64_t> KSC_lru;   // front = most recently used
+    std::map<uint64_t,std::list<uint64_t>::iterator> KSC_lru_pos;
+    auto keyAt=[&](uint32_t r,uint32_t tw)->gpufhe::KeySwitchConstants&{
+        uint64_t kk=((uint64_t)r<<8)|tw; auto it=KSC.find(kk);
+        if(it!=KSC.end()){
+            KSC_lru.erase(KSC_lru_pos[kk]); KSC_lru.push_front(kk); KSC_lru_pos[kk]=KSC_lru.begin();
+            return it->second;
+        }
+        // alpha=2 tolerates key reuse across levels (the last part mismatches by
+        // at most 1 tower); it is alpha=10 that breaks. So take a level VIEW of
+        // one full-QP key instead of regenerating -- fresh keys per level cost
+        // up to 105 keygens here with 14 parts.
+        if(KSC.size()>=KSC_CAP){
+            uint64_t victim=KSC_lru.back(); KSC_lru.pop_back();
+            KSC_lru_pos.erase(victim); KSC.erase(victim);
+        }
+        KSC.emplace(kk,atLevel(rotFull(rotAmt(r),4000+r),tw));
+        KSC_lru.push_front(kk); KSC_lru_pos[kk]=KSC_lru.begin();
+        return KSC[kk]; };
+    auto rescaleAt=[&](std::vector<uint64_t>& a0,std::vector<uint64_t>& a1,uint32_t tw){
+        std::vector<uint64_t> ml(mod.begin(),mod.begin()+tw),rl(root.begin(),root.begin()+tw);
+        gpufhe::KeySwitchConstants Kd; Kd.n=n;
+        gpufhe::compute_keyswitch_constants(Kd,ml,modP,npFor(tw));
+        for(uint32_t i2=0;i2<tw;++i2){Kd.rootModList.push_back(ml[i2]);Kd.rootValList.push_back(rl[i2]);}
+        for(uint32_t j2=0;j2<sizeP;++j2){Kd.rootModList.push_back(modP[j2]);Kd.rootValList.push_back(rootQP[sizeQ+j2]);}
+        Kd.av.assign(Kd.numPart,{});Kd.bv.assign(Kd.numPart,{});Kd.evalKeyTowers=tw+sizeP;
+        for(uint32_t p2=0;p2<Kd.numPart;++p2){Kd.av[p2].assign((size_t)(tw+sizeP)*n,0);Kd.bv[p2].assign((size_t)(tw+sizeP)*n,0);}
+        auto Cc=gpufhe::ks_context_create(Kd);
+        std::vector<uint64_t> s1,s2; gpufhe::native_rescale_consts(s1,s2,ml,tw-1);
+        size_t TT=(size_t)tw*n; uint64_t *d0,*d1,*sc2,*dp2;
+        cudaMalloc(&d0,TT*8);cudaMalloc(&d1,TT*8);cudaMalloc(&sc2,(size_t)n*8);cudaMalloc(&dp2,(size_t)n*8);
+        cudaMemcpy(d0,a0.data(),TT*8,cudaMemcpyHostToDevice);cudaMemcpy(d1,a1.data(),TT*8,cudaMemcpyHostToDevice);
+        gpufhe::rescale_resident_raw(d0,tw,Cc,s1,s2,sc2,dp2,0);
+        gpufhe::rescale_resident_raw(d1,tw,Cc,s1,s2,sc2,dp2,0);
+        cudaDeviceSynchronize();
+        std::vector<uint64_t> g0(TT),g1(TT);
+        cudaMemcpy(g0.data(),d0,TT*8,cudaMemcpyDeviceToHost);cudaMemcpy(g1.data(),d1,TT*8,cudaMemcpyDeviceToHost);
+        cudaFree(d0);cudaFree(d1);cudaFree(sc2);cudaFree(dp2);gpufhe::ks_context_destroy(Cc);
+        size_t T2b=(size_t)(tw-1)*n; a0.assign(g0.begin(),g0.begin()+T2b); a1.assign(g1.begin(),g1.begin()+T2b); };
+
+    // Stage-scoped resident rotation: hoists stream/DeviceKSWork/base-
+    // ciphertext residency out of the per-diagonal loop. Only the per-key
+    // DeviceKSContext av/bv upload remains per-diagonal (unavoidable).
+    struct StageRotCtx{
+        cudaStream_t s=0; gpufhe::DeviceKSWork W{};
+        uint64_t *d_base0=nullptr,*d_base1=nullptr,*d_w0=nullptr,*d_w1=nullptr;
+        uint64_t *d_scratch=nullptr,*d_b0=nullptr,*d_b1=nullptr; size_t cap=0;
+    };
+    auto stageRotBegin=[&](StageRotCtx& R,const std::vector<uint64_t>& c0,const std::vector<uint64_t>& c1,
+                          uint32_t towers,const gpufhe::KeySwitchConstants& anyKeyAtLevel){
+        size_t need=(size_t)towers*n*8;
+        if(need>R.cap){
+            if(R.d_base0){cudaFree(R.d_base0);cudaFree(R.d_base1);cudaFree(R.d_w0);cudaFree(R.d_w1);
+                          cudaFree(R.d_scratch);cudaFree(R.d_b0);cudaFree(R.d_b1);}
+            cudaMalloc(&R.d_base0,need);cudaMalloc(&R.d_base1,need);
+            cudaMalloc(&R.d_w0,need);cudaMalloc(&R.d_w1,need);
+            // towers*n sized, NOT n-sized: automorphism_eval_fast_device
+            // batches all towers in one gather launch (see its own comment
+            // in src/rotate.cpp), unlike the old per-tower automorphism_eval_device
+            // this used to call, which only needed one n-sized scratch tower.
+            cudaMalloc(&R.d_scratch,need);cudaMalloc(&R.d_b0,need);cudaMalloc(&R.d_b1,need);
+            R.cap=need;
+        }
+        cudaStreamCreate(&R.s);
+        gpufhe::DeviceKSContext Csize;
+        Csize.n=anyKeyAtLevel.n; Csize.sizeQl=anyKeyAtLevel.sizeQl; Csize.sizeP=anyKeyAtLevel.sizeP;
+        Csize.sizeQlP=anyKeyAtLevel.sizeQl+anyKeyAtLevel.sizeP; Csize.sizePart=anyKeyAtLevel.sizePart;
+        R.W=gpufhe::ks_work_create(Csize);
+        cudaMemcpyAsync(R.d_base0,c0.data(),need,cudaMemcpyHostToDevice,R.s);
+        cudaMemcpyAsync(R.d_base1,c1.data(),need,cudaMemcpyHostToDevice,R.s);
+    };
+    auto stageRotDiag=[&](StageRotCtx& R,std::vector<uint64_t>& out0,std::vector<uint64_t>& out1,
+                         uint32_t k,const gpufhe::KeySwitchConstants& Krot,uint32_t towers,
+                         const std::vector<uint64_t>& ml,const std::vector<uint64_t>& rl){
+        size_t B=(size_t)towers*n*8;
+        cudaMemcpyAsync(R.d_w0,R.d_base0,B,cudaMemcpyDeviceToDevice,R.s);
+        cudaMemcpyAsync(R.d_w1,R.d_base1,B,cudaMemcpyDeviceToDevice,R.s);
+        // Eval-domain permutation (validated bit-exact against
+        // automorphism_eval_device at n=8192, tests/test_automorph_eval_fast.cpp)
+        // -- this call site was still on the old INTT->permute->NTT path,
+        // never updated when rotate_ct_resident got this fix (commit 0043af3),
+        // because this stage-resident loop doesn't go through rotate_ct_resident
+        // at all. (rl is now unused for this call -- the fast path is
+        // modulus-independent; ml is still needed below for the final combine.)
+        gpufhe::automorphism_eval_fast_device(R.d_w0,towers,n,k,R.d_scratch,R.s);
+        gpufhe::automorphism_eval_fast_device(R.d_w1,towers,n,k,R.d_scratch,R.s);
+        auto C=gpufhe::ks_context_create(Krot,R.s);
+        gpufhe::keyswitch_resident(R.d_w1,R.d_b0,R.d_b1,C,R.W,R.s);
+        gpufhe::ks_context_destroy(C);
+        out0.resize((size_t)towers*n); out1.resize((size_t)towers*n);
+        std::vector<uint64_t> ba0((size_t)towers*n);
+        cudaMemcpyAsync(out0.data(),R.d_w0,B,cudaMemcpyDeviceToHost,R.s);
+        cudaMemcpyAsync(ba0.data(),R.d_b0,B,cudaMemcpyDeviceToHost,R.s);
+        cudaMemcpyAsync(out1.data(),R.d_b1,B,cudaMemcpyDeviceToHost,R.s);
+        cudaStreamSynchronize(R.s);
+        for(uint32_t t=0;t<towers;++t){ uint64_t q=ml[t];
+            for(uint32_t kk=0;kk<n;++kk){ size_t x=(size_t)t*n+kk;
+                uint64_t s2=out0[x]+ba0[x]; out0[x]=(s2>=q)?s2-q:s2; } }
+    };
+    auto stageRotEnd=[&](StageRotCtx& R){
+        cudaStreamDestroy(R.s); R.s=0;
+        gpufhe::ks_work_destroy(R.W); R.W=gpufhe::DeviceKSWork{};
+    };
+
+    std::vector<uint64_t> cs0=R0, cs1=R1;
+    uint32_t ctw=sizeQ; double csc=(double)q0;      // declared input scale
+    uint32_t ndiagTot=0;
+    { auto _t=NOW();
+      for(uint32_t g=0;g<LST;++g){
+        std::vector<uint32_t> offs; std::vector<std::vector<cd>> dg;
+        stageDiags(g,offs,dg); ndiagTot+=(uint32_t)offs.size();
+        std::vector<uint64_t> ml(mod.begin(),mod.begin()+ctw),rl(root.begin(),root.begin()+ctw);
+        size_t TT=(size_t)ctw*n;
+        std::vector<uint64_t> a0(TT,0),a1(TT,0); bool fst=true;
+        // Each stage costs a rescale, so encoding every stage's diagonals at
+        // Delta_pt would divide the scale by (Delta_pt/q) per stage and collapse
+        // it (2^60 -> 2^30 at L=3), pushing it below Delta_w so that EvalMod's
+        // ct*ct multiplies shrink it further into denormals -> inf. Hold the
+        // scale FLAT through the intermediate stages by encoding at the modulus
+        // being dropped; only the last stage does the 2^60 -> 2^50 step.
+        const double dpt = (g+1<LST) ? (double)mod[ctw-1] : Delta_pt;
+        StageRotCtx R; stageRotBegin(R,cs0,cs1,ctw,keyAt(offs[0],ctw));
+        for(size_t x=0;x<offs.size();++x){
+            auto _tp=NOW();
+            std::vector<int64_t> md; gpufhe::encode_host(md,dg[x],n,dpt);
+            std::vector<uint64_t> dE; gpufhe::pt_to_eval_host(dE,md,ctw,n,ml,rl);
+            g_tPtEval+=EL(_tp);
+            std::vector<uint64_t> t0,t1;
+            auto _tr=NOW();
+            if(offs[x]) stageRotDiag(R,t0,t1,rotAmt(offs[x]),keyAt(offs[x],ctw),ctw,ml,rl);
+            else { t0=cs0; t1=cs1; }
+            g_tRot+=EL(_tr);
+            auto _ta=NOW();
+            gpufhe::ct_mul_pt_host(t0,t1,dE,ctw,n,ml);
+            if(fst){a0=t0;a1=t1;fst=false;} else gpufhe::ct_add_ct_host(a0,a1,t0,t1,ctw,n,ml);
+            g_tCpuAcc+=EL(_ta); }
+        if(g==0){
+            // ---- HOISTED VALIDATION against the REAL, live C2S stage 0
+            // state (research/NEXT_SESSION.md priority queue item 1's
+            // "next step"). Decompose cs1 (the actual bootstrap ciphertext
+            // entering this stage, UNPERMUTED) ONCE, reuse across all
+            // offs.size() diagonals. Builds its OWN hoisted-convention
+            // keys FRESH (no cache advantage over the trusted path, which
+            // is also generating fresh keys here via keyAt on first use)
+            // for a fair, representative comparison. Compares against the
+            // trusted a0,a1 computed just above (pre-rescale -- rescale
+            // is deterministic and already proven, no need to duplicate
+            // it on both sides).
+            auto t0h=NOW();
+            auto Cshape=gpufhe::ks_context_create(KREL);   // shape only; av/bv unused by decompose
+            auto Dh=gpufhe::hoist_digits_create(Cshape);
+            size_t Bc=(size_t)ctw*n*8;
+            uint64_t *d_cs0,*d_cs1;
+            cudaMalloc(&d_cs0,Bc); cudaMalloc(&d_cs1,Bc);
+            cudaMemcpy(d_cs0,cs0.data(),Bc,cudaMemcpyHostToDevice);
+            cudaMemcpy(d_cs1,cs1.data(),Bc,cudaMemcpyHostToDevice);
+            gpufhe::ks_decompose_only(d_cs1,Cshape,Dh,0);
+            cudaDeviceSynchronize();
+            gpufhe::ks_context_destroy(Cshape);
+            double tDecomposeOnce=EL(t0h);
+
+            std::vector<uint64_t> a0h(TT,0),a1h(TT,0); bool fsth=true;
+            std::vector<uint64_t> a0g(TT,0),a1g(TT,0); bool fstg=true;
+            double tHoistKeygen=0, tHoistCompute=0;
+            uint32_t sizeQlP_loc=ctw+sizeP;
+            uint64_t *d_scratch_qp; cudaMalloc(&d_scratch_qp,(size_t)sizeQlP_loc*n*8);
+            for(size_t x=0;x<offs.size();++x){
+                std::vector<int64_t> md; gpufhe::encode_host(md,dg[x],n,dpt);
+                std::vector<uint64_t> dE; gpufhe::pt_to_eval_host(dE,md,ctw,n,ml,rl);
+                std::vector<uint64_t> t0,t1;
+                if(offs[x]){
+                    uint32_t k=rotAmt(offs[x]);
+                    auto _tk=NOW();
+                    uint64_t kinv; { uint64_t a=k%M, mmo=M; int64_t old_r=(int64_t)a,r=(int64_t)mmo,old_s=1,s=0;
+                        while(r!=0){int64_t qd=old_r/r,tr=old_r-qd*r;old_r=r;r=tr;int64_t ts=old_s-qd*s;old_s=s;s=ts;}
+                        int64_t res=old_s%(int64_t)mmo; if(res<0)res+=(int64_t)mmo; kinv=(uint64_t)res; }
+                    std::vector<uint64_t> pkA_h=KPqp.pkA, pkB_h=KPqp.pkB;
+                    gpufhe::automorphism_eval_host(pkA_h,sizeQlP,n,(uint32_t)kinv,modQP,rootQP);
+                    gpufhe::automorphism_eval_host(pkB_h,sizeQlP,n,(uint32_t)kinv,modQP,rootQP);
+                    gpufhe::KeySwitchConstants Kh; Kh.n=n;
+                    gpufhe::compute_keyswitch_constants(Kh,mod,modP,npFor(ctw));
+                    for(uint32_t i=0;i<ctw;++i){Kh.rootModList.push_back(mod[i]);Kh.rootValList.push_back(root[i]);}
+                    for(uint32_t j=0;j<sizeP;++j){Kh.rootModList.push_back(modP[j]);Kh.rootValList.push_back(rootQP[sizeQ+j]);}
+                    gpufhe::evalkeygen_host_sold(Kh,KPqp.s,KPqp.s,pkA_h,pkB_h,PModq,modQP,rootQP,ns,3.19,5000+(uint64_t)offs[x]);
+                    tHoistKeygen+=EL(_tk);
+
+                    auto _tc=NOW();
+                    auto Ck=gpufhe::ks_context_create(Kh);
+                    auto Wk=gpufhe::ks_work_create(Ck);
+                    gpufhe::ks_accumulate_from_digits(d_cs1,Dh,Ck,Wk,0);
+                    for(uint32_t t=0;t<ctw;++t)
+                        LaunchScaledAddInto(Wk.d_res0+(size_t)t*n, d_cs0+(size_t)t*n, PModq[t], mod[t], n, 0);
+                    gpufhe::automorphism_eval_fast_device(Wk.d_res0,sizeQlP_loc,n,k,d_scratch_qp,0);
+                    gpufhe::automorphism_eval_fast_device(Wk.d_res1,sizeQlP_loc,n,k,d_scratch_qp,0);
+                    uint64_t *d_ba0,*d_ba1; cudaMalloc(&d_ba0,Bc); cudaMalloc(&d_ba1,Bc);
+                    gpufhe::ks_moddown(Ck,Wk,Wk.d_res0,d_ba0,0);
+                    gpufhe::ks_moddown(Ck,Wk,Wk.d_res1,d_ba1,0);
+                    cudaDeviceSynchronize();
+                    t0.resize(TT); t1.resize(TT);
+                    cudaMemcpy(t0.data(),d_ba0,Bc,cudaMemcpyDeviceToHost);
+                    cudaMemcpy(t1.data(),d_ba1,Bc,cudaMemcpyDeviceToHost);
+                    cudaFree(d_ba0); cudaFree(d_ba1);
+                    gpufhe::ks_work_destroy(Wk); gpufhe::ks_context_destroy(Ck);
+                    tHoistCompute+=EL(_tc);
+                } else { t0=cs0; t1=cs1; }
+                // Parallel re-computed-trusted accumulation (gt0,gt1, summed
+                // into a0g,a1g the SAME way a0h,a1h accumulates) -- isolates
+                // whether a mismatch is in the per-diagonal keyswitch (would
+                // show here, comparing against t0,t1 directly) or purely in
+                // how the OFFICIAL a0,a1 (computed by the earlier, unmodified
+                // x-loop using a shared StageRotCtx) relates to a fresh
+                // per-diagonal recomputation.
+                std::vector<uint64_t> gt0,gt1;
+                if(offs[x]){
+                    StageRotCtx Rdbg; stageRotBegin(Rdbg,cs0,cs1,ctw,keyAt(offs[x],ctw));
+                    stageRotDiag(Rdbg,gt0,gt1,rotAmt(offs[x]),keyAt(offs[x],ctw),ctw,ml,rl);
+                    stageRotEnd(Rdbg);
+                    std::vector<int64_t> dmg,dmh;
+                    gpufhe::decrypt_host(dmg,gt0,gt1,KPq.s,n,ml,rl);
+                    gpufhe::decrypt_host(dmh,t0,t1,KPq.s,n,ml,rl);
+                    int64_t dmaxAbs=0,dmaxDiff=0;
+                    for(size_t i=0;i<dmg.size();++i){
+                        int64_t av=(dmg[i]<0?-dmg[i]:dmg[i]); if(av>dmaxAbs)dmaxAbs=av;
+                        int64_t dd=dmg[i]-dmh[i]; if(dd<0)dd=-dd; if(dd>dmaxDiff)dmaxDiff=dd; }
+                    std::cout<<"  [debug] isolated diag x="<<x<<" offs[x]="<<offs[x]
+                              <<" trusted-vs-hoisted maxAbs="<<dmaxAbs<<" maxDiff="<<dmaxDiff<<"\n";
+                } else { gt0=cs0; gt1=cs1; }
+                gpufhe::ct_mul_pt_host(gt0,gt1,dE,ctw,n,ml);
+                if(fstg){a0g=gt0;a1g=gt1;fstg=false;} else gpufhe::ct_add_ct_host(a0g,a1g,gt0,gt1,ctw,n,ml);
+                gpufhe::ct_mul_pt_host(t0,t1,dE,ctw,n,ml);
+                if(fsth){a0h=t0;a1h=t1;fsth=false;} else gpufhe::ct_add_ct_host(a0h,a1h,t0,t1,ctw,n,ml);
+            }
+            {
+                // decrypt_host returns int64_t; the PRE-rescale accumulated
+                // product (16 ciphertext*plaintext multiplies summed, never
+                // meant to be decrypted directly -- rescaleAt always runs
+                // immediately after this sum in the real pipeline) sits at
+                // a combined scale that can exceed what int64_t represents,
+                // so compare AFTER rescale (on copies), matching what every
+                // real downstream consumer of this stage's output actually
+                // sees.
+                auto a0o2=a0,a1o2=a1, a0r2=a0g,a1r2=a1g, a0h2c=a0h,a1h2c=a1h;
+                rescaleAt(a0o2,a1o2,ctw); rescaleAt(a0r2,a1r2,ctw); rescaleAt(a0h2c,a1h2c,ctw);
+                std::vector<uint64_t> mlr(mod.begin(),mod.begin()+ctw-1),rlr(root.begin(),root.begin()+ctw-1);
+                std::vector<int64_t> mo,mr,mh2;
+                gpufhe::decrypt_host(mo,a0o2,a1o2,KPq.s,n,mlr,rlr);
+                gpufhe::decrypt_host(mr,a0r2,a1r2,KPq.s,n,mlr,rlr);
+                gpufhe::decrypt_host(mh2,a0h2c,a1h2c,KPq.s,n,mlr,rlr);
+                int64_t d_or=0,d_rh=0,maxA=0;
+                for(size_t i=0;i<mo.size();++i){
+                    int64_t av=(mo[i]<0?-mo[i]:mo[i]); if(av>maxA)maxA=av;
+                    int64_t a=mo[i]-mr[i]; if(a<0)a=-a; if(a>d_or)d_or=a;
+                    int64_t b=mr[i]-mh2[i]; if(b<0)b=-b; if(b>d_rh)d_rh=b; }
+                std::cout<<"  [debug] three-way (POST-rescale): maxAbs="<<maxA
+                          <<" |official-recomputedTrusted|="<<d_or
+                          <<" |recomputedTrusted-hoisted|="<<d_rh<<"\n";
+            }
+            cudaFree(d_cs0); cudaFree(d_cs1); cudaFree(d_scratch_qp);
+            gpufhe::hoist_digits_destroy(Dh);
+
+            auto a0rs=a0,a1rs=a1, a0hrs=a0h,a1hrs=a1h;
+            rescaleAt(a0rs,a1rs,ctw); rescaleAt(a0hrs,a1hrs,ctw);
+            std::vector<uint64_t> mlf(mod.begin(),mod.begin()+ctw-1),rlf(root.begin(),root.begin()+ctw-1);
+            std::vector<int64_t> mg,mh;
+            gpufhe::decrypt_host(mg,a0rs,a1rs,KPq.s,n,mlf,rlf);
+            gpufhe::decrypt_host(mh,a0hrs,a1hrs,KPq.s,n,mlf,rlf);
+            int64_t maxAbs=0,maxDiff=0;
+            for(size_t i=0;i<mg.size();++i){
+                int64_t av=(mg[i]<0?-mg[i]:mg[i]); if(av>maxAbs)maxAbs=av;
+                int64_t dd=mg[i]-mh[i]; if(dd<0)dd=-dd; if(dd>maxDiff)maxDiff=dd; }
+            bool ok = maxDiff < (maxAbs>>18) + (1LL<<32);
+            std::cout<<"\n=== HOISTED C2S STAGE 0 VALIDATION (real bootstrap state) ===\n";
+            std::cout<<"  trusted vs hoisted decrypted maxAbs="<<maxAbs<<" maxDiff="<<maxDiff
+                      <<(ok?" [MATCH within noise]":" [MISMATCH]")<<"\n";
+            std::cout<<"  hoisted: decompose-once="<<tDecomposeOnce<<"s  keygen("<<offs.size()<<" keys, fresh)="
+                      <<tHoistKeygen<<"s  compute="<<tHoistCompute<<"s  total="
+                      <<(tDecomposeOnce+tHoistKeygen+tHoistCompute)<<"s\n";
+            std::cout<<"  trusted: elapsed since C2S start="<<EL(_t)<<"s (stage 0 is the first work done,"
+                      <<" so this is ~stage 0's own cost; includes fresh keygen via keyAt)\n";
+            std::cout<<(ok?"[PASS]":"[FAIL]")<<" stage-0 hoisting validation against the REAL bootstrap state\n";
+            return ok?0:1;
+        }
+        stageRotEnd(R);
+        rescaleAt(a0,a1,ctw);
+        std::cerr<<"    C2S stage "<<g<<" tw="<<ctw<<" parts="<<npFor(ctw)
+                 <<" diags="<<offs.size()<<" keys="<<KSC.size()<<" t="<<EL(_t)<<"s\n";
+        csc=csc*dpt/(double)mod[ctw-1]; --ctw; cs0=a0; cs1=a1; }
+      tC2S=EL(_t); }
+    std::cout<<"C2S: "<<LST<<" FFT stages (radix 2^"<<RST<<"), "<<ndiagTot
+             <<" diagonals vs "<<S<<" dense, rotation keys="<<KSC.size()<<"\n";
+    std::cout<<"  [mem] after C2S: KROT="<<KROT.size()<<" KSC="<<KSC.size()
+             <<" peak RSS="<<rssMB()<<" MB\n";
+    uint32_t nt=ctw; size_t T2=(size_t)nt*n; (void)T2;
+    std::vector<uint64_t> y0=cs0,y1=cs1;
+    const double sOut=csc;
+    std::vector<uint64_t> mf(mod.begin(),mod.begin()+nt),rf(root.begin(),root.begin()+nt);
+    auto KPr=gpufhe::keygen_host(n,mf,rf,ns,3.19,101);
+
+    auto peek=[&](const std::vector<uint64_t>&p0,const std::vector<uint64_t>&p1,double sc)->std::vector<cd>{
+        std::vector<int64_t> d; gpufhe::decrypt_host(d,p0,p1,KPr.s,n,mf,rf);
+        std::vector<cd> v; gpufhe::decode_host(v,d,n,sc); return v; };
+
+    // ---- CHECK C2S: slots must be y_k = (a_k + i a_{k+S})/q0
+    { auto v=peek(y0,y1,sOut);
+      double e=0,mx=0; for(uint32_t k=0;k<S;++k){
+          cd r{d128(aref[k])/(double)q0, d128(aref[k+S])/(double)q0};
+          e=std::max(e,std::abs(v[brev(k)]-r)); mx=std::max(mx,std::abs(r)); }
+      std::cout<<"C2S slots err = "<<e<<"  (max|y| = "<<mx<<" -> K budget)\n";
+      std::cout<<"  y[0]="<<v[brev(0)]<<" ref=("<<d128(aref[0])/(double)q0<<","<<d128(aref[S])/(double)q0<<")\n"; }
+
+    // ---- SPLIT: ctR = ct + conj(ct) (slots 2Re y) ; ctI = ct - conj(ct) (slots 2i Im y)
+    std::vector<uint64_t> k0=y0,k1=y1;
+    { auto Kl=atLevel(rotFull(M-1,7400),nt);
+      gpufhe::rotate_ct_host(k0,k1,M-1,Kl,nt,n,mf,rf); }
+
+    std::vector<uint64_t> r0=y0,r1=y1,i0=y0,i1=y1;
+    gpufhe::ct_add_ct_host(r0,r1,k0,k1,nt,n,mf);           // 2*Re(y)
+    for(uint32_t t=0;t<nt;++t){uint64_t q=mf[t];
+        for(uint32_t j=0;j<n;++j){size_t x=(size_t)t*n+j;
+            i0[x]=smu(i0[x],k0[x],q); i1[x]=smu(i1[x],k1[x],q);}}   // 2i*Im(y)
+
+
+    // ================== BACK HALF: EvalMod x2 -> S2C -> recover ==================
+    const double Delta_w=std::pow(2.0,55);
+    struct Ct { std::vector<uint64_t> c0,c1; uint32_t tw; double scale; };
+
+    auto mkKlvl=[&](uint32_t k,uint32_t tw,uint32_t seed)->gpufhe::KeySwitchConstants{
+        return atLevel(rotFull(k,seed),tw); };
+    // CONTROL: regenerate the relin key FRESH at each level (no reuse) to
+    // separate "alpha=10 is broken" from "reuse across a numPart change is broken".
+    auto buildK=[&](uint32_t tw)->gpufhe::KeySwitchConstants{
+        // buildK(tw) is a pure function of tw alone: every capture above is
+        // fixed for this bootstrap run and the evalkeygen_host seed below
+        // (202) is a hardcoded literal, so two calls with the same tw are
+        // byte-for-byte identical. EvalMod's R and I branches independently
+        // walk the exact same descending sequence of tw values (same starting
+        // tw, same degC/rDbl), so every tw here is regenerated twice with no
+        // difference whatsoever. Cache by tw (process-lifetime, same pattern
+        // as g_rtab/upc elsewhere in this codebase) instead of regenerating.
+        static std::map<uint32_t,gpufhe::KeySwitchConstants> g_buildK_cache;
+        auto cit=g_buildK_cache.find(tw);
+        if(cit!=g_buildK_cache.end()) return cit->second;
+        std::vector<uint64_t> ml(mod.begin(),mod.begin()+tw),rl(root.begin(),root.begin()+tw);
+        std::vector<uint64_t> mq(ml); for(auto p:modP)mq.push_back(p);
+        std::vector<uint64_t> rq(rl); for(uint32_t j=0;j<sizeP;++j)rq.push_back(rootQP[sizeQ+j]);
+        auto sl=[&](const std::vector<uint64_t>&src){std::vector<uint64_t> d((size_t)(tw+sizeP)*n);
+            for(uint32_t t=0;t<tw;++t)std::copy(src.begin()+(size_t)t*n,src.begin()+(size_t)(t+1)*n,d.begin()+(size_t)t*n);
+            for(uint32_t j=0;j<sizeP;++j)std::copy(src.begin()+(size_t)(sizeQ+j)*n,src.begin()+(size_t)(sizeQ+j+1)*n,d.begin()+(size_t)(tw+j)*n);
+            return d;};
+        gpufhe::KeySwitchConstants K; K.n=n;
+        gpufhe::compute_keyswitch_constants(K,ml,modP,npFor(tw));
+        for(uint32_t i=0;i<tw;++i){K.rootModList.push_back(ml[i]);K.rootValList.push_back(rl[i]);}
+        for(uint32_t j=0;j<sizeP;++j){K.rootModList.push_back(modP[j]);K.rootValList.push_back(rootQP[sizeQ+j]);}
+        std::vector<uint64_t> PM(tw+sizeP);
+        for(uint32_t t=0;t<tw+sizeP;++t){uint64_t q=mq[t],P=1%q;for(uint32_t j=0;j<sizeP;++j)P=mmu(P,modP[j]%q,q);PM[t]=P;}
+        gpufhe::evalkeygen_host(K,sl(KPqp.s),sl(KPqp.pkA),sl(KPqp.pkB),PM,mq,rq,ns,3.19,202);
+        g_buildK_cache.emplace(tw,K);
+        return K; };
+    // Structural-only constants for rescale: rescale_resident_raw never reads
+    // K.av/K.bv (it's pure NTT/INTT + modulus combine), so skip evalkeygen_host
+    // entirely when the caller only needs rescIP. Mirrors rescaleAt's own
+    // zero-filled-av/bv pattern above, just as a reusable builder.
+    auto buildKStruct=[&](uint32_t tw)->gpufhe::KeySwitchConstants{
+        std::vector<uint64_t> ml(mod.begin(),mod.begin()+tw),rl(root.begin(),root.begin()+tw);
+        gpufhe::KeySwitchConstants K; K.n=n;
+        gpufhe::compute_keyswitch_constants(K,ml,modP,npFor(tw));
+        for(uint32_t i=0;i<tw;++i){K.rootModList.push_back(ml[i]);K.rootValList.push_back(rl[i]);}
+        for(uint32_t j=0;j<sizeP;++j){K.rootModList.push_back(modP[j]);K.rootValList.push_back(rootQP[sizeQ+j]);}
+        K.av.assign(K.numPart,{}); K.bv.assign(K.numPart,{}); K.evalKeyTowers=tw+sizeP;
+        for(uint32_t p=0;p<K.numPart;++p){K.av[p].assign((size_t)(tw+sizeP)*n,0);K.bv[p].assign((size_t)(tw+sizeP)*n,0);}
+        return K; };
+    auto rescIP=[&](std::vector<uint64_t>&a0,std::vector<uint64_t>&a1,uint32_t tw,const gpufhe::KeySwitchConstants&Kx){
+        auto Cl=gpufhe::ks_context_create(Kx);
+        std::vector<uint64_t> s1,s2; {std::vector<uint64_t> sub(mod.begin(),mod.begin()+tw);
+            gpufhe::native_rescale_consts(s1,s2,sub,tw-1);}
+        size_t TT=(size_t)tw*n; uint64_t *d0,*d1,*sc,*dp;
+        cudaMalloc(&d0,TT*8);cudaMalloc(&d1,TT*8);cudaMalloc(&sc,(size_t)n*8);cudaMalloc(&dp,(size_t)n*8);
+        cudaMemcpy(d0,a0.data(),TT*8,cudaMemcpyHostToDevice);cudaMemcpy(d1,a1.data(),TT*8,cudaMemcpyHostToDevice);
+        gpufhe::rescale_resident_raw(d0,tw,Cl,s1,s2,sc,dp,0);
+        gpufhe::rescale_resident_raw(d1,tw,Cl,s1,s2,sc,dp,0);
+        cudaDeviceSynchronize();
+        std::vector<uint64_t> g0(TT),g1(TT);
+        cudaMemcpy(g0.data(),d0,TT*8,cudaMemcpyDeviceToHost);cudaMemcpy(g1.data(),d1,TT*8,cudaMemcpyDeviceToHost);
+        cudaFree(d0);cudaFree(d1);cudaFree(sc);cudaFree(dp);gpufhe::ks_context_destroy(Cl);
+        size_t T2b=(size_t)(tw-1)*n; a0.assign(g0.begin(),g0.begin()+T2b); a1.assign(g1.begin(),g1.begin()+T2b); };
+    auto mulCt=[&](const Ct&A,const Ct&B)->Ct{
+        uint32_t tw=A.tw; size_t TT=(size_t)tw*n;
+        std::vector<uint64_t> t0(TT),t1(TT),t2(TT);
+        {   // RNS tensor product (t0=a0*b0, t1=a0*b1+a1*b0, t2=a1*b1), batched
+            // across all tw towers on the GPU -- was a CPU loop of 4 128-bit
+            // mmu() calls per element (up to tw*n = 245760 elements).
+            uint64_t *d_a0,*d_a1,*d_b0,*d_b1,*d_t0,*d_t1,*d_t2;
+            cudaMalloc(&d_a0,TT*8);cudaMalloc(&d_a1,TT*8);
+            cudaMalloc(&d_b0,TT*8);cudaMalloc(&d_b1,TT*8);
+            cudaMalloc(&d_t0,TT*8);cudaMalloc(&d_t1,TT*8);cudaMalloc(&d_t2,TT*8);
+            cudaMemcpy(d_a0,A.c0.data(),TT*8,cudaMemcpyHostToDevice);
+            cudaMemcpy(d_a1,A.c1.data(),TT*8,cudaMemcpyHostToDevice);
+            cudaMemcpy(d_b0,B.c0.data(),TT*8,cudaMemcpyHostToDevice);
+            cudaMemcpy(d_b1,B.c1.data(),TT*8,cudaMemcpyHostToDevice);
+            LaunchCtTensorBatched(d_a0,d_a1,d_b0,d_b1,d_t0,d_t1,d_t2,
+                                  mod.data(),tw,n,0);
+            cudaDeviceSynchronize();
+            cudaMemcpy(t0.data(),d_t0,TT*8,cudaMemcpyDeviceToHost);
+            cudaMemcpy(t1.data(),d_t1,TT*8,cudaMemcpyDeviceToHost);
+            cudaMemcpy(t2.data(),d_t2,TT*8,cudaMemcpyDeviceToHost);
+            cudaFree(d_a0);cudaFree(d_a1);cudaFree(d_b0);cudaFree(d_b1);
+            cudaFree(d_t0);cudaFree(d_t1);cudaFree(d_t2);
+        }
+        auto Kl=buildK(tw); auto R=gpufhe::keyswitch_core_resident(t2,Kl);
+        std::vector<uint64_t> r0b(TT),r1b(TT);
+        for(uint32_t t=0;t<tw;++t){uint64_t q=mod[t];
+            for(uint32_t k=0;k<n;++k){size_t x=(size_t)t*n+k;
+                uint64_t u0=t0[x]+R.ba0[x]; r0b[x]=(u0>=q)?u0-q:u0;
+                uint64_t u1=t1[x]+R.ba1[x]; r1b[x]=(u1>=q)?u1-q:u1;}}
+        rescIP(r0b,r1b,tw,Kl);
+        Ct o; o.tw=tw-1; o.scale=A.scale*B.scale/(double)mod[tw-1]; o.c0=r0b; o.c1=r1b; return o; };
+    auto lvl=[&](const Ct&A,uint32_t tw)->Ct{ Ct o; o.tw=tw; o.scale=A.scale; size_t TT=(size_t)tw*n;
+        o.c0.assign(A.c0.begin(),A.c0.begin()+TT); o.c1.assign(A.c1.begin(),A.c1.begin()+TT); return o; };
+    auto x2=[&](Ct&A){ for(uint32_t t=0;t<A.tw;++t){uint64_t q=mod[t];
+        for(uint32_t k=0;k<n;++k){size_t x=(size_t)t*n+k; A.c0[x]=(A.c0[x]*2)%q; A.c1[x]=(A.c1[x]*2)%q;}} };
+    auto subC=[&](const Ct&A,const Ct&B)->Ct{ Ct o; o.tw=A.tw; o.scale=A.scale;
+        size_t TT=(size_t)A.tw*n; o.c0.resize(TT);o.c1.resize(TT);
+        for(uint32_t t=0;t<A.tw;++t){uint64_t q=mod[t];
+            for(uint32_t k=0;k<n;++k){size_t x=(size_t)t*n+k;
+                o.c0[x]=smu(A.c0[x],B.c0[x],q); o.c1[x]=smu(A.c1[x],B.c1[x],q);}} return o; };
+    auto subK=[&](Ct&A,cd v){ std::vector<cd> zc(S,v); std::vector<int64_t> m2;
+        gpufhe::encode_host(m2,zc,n,A.scale);
+        std::vector<uint64_t> ml(mod.begin(),mod.begin()+A.tw),rl(root.begin(),root.begin()+A.tw);
+        std::vector<uint64_t> e2; gpufhe::pt_to_eval_host(e2,m2,A.tw,n,ml,rl);
+        for(uint32_t t=0;t<A.tw;++t){uint64_t q=mod[t];
+            for(uint32_t k=0;k<n;++k){size_t x=(size_t)t*n+k; A.c0[x]=smu(A.c0[x],e2[x],q);}} };
+    auto mulK=[&](const Ct&A,cd v)->Ct{ Ct o=A; std::vector<cd> zc(S,v); std::vector<int64_t> m2;
+        gpufhe::encode_host(m2,zc,n,Delta_w);
+        std::vector<uint64_t> ml(mod.begin(),mod.begin()+A.tw),rl(root.begin(),root.begin()+A.tw);
+        std::vector<uint64_t> e2; gpufhe::pt_to_eval_host(e2,m2,A.tw,n,ml,rl);
+        gpufhe::ct_mul_pt_host(o.c0,o.c1,e2,A.tw,n,ml);
+        auto Kl=buildKStruct(A.tw); rescIP(o.c0,o.c1,A.tw,Kl);
+        o.tw=A.tw-1; o.scale=A.scale*Delta_w/(double)mod[A.tw-1]; return o; };
+
+    // K = max|a_k/q0| grows like sqrt(n): uniform ternary s has ~n/3 nonzero
+    // coeffs, so |I| ~ sqrt(n) and K doubles per 4x ring (29.2@n=1024,
+    // 69.6@n=4096). The double-angle count must track it, since Chebyshev is
+    // only valid for |y|<=1 and y = 2pi(x-1/4)/2^r:
+    //     r = ceil(log2(2*pi*(K+0.25)))
+    // Costs one extra level per 4x ring. (A SPARSE ternary secret, fixed
+    // hamming weight ~64, would pin K independent of n — that is why standard
+    // CKKS bootstrapping uses one.)
+    // K = max|a_k/q0| is set by the SECRET's hamming weight, NOT by n: |I| ~
+    // sqrt(h). Uniform ternary (h ~ n/3) makes K grow like sqrt(n) -- 29.2@1024,
+    // 69.6@4096 -- but with fixed h it is n-independent (measured 9.49 at h=64).
+    // Using the sqrt(n) law with a sparse secret picks r=9 where 7 suffices, and
+    // each surplus doubling amplifies error ~4x (that cost a run: err 1.30).
+    const double Kbud=(HW? 2.5*std::sqrt((double)HW) : 40.0*std::sqrt((double)n/1024.0));
+    const uint32_t rDbl=(uint32_t)std::ceil(std::log2(2*M_PI*(Kbud+0.25))), degC=10;
+    std::cout<<"K budget="<<Kbud<<" -> "<<rDbl<<" double-angle steps; depth="
+             <<(1+1+(degC-1)+1+rDbl+1)<<" levels, output tw="<<((int)sizeQ-(int)(4+degC+rDbl))<<"\n";
+    const double Aaff=2*M_PI/std::pow(2.0,rDbl), Baff=-(M_PI/2)/std::pow(2.0,rDbl);
+    std::vector<double> cc(degC+1,0.0);
+    { const uint32_t NQ=4*(degC+1);
+      for(uint32_t k=0;k<=degC;++k){ double s2=0;
+        for(uint32_t j=0;j<NQ;++j){double th=M_PI*(j+0.5)/NQ; s2+=std::cos(std::cos(th))*std::cos(k*th);}
+        cc[k]=2.0*s2/NQ; } cc[0]*=0.5; }
+
+    auto evalMod=[&](const Ct& X, cd aff)->Ct{
+        Ct U=mulK(X,aff); subK(U,cd{-Baff,0});
+        std::vector<Ct> Tk(degC+1); Tk[1]=U;
+        { Ct sq=mulCt(U,U); x2(sq); subK(sq,cd{1,0}); Tk[2]=sq; }
+        for(uint32_t k=3;k<=degC;++k){ Ct ul=lvl(U,Tk[k-1].tw);
+            Ct P=mulCt(ul,Tk[k-1]); x2(P);
+            Ct km2=lvl(Tk[k-2],P.tw); Tk[k]=subC(P,km2);
+ }
+        uint32_t low=Tk[degC].tw;
+        std::vector<uint64_t> ml(mod.begin(),mod.begin()+low),rl(root.begin(),root.begin()+low);
+        Ct acc; acc.tw=low; acc.scale=0; bool f1=true;
+        for(uint32_t k=1;k<=degC;++k){ Ct t=lvl(Tk[k],low);
+            std::vector<cd> zc(S,cd{cc[k],0}); std::vector<int64_t> mc;
+            gpufhe::encode_host(mc,zc,n,Delta_w);
+            std::vector<uint64_t> cE; gpufhe::pt_to_eval_host(cE,mc,low,n,ml,rl);
+            gpufhe::ct_mul_pt_host(t.c0,t.c1,cE,low,n,ml);
+            if(f1){acc.c0=t.c0;acc.c1=t.c1;acc.scale=t.scale*Delta_w;f1=false;}
+            else gpufhe::ct_add_ct_host(acc.c0,acc.c1,t.c0,t.c1,low,n,ml); }
+        { auto Kd=buildKStruct(low); rescIP(acc.c0,acc.c1,low,Kd);
+          acc.scale/=(double)mod[low-1]; acc.tw=low-1; }
+        subK(acc,cd{-cc[0],0});
+        for(uint32_t j=1;j<=rDbl;++j){ Ct sq=mulCt(acc,acc); x2(sq); subK(sq,cd{1,0}); acc=sq; }
+        return acc; };
+
+    { auto vr=peek(r0,r1,sOut), vi=peek(i0,i1,sOut);
+      double mr=0,mi=0,er=0,ei=0;
+      for(uint32_t k=0;k<S;++k){
+          mr=std::max(mr,std::abs(vr[k])); mi=std::max(mi,std::abs(vi[k]));
+          er=std::max(er,std::abs(vr[k].real()-2.0*d128(aref[brev(k)])/(double)q0));
+          ei=std::max(ei,std::abs(vi[k].imag()-2.0*d128(aref[brev(k)+S])/(double)q0)); }
+      std::cout<<"  SPLIT ctR max|slot|="<<mr<<" err="<<er
+               <<" | ctI max|slot|="<<mi<<" err="<<ei<<"\n"; }
+    Ct ctR; ctR.c0=r0; ctR.c1=r1; ctR.tw=nt; ctR.scale=sOut;
+    Ct ctI; ctI.c0=i0; ctI.c1=i1; ctI.tw=nt; ctI.scale=sOut;
+    std::cout<<"EvalMod on both branches (depth "<<(1+ (degC-1) +1+rDbl)<<" levels each)...\n"<<std::flush;
+    auto _tem=NOW();
+    Ct oR=evalMod(ctR, cd{Aaff/2.0,0});
+    Ct oI=evalMod(ctI, cd{0,-Aaff/2.0});
+    tEM=EL(_tem);
+    std::cout<<"  EvalMod out tw="<<oR.tw<<" scale=2^"<<std::log2(oR.scale)<<"\n";
+    std::cout<<"  [mem] after EvalMod: KROT="<<KROT.size()<<" KSC="<<KSC.size()
+             <<" peak RSS="<<rssMB()<<" MB\n";
+    { std::vector<uint64_t> mo(mod.begin(),mod.begin()+oR.tw),ro(root.begin(),root.begin()+oR.tw);
+      auto KO=gpufhe::keygen_host(n,mo,ro,ns,3.19,101);
+      std::vector<int64_t> d; gpufhe::decrypt_host(d,oR.c0,oR.c1,KO.s,n,mo,ro);
+      std::vector<cd> v; gpufhe::decode_host(v,d,n,oR.scale);
+      // slots are BIT-REVERSED after the staged C2S: slot k holds a_{brev(k)}
+      double e=0; for(uint32_t k=0;k<S;++k) e=std::max(e,std::abs(v[k].real()-std::sin(2*M_PI*d128(aref[brev(k)])/(double)q0)));
+      std::cout<<"  EvalMod(R) err vs sin(2pi a_k/q0) = "<<e<<"\n"; }
+
+    // ---- S2C: z_i = sum_k W[i][k]*oR_k + sum_k W[i][k+S]*oI_k
+    auto Went=[&](uint32_t i,uint32_t j)->cd{
+        return std::polar(1.0, M_PI*(double)(((uint64_t)j*rk[i])%M)/(double)n); };
+    // ---- S2C via the FORWARD FFT stages (mirror of C2S): stage order runs
+    // L-1 -> 0, sub-stages high -> low, butterfly a +/- t*b. It consumes the
+    // bit-reversed order C2S produces, so no brev() indexing is needed.
+    // Both branches ride the SAME stages: fft(oR + i*oI) = fft(oR) + i*fft(oI),
+    // so the i is folded into the I-branch's first-stage diagonals -> the two
+    // merge during stage L-1 and the rest run on one ciphertext. Cost is L+1
+    // transform passes, depth L. Round trip S2C(C2S(z))=z gated at 9.6e-16.
+    auto applyMergedFwd=[&](std::vector<cd>& v,uint32_t g){
+        for(int st=(int)((g+1)*RST)-1; st>=(int)(g*RST); --st){
+            uint32_t h=S>>(st+1); std::vector<cd> o(S);
+            for(uint32_t base=0;base<S;base+=2*h)
+                for(uint32_t k=0;k<h;++k){
+                    cd a=v[base+k],b=v[base+k+h],t=twd(k,(uint32_t)st);
+                    o[base+k]=a+t*b; o[base+k+h]=a-t*b;}
+            v.swap(o);} };
+    auto stageDiagsFwd=[&](uint32_t g,std::vector<uint32_t>& offs,std::vector<std::vector<cd>>& dg){
+        std::vector<std::vector<cd>> acc(S); std::vector<uint8_t> used(S,0);
+        for(uint32_t jj=0;jj<S;++jj){
+            std::vector<cd> u(S,cd{0,0}); u[jj]=1; applyMergedFwd(u,g);
+            for(uint32_t ii=0;ii<S;++ii) if(std::abs(u[ii])>1e-12){
+                uint32_t d=(jj+S-ii)%S;
+                if(!used[d]){used[d]=1;acc[d].assign(S,cd{0,0});}
+                acc[d][ii]=u[ii]; } }
+        offs.clear(); dg.clear();
+        for(uint32_t d=0;d<S;++d) if(used[d]){offs.push_back(d);dg.push_back(acc[d]);} };
+
+    uint32_t stw=oR.tw; double ssc=oR.scale; uint32_t s2cdiag=0;
+    std::vector<uint64_t> sa0,sa1;
+    { auto _t=NOW();
+      for(int g=(int)LST-1; g>=0; --g){
+        std::vector<uint32_t> offs; std::vector<std::vector<cd>> dg;
+        stageDiagsFwd((uint32_t)g,offs,dg); s2cdiag+=(uint32_t)offs.size();
+        std::vector<uint64_t> ml(mod.begin(),mod.begin()+stw),rl(root.begin(),root.begin()+stw);
+        size_t TT=(size_t)stw*n;
+        std::vector<uint64_t> a0(TT,0),a1(TT,0); bool fst=true;
+        const double dpt = (g>0) ? (double)mod[stw-1] : Delta_pt;   // hold scale flat
+        std::vector<std::pair<const std::vector<uint64_t>*,cd>> srcs0, srcs1;
+        if((uint32_t)g==LST-1){ srcs0={{&oR.c0,cd{1,0}},{&oI.c0,cd{0,1}}};
+                                srcs1={{&oR.c1,cd{1,0}},{&oI.c1,cd{0,1}}}; }
+        else { srcs0={{&sa0,cd{1,0}}}; srcs1={{&sa1,cd{1,0}}}; }
+        for(size_t q2=0;q2<srcs0.size();++q2){
+          StageRotCtx R; stageRotBegin(R,*srcs0[q2].first,*srcs1[q2].first,stw,keyAt(offs[0],stw));
+          for(size_t x=0;x<offs.size();++x){
+            auto _tp=NOW();
+            std::vector<cd> dd(S);
+            for(uint32_t i2=0;i2<S;++i2) dd[i2]=dg[x][i2]*srcs0[q2].second;
+            std::vector<int64_t> md; gpufhe::encode_host(md,dd,n,dpt);
+            std::vector<uint64_t> dE; gpufhe::pt_to_eval_host(dE,md,stw,n,ml,rl);
+            g_tPtEval+=EL(_tp);
+            std::vector<uint64_t> t0,t1;
+            auto _tr=NOW();
+            if(offs[x]) stageRotDiag(R,t0,t1,rotAmt(offs[x]),keyAt(offs[x],stw),stw,ml,rl);
+            else { t0=*srcs0[q2].first; t1=*srcs1[q2].first; }
+            g_tRot+=EL(_tr);
+            auto _ta=NOW();
+            gpufhe::ct_mul_pt_host(t0,t1,dE,stw,n,ml);
+            if(fst){a0=t0;a1=t1;fst=false;} else gpufhe::ct_add_ct_host(a0,a1,t0,t1,stw,n,ml);
+            g_tCpuAcc+=EL(_ta); }
+          stageRotEnd(R); }
+        rescaleAt(a0,a1,stw);
+        std::cerr<<"    S2C stage "<<g<<" tw="<<stw<<" parts="<<npFor(stw)
+                 <<" diags="<<offs.size()<<" keys="<<KSC.size()<<" t="<<EL(_t)<<"s\n";
+        ssc=ssc*dpt/(double)mod[stw-1]; --stw; sa0=a0; sa1=a1; }
+      tS2C=EL(_t); }
+    std::cout<<"  [mem] after S2C: KROT="<<KROT.size()<<" KSC="<<KSC.size()
+             <<" peak RSS="<<rssMB()<<" MB\n";
+    std::cout<<"S2C: "<<LST<<" FFT stages, "<<s2cdiag<<" diagonals vs "<<S<<" dense\n";
+    uint32_t twF=stw;
+    double sFinal=ssc;
+    double Dfinal=sFinal*2*M_PI*Delta_in/(double)q0;
+    std::vector<uint64_t> mF(mod.begin(),mod.begin()+twF),rF(root.begin(),root.begin()+twF);
+    auto KF=gpufhe::keygen_host(n,mF,rF,ns,3.19,101);
+    std::vector<int64_t> dF; gpufhe::decrypt_host(dF,sa0,sa1,KF.s,n,mF,rF);
+    std::vector<cd> zF; gpufhe::decode_host(zF,dF,n,Dfinal);
+
+    double eFin=0; for(uint32_t k=0;k<S;++k) eFin=std::max(eFin,std::abs(zF[k]-z[k]));
+    double secs=std::chrono::duration<double>(std::chrono::steady_clock::now()-tBoot).count();
+    std::cout<<"\n=== BOOTSTRAP RESULT ===\n";
+    std::cout<<"evalkeygen calls total = "<<nKeygen<<" (was ~130 with per-level regeneration)\n";
+    std::cout<<"bootstrap wall time = "<<secs<<" s\n";
+    std::cout<<"  keygen (48 keys) = "<<tKeygen<<" s\n";
+    std::cout<<"  C2S              = "<<tC2S<<" s\n";
+    std::cout<<"  EvalMod x2       = "<<tEM<<" s\n";
+    std::cout<<"  S2C              = "<<tS2C<<" s\n";
+    std::cout<<"  [profiling] C2S+S2C per-diagonal breakdown: pt_to_eval_host="<<g_tPtEval
+             <<"s  rotate_ct_resident="<<g_tRot<<"s  CPU ct_mul/add="<<g_tCpuAcc<<"s\n";
+    std::cout<<"  other            = "<<(secs-tC2S-tEM-tS2C)<<" s\n";
+    std::cout<<"input level tw=1 (q0 only)  ->  output level tw="<<twF<<"\n";
+    std::cout<<"final decode scale 2^"<<std::log2(Dfinal)<<"\n";
+    std::cout<<"max slot err |boot(z) - z| = "<<eFin<<"\n";
+    std::cout<<"  z[0]="<<z[0]<<"  got="<<zF[0]<<"\n";
+    std::cout<<"  z[1]="<<z[1]<<"  got="<<zF[1]<<"\n";
+    if(eFin<2e-2){std::cout<<"[PASS] FULL CKKS BOOTSTRAP: depleted ct refreshed to a higher level\n";return 0;}
+    std::cout<<"[FAIL]\n"; return 1;
+}

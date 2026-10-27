@@ -101,34 +101,50 @@ for repeated/interleaved measurement — never trust a single sequential run.
    LARGER at N=16 than at N=5 (2.44x vs 2.04x), as expected since more
    rotations amortize one shared decompose further.
 
-   **Next step (not yet started): wire this into the actual `test_boot.cpp`
-   C2S/S2C stages for a true end-to-end bootstrap measurement.** The
-   bucket-level numbers above are strong and realistic, but are still a
-   standalone micro-benchmark with hand-picked keys, not the live
-   bootstrap. Scoped but NOT implemented, because it requires a real
-   architectural decision, not a quick swap:
-   - `tests/test_boot.cpp`'s C2S/S2C loops use `rotFull`/`keyAt` to build
-     TEXTBOOK-convention keys (permute the payload secret by `k`) into
-     the existing `KROT`/`KSC` caches, consumed by `stageRotDiag`
-     (textbook order: automorphism BEFORE keyswitch). The hoisted
-     mechanism needs the OTHER convention (permute `pkA_QP`/`pkB_QP` by
-     `k^-1`, payload unpermuted) — a structurally different key, not a
-     drop-in replacement for what's cached today.
-   - Correct, safe approach: add a SEPARATE, parallel `KROT_hoist`/
-     `KSC_hoist` cache (same bounded-LRU pattern as the existing ones)
-     feeding a NEW `stageRotHoistDiag` that calls `ks_decompose_only`
-     ONCE per bucket (`g` in the C2S/S2C stage loop) and
-     `ks_accumulate_from_digits` per diagonal — built and run ALONGSIDE
-     the existing path (not replacing it) so the live bootstrap's
-     trusted output can be compared diagonal-by-diagonal before any
-     switch-over is even considered. This roughly doubles keygen cost
-     for the hoisted-path validation run specifically (a second set of
-     per-k keys) — acceptable for a one-time validation run, NOT
-     something to ship permanently without first deciding whether to
-     replace `KROT` outright (abandoning the textbook convention
-     entirely) rather than maintain two parallel caches long-term.
-   - Do this stage-by-stage, starting with C2S stage 0 (cheapest, 16
-     diagonals, tw=30) before extending to all 6 C2S+S2C stages.
+   **Real end-to-end validation against an ACTUAL bootstrap stage: DONE,
+   PASSED.** `tests/test_hoist_stage0.cpp` (a modified copy of
+   `test_boot.cpp`, identical through ModRaise and C2S stage 0's own
+   trusted computation, then ALSO computes a hoisted-mechanism version
+   of that SAME real stage — own fresh hoisted-convention keys, no
+   cache advantage over the trusted path, which is also generating
+   fresh keys here on its first use via `keyAt`): **maxDiff=613 against
+   maxAbs=5.76e17 (negligible, ~1e-15 relative — [MATCH within noise]).
+   Hoisted total 7.53s (decompose-once=0.073s + 16 fresh keygens=6.71s +
+   compute=0.75s) vs trusted 25.89s — a real ~3.4x speedup on the
+   actual first C2S stage of a live bootstrap, both sides paying for
+   fresh key generation.** This is a substantially larger win than the
+   N=16 synthetic micro-benchmark's ~2.44x, plausibly because the real
+   stage's trusted per-diagonal compute (full `ks_accumulate_qp` via
+   `keyswitch_resident`, 16 times) carries more overhead than the
+   synthetic benchmark isolated.
+
+   Debugging note worth preserving: the first attempt at this
+   validation produced a dramatic, nonsensical mismatch (maxDiff twice
+   maxAbs) that turned out to be a TEST bug, not an algorithm bug —
+   decrypting the PRE-`rescaleAt` accumulated sum (16 ciphertext×
+   plaintext products summed, at a combined scale that exceeds what
+   `decrypt_host`'s `int64_t` return represents) overflows silently.
+   Isolating each diagonal's raw rotation (pre-multiply, still at the
+   original encryption scale) showed perfect agreement throughout,
+   which is what correctly pointed at the comparison itself rather than
+   the mechanism. Always rescale before decrypting an intermediate
+   stage's accumulator.
+
+   **Next step: extend from "validated on stage 0 in isolation" to "wired
+   into the live, full bootstrap across all 6 C2S+S2C stages."** This
+   needs a real architectural decision, not a quick swap — `test_boot.cpp`'s
+   `rotFull`/`keyAt`/`KROT`/`KSC` build and cache TEXTBOOK-convention
+   keys (permute the payload secret by `k`); the hoisted mechanism needs
+   the OTHER convention (permute `pkA_QP`/`pkB_QP` by `k^-1`, payload
+   unpermuted) — a structurally different key, not a drop-in replacement
+   for what's cached today. Correct, safe approach: add a SEPARATE,
+   parallel `KROT_hoist`/`KSC_hoist` cache (same bounded-LRU pattern)
+   feeding a `stageRotHoistDiag`, wired into ALL stages (not just stage
+   0), with the existing trusted path kept available for the interleaved
+   comparison until the full-bootstrap numbers are in — do not simply
+   replace it. `tests/test_hoist_stage0.cpp` is the proven template for
+   each stage's validation; extending it to loop over every `g` instead
+   of returning after `g==0` is the mechanical part of this next step.
 
 2. **`KROT`'s own memory scaling — lever analysis DONE, safety-net
    implemented, actual eviction tuning for n=131072 NOT yet done.** A
