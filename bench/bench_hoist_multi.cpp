@@ -85,7 +85,12 @@ int main(){
     std::vector<uint64_t> c0,c1;
     gpufhe::encrypt_host(c0,c1,mz,KPq.pkA,KPq.pkB,n,mod,root,ns,3.19,303);
 
-    const std::vector<uint32_t> ks = {5u,7u,11u,13u,99u};   // N=5
+    // N=16: matches the REAL C2S stage 0 bucket size measured in
+    // tests/test_boot.cpp at n=8192 ("C2S stage 0 tw=30 parts=15 diags=16"),
+    // not an arbitrary round number -- this is what an actual hoisting
+    // opportunity in this bootstrap would look like.
+    const std::vector<uint32_t> ks = {5u,7u,11u,13u,17u,19u,23u,29u,31u,37u,
+                                       41u,43u,47u,53u,59u,61u};
     std::vector<gpufhe::KeySwitchConstants> K(ks.size());
     for(size_t ki=0; ki<ks.size(); ++ki){
         uint32_t k=ks[ki]; uint64_t kinv=modinv(k,2*n);

@@ -121,17 +121,21 @@ rather than abandoned or faked.
    rotation indices in a bootstrap stage) is a separate mechanism, not
    yet built — see `NEXT_SESSION.md` priority queue item 1.
 
-8. **Multi-rotation decompose-sharing: DONE, real measured ~2.04x
-   speedup.** New, separate files `include/keyswitch_hoist.h` +
-   `src/keyswitch_hoist.cpp` (`keyswitch_resident.cpp` untouched).
-   `tests/test_hoist_multi.cpp`: bit-exact vs. the existing fused
-   `ks_accumulate_qp` (0/524288 mismatches), correct across 6 shared
-   rotation indices. `bench/bench_hoist_multi.cpp`: N=5 rotations,
-   interleaved A/B (30 reps), baseline median 94.49ms vs. hoisted median
-   46.32ms, bootstrap 95% CI on the paired difference [47.86,48.60]ms —
-   **entirely excludes zero, a real win, not noise.** Not yet wired into
-   the actual bootstrap's C2S/S2C stages — next step, see
-   `NEXT_SESSION.md` priority queue item 1.
+8. **Multi-rotation decompose-sharing: DONE, real measured win, LARGER
+   at realistic bucket sizes.** New, separate files `include/
+   keyswitch_hoist.h` + `src/keyswitch_hoist.cpp` (`keyswitch_resident.cpp`
+   untouched). `tests/test_hoist_multi.cpp`: bit-exact vs. the existing
+   fused `ks_accumulate_qp` (0/524288 mismatches), correct across 6
+   shared rotation indices. `bench/bench_hoist_multi.cpp`, interleaved
+   A/B (30 reps): **N=5** — baseline median 94.49ms vs hoisted 46.32ms,
+   ~2.04x, paired-diff 95% CI [47.86,48.60]ms. **N=16** (matching the
+   REAL C2S stage 0 bucket size, "diags=16") — baseline median 374.76ms
+   vs hoisted 153.62ms, **~2.44x**, paired-diff 95% CI [220.0,297.0]ms —
+   both entirely exclude zero, relative win GROWS with N as expected.
+   Not yet wired into the actual bootstrap's C2S/S2C stages — needs a
+   parallel hoisted-key cache (structurally different key convention
+   than today's `KROT`), scoped in `NEXT_SESSION.md` priority queue
+   item 1, not yet built.
 
 9. **`KROT` memory-scaling: lever analysis DONE, bounded-cache safety
    net implemented.** Zero-copy ruled out with direct code evidence

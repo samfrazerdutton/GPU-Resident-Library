@@ -88,19 +88,47 @@ for repeated/interleaved measurement — never trust a single sequential run.
    [47.86, 48.60]ms, entirely excluding zero.** This is a real, clean win
    at the micro-benchmark level, not noise.
 
-   **Next step (not yet started): wire this into an actual bootstrap
-   stage and measure END-TO-END bootstrap time.** The micro-benchmark
-   above proves the mechanism works and is fast in isolation, but the
-   directive's bar for claiming a real win is full-bootstrap, interleaved
-   A/B, thermal-controlled measurement — not yet done. The natural target
-   is `tests/test_boot.cpp`'s C2S/S2C BSGS-structured rotation loops
-   (`rotFull`/`keyAt`/the per-diagonal `rotate_ct_resident` calls) —
-   within one baby-step bucket, several diagonals rotate the SAME base
-   ciphertext by different giant-step-scaled indices, exactly the
-   decompose-sharing opportunity this mechanism targets. Build this as a
-   SEPARATE code path in `test_boot.cpp` (or a new test_boot variant) so
-   the existing, trusted per-diagonal `rotate_ct_resident` path stays
-   available for the interleaved comparison; do not simply replace it.
+   **Re-measured at a REALISTIC bucket size (N=16, matching C2S stage
+   0's actual measured diagonal count "diags=16" exactly, not an
+   arbitrary N=5): baseline median 374.76ms vs hoisted median 153.62ms —
+   ~2.44x, bootstrap 95% CI on the paired difference [220.0, 297.0]ms,
+   entirely excludes zero.** (Raw per-rep times drifted upward 320ms→
+   492ms across the run from GPU thermal throttling — expected and
+   harmless here specifically because baseline/hoisted are measured
+   back-to-back within each rep, so the ratio stays valid even as
+   absolute numbers drift; this is exactly why the paired difference,
+   not either raw mean, is the number to trust.) The relative win is
+   LARGER at N=16 than at N=5 (2.44x vs 2.04x), as expected since more
+   rotations amortize one shared decompose further.
+
+   **Next step (not yet started): wire this into the actual `test_boot.cpp`
+   C2S/S2C stages for a true end-to-end bootstrap measurement.** The
+   bucket-level numbers above are strong and realistic, but are still a
+   standalone micro-benchmark with hand-picked keys, not the live
+   bootstrap. Scoped but NOT implemented, because it requires a real
+   architectural decision, not a quick swap:
+   - `tests/test_boot.cpp`'s C2S/S2C loops use `rotFull`/`keyAt` to build
+     TEXTBOOK-convention keys (permute the payload secret by `k`) into
+     the existing `KROT`/`KSC` caches, consumed by `stageRotDiag`
+     (textbook order: automorphism BEFORE keyswitch). The hoisted
+     mechanism needs the OTHER convention (permute `pkA_QP`/`pkB_QP` by
+     `k^-1`, payload unpermuted) — a structurally different key, not a
+     drop-in replacement for what's cached today.
+   - Correct, safe approach: add a SEPARATE, parallel `KROT_hoist`/
+     `KSC_hoist` cache (same bounded-LRU pattern as the existing ones)
+     feeding a NEW `stageRotHoistDiag` that calls `ks_decompose_only`
+     ONCE per bucket (`g` in the C2S/S2C stage loop) and
+     `ks_accumulate_from_digits` per diagonal — built and run ALONGSIDE
+     the existing path (not replacing it) so the live bootstrap's
+     trusted output can be compared diagonal-by-diagonal before any
+     switch-over is even considered. This roughly doubles keygen cost
+     for the hoisted-path validation run specifically (a second set of
+     per-k keys) — acceptable for a one-time validation run, NOT
+     something to ship permanently without first deciding whether to
+     replace `KROT` outright (abandoning the textbook convention
+     entirely) rather than maintain two parallel caches long-term.
+   - Do this stage-by-stage, starting with C2S stage 0 (cheapest, 16
+     diagonals, tw=30) before extending to all 6 C2S+S2C stages.
 
 2. **`KROT`'s own memory scaling — lever analysis DONE, safety-net
    implemented, actual eviction tuning for n=131072 NOT yet done.** A
