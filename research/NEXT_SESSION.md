@@ -143,12 +143,40 @@ for repeated/interleaved measurement — never trust a single sequential run.
    across multiple stages' worth of keys, PLUS the hoisted path's fresh,
    uncached per-diagonal key generation (by design, for a fair
    no-cache-advantage comparison) adds real additional pressure on top.
-   Not chased further — the single-stage result (now reproduced twice)
-   is strong enough evidence for this round; a multi-stage or full-C2S
-   validation run should get a dedicated memory budget (e.g. an
-   explicit bounded cache for the hoisted path's own temporary keys, or
-   running stages one-at-a-time in separate processes) rather than
-   accumulating unbounded across stages in one process.
+   Not chased further via that design — the single-stage result (now
+   reproduced twice) is strong enough evidence for this round.
+
+   **Follow-up attempt: `tests/test_hoist_allstages.cpp`** (new file,
+   sequential-pass design: run the trusted path's existing, UNMODIFIED
+   C2S loop to completion first, THEN reset to the same ModRaise output
+   and run a SEPARATE hoisted-only pass over all 3 stages — never
+   holding both paths' keys simultaneously, avoiding the memory
+   coexistence problem above). Pass 1 (trusted) completed cleanly every
+   time (matches known timings). Pass 2 (hoisted) surfaced TWO distinct
+   bugs, in sequence:
+   1. The per-stage hoisted key construction (`Kh`) and the decompose
+      shape reference (`Cshape`) both passed the FULL, un-sliced `mod`
+      array (30 entries) to `compute_keyswitch_constants` even after
+      `hctw` shrank to 29, 28 via rescale — a genuine bug (not just a
+      stage-0 coincidence masking it): the trusted path's own
+      `atLevel()` always slices `mod` to the current tower count first,
+      which this code failed to do. Threw `std::runtime_error("no root
+      table for modulus")` entering stage 1. **Fixed** by slicing to
+      `hml` (already computed per-stage) before calling
+      `compute_keyswitch_constants`, matching `atLevel`'s pattern.
+   2. After that fix, pass 2 instead SEGFAULTS (not a clean exception)
+      partway through, cause not yet identified — plausibly a shape
+      mismatch between `Dh` (sized by `Cshape`'s `numPart`/`sizeQlP`)
+      and a per-diagonal `Ck`/`Wk` at some later stage/diagonal, but
+      not confirmed. **Not pursued further this round** — two bugs
+      deep into a secondary validation path, with each build+run cycle
+      costing significant time in this session's WSL environment, is
+      past the point of good ROI when the primary, single-stage result
+      is already solid and twice-reproduced. `tests/
+      test_hoist_allstages.cpp` is committed AS-IS, NOT WORKING (crashes
+      on multi-stage), as a starting point and a documented pitfall
+      list (both bugs above) for whoever picks this up next — do not
+      assume it works; re-verify after any further fix.
 
    **Next step: extend from "validated on stage 0 (reproduced twice) in
    isolation" to "wired into the live, full bootstrap across all 6
