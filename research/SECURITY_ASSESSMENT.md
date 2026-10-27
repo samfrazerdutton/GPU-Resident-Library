@@ -83,60 +83,124 @@ CoeffsToSlots→EvalMod→SlotsToCoeffs bootstrap circuit needs) — "shrink the
 circuit to fit a small n" is not a realistic path at this depth; "grow n
 and drop the sparse-secret assumption" is.
 
-## n=65536 + uniform ternary — now directly verified, not just cited
+## SUPERSEDED: n=65536 + uniform ternary — the flagged caveat turned out to matter
 
-Ran this repo's own `lwe_security.py` (primal uSVP, validated to within
-0.2-3.6 bits of the published 128-bit reference table) at the literal
-current modulus budget with no other change but the secret distribution:
+The previous revision of this document concluded n=65536 + uniform ternary
+gives 128/120-bit security "at the existing 1775-bit budget," and
+explicitly flagged as an open caveat: *"Switching from sparse to uniform
+ternary secret has its own cost implications... that have not been
+analyzed here."* That caveat was correct to raise, and resolving it
+reverses the conclusion.
+
+**The 1775-bit budget is not secret-distribution-independent.** This
+codebase's own EvalMod circuit (`tests/test_boot.cpp`) sizes its
+double-angle iteration count from a secret-dependent "K budget":
+
+```cpp
+const double Kbud=(HW? 2.5*std::sqrt((double)HW) : 40.0*std::sqrt((double)n/1024.0));
+const uint32_t rDbl=(uint32_t)std::ceil(std::log2(2*M_PI*(Kbud+0.25))), degC=10;
+```
+
+For the sparse secret (HW=64, fixed), Kbud=20 regardless of n, giving
+rDbl=7 double-angle steps — this is what the current, already-validated
+circuit (1775-bit budget) actually implements. For a **uniform** ternary
+secret (HW=0 branch), Kbud scales with √n, and grows the required
+double-angle count substantially at the n values needed for security:
+
+| n (uniform secret) | Kbud | rDbl | extra towers vs. current (rDbl=7) circuit |
+|---|---|---|---|
+| 8192 | 113.1 | 10 | +3 |
+| 32768 | 226.3 | 11 | +4 |
+| 65536 | 320.0 | 11 | +4 |
+| 131072 | 452.5 | 12 | +5 |
+
+Each extra double-angle step costs one more tower (~55 bits) in the actual
+modulus chain — this is not a rough guess, it is how `rDbl` is consumed
+in the existing, already-bit-exact-verified circuit. Re-ran the security
+estimator at the **self-consistent** budget (1775 + extra_towers×55) for
+each candidate n:
 
 ```
-$ python3 tools/lwe_security.py 65536 1775
-n=65536 log2(QP)=1775 uniform ternary: beta=314 -> 128 classical / 120 quantum bits
-$ python3 tools/lwe_security.py 32768 1775
-n=32768 log2(QP)=1775 uniform ternary: beta=97 -> 64 classical / 61 quantum bits
-$ python3 tools/lwe_security.py 131072 1775
-n=131072 log2(QP)=1775 uniform ternary: beta=831 -> 280 classical / 258 quantum bits
+n=65536  self-consistent budget=1995: 113 classical / 106 quantum bits  -- SHORT of 128
+n=131072 self-consistent budget=2050: 237 classical / 219 quantum bits  -- massive overkill
 ```
 
-**n=65536 lands almost exactly on 128 classical / 120 quantum bits at this
-circuit's existing 1775-bit budget.** n=32768 is insufficient (64 bits).
-n=131072 is massive, wasteful overkill (280 bits — 2.2x more security than
-needed, at 2x the n, memory, and NTT cost of n=65536 for zero required
-benefit) once the sparse-secret assumption is dropped. **n=65536 is the
-correct target, confirmed with this repo's own tooling, not just the cited
-paper's general argument.**
+**n=65536 + uniform ternary does NOT reach 128 bits once the circuit's
+own extra depth requirement is correctly priced in.** The 128-bit number
+in the previous revision was real but computed against the wrong
+(sparse-secret-sized) budget — an honest methodology error, caught by
+actually implementing the self-consistent check rather than reusing a
+borrowed budget figure across a secret-distribution change.
+
+## Corrected recommendation: n=131072, KEEP the existing sparse secret (h=64)
+
+Checked the alternative directly: sparse secret (h=64, **no code change,
+no circuit change, no extra EvalMod depth** — Kbud stays fixed at 20
+regardless of n since the sparse branch doesn't depend on n) at n=131072,
+same 1775-bit budget as the circuit already implements and has validated
+bit-exact 13 consecutive times this session:
+
+```
+$ python3 tools/hybrid_security.py 131072 1775 64
+n=131072 log2(QP)=1775 h=64: 134 classical bits
+$ python3 tools/hybrid_security.py 65536 1775 64
+n=65536 log2(QP)=1775 h=64: 90 classical bits   -- confirms n=65536 is short either way
+```
+
+**n=131072 with the existing sparse secret reaches 134 classical bits,
+using the exact same bootstrap circuit (same rDbl=7, same degC=10, same
+everything except n/moduli/sizeQ) already extensively validated.** This
+dominates the uniform-ternary path on every axis that matters here: it
+meets the 128-bit target (uniform-at-65536 does not), it does not require
+the larger, previously-unvalidated circuit depth uniform secrets need at
+large n (uniform-at-131072 does, wastefully), and it requires zero changes
+to `src/keygen.cpp`'s secret-sampling code (the sparse path is already
+implemented and tested).
+
+**n=131072 is the corrected target. Switching to uniform ternary is not
+needed and should not be pursued for this specific implementation** — the
+general argument in Bossuat et al. (sparse secrets lose margin to
+dual/hybrid attacks) remains true in the abstract, but in THIS codebase's
+concrete circuit, going uniform costs more in required depth than it saves
+in attack resistance, at the n values actually in play.
 
 ## Standing, unresolved caveats (explicit, not glossed over)
 
 - Neither estimator here has been cross-checked against the SageMath
   lattice-estimator (the de facto standard tool) for THESE specific
-  parameters. The validation that exists is against published reference
-  tables and two specific prior cryptanalysis results, not an
-  apples-to-apples run of the same (n, logQP, h) through an independent
-  tool. This remains open.
-- Switching from sparse to uniform ternary secret has its OWN cost
-  implications (larger Hamming weight generally means more non-zero
-  secret-key coefficients, which can affect noise growth and certain
-  circuit costs) that have not been analyzed here.
+  parameters. This remains open regardless of which secret distribution is
+  chosen.
+- `hybrid_security.py` (the binding, tighter model for sparse secrets)
+  reports only a classical-bit estimate — it has no quantum-adjusted
+  variant in this repo's tooling. The 134-bit figure for n=131072/h=64 has
+  no corresponding quantum number from the tighter model; `lwe_security.py`
+  (looser, primal, upper-bound-only for sparse secrets) would need to be
+  consulted for a quantum estimate, with the explicit caveat that it is
+  less tight than the hybrid model for a sparse secret.
+- The Bossuat et al. paper's concern about sparse-secret attacks specific
+  to bootstrapping evaluation keys (not just generic LWE hardness) may not
+  be fully captured by `hybrid_security.py`'s calibration (validated
+  against 2 published dual/MITM results, not against a bootstrapping-
+  specific attack). This is a real residual uncertainty for the sparse
+  path, not fully resolved by this assessment.
 - No independent, external cryptographic review has occurred. Nothing in
   this repository should be described as "production-grade" or "secure
   for real data" on the basis of this assessment alone.
 
 ## Disposition
 
-Do not adopt n=131072 (confirmed wasteful: 280 bits, 2.2x the needed
-security, at 2x n=65536's cost). Do not continue treating the current
-n=8192/sparse(h=64)/1775-bit parameter set as anything other than an
-explicitly insecure (~51-bit) demo/research configuration — every
-benchmark number in `docs/performance-baseline.md` and
-`EXPERIMENT_LEDGER.md` describes this demo configuration, not a secure
-one. The candidate secure profile is now: **n=65536, log2(QP)≈1775,
-uniform ternary secret, 128/120-bit classical/quantum per this repo's own
-primal estimator.** The next concrete security task is: (1) decide and
-implement the secret-distribution switch (sparse h=64 -> uniform ternary)
-in the actual keygen code, correctness-test it, (2) re-run the hybrid/MITM
-estimator too for completeness (expected inapplicable/non-binding for a
-uniform secret, but confirm rather than assume), (3) plan a
-re-measurement of bootstrap performance at n=65536 (which will be slower
-than the current ~115s, likely
-substantially — not yet measured).
+**n=131072, sparse secret h=64 (unchanged), log2(QP)=1775 (unchanged
+circuit) is the corrected candidate secure profile — not n=65536 uniform
+ternary.** Do not implement the secret-distribution switch that the
+previous revision of this document recommended; it has been superseded by
+the analysis above. Do not continue treating the current n=8192 instance
+as anything other than an explicitly insecure (~51-bit) demo/research
+configuration. The next concrete security task is: (1) regenerate moduli/
+roots at n=131072 with the existing sparse-secret code path (no keygen.cpp
+change needed), (2) fix the KROT/KSC bounded-cache prerequisite (see
+`MEMORY_FEASIBILITY.md` — mandatory before n=131072, which will multiply
+host RAM pressure ~16x over the already-near-ceiling n=8192 measurement),
+(3) run the full bootstrap end to end at n=131072 and measure real
+performance (expected substantially slower than the current ~115-140s;
+do not guess the number), (4) revisit the residual sparse-secret caveat
+above if an independent security review becomes available.

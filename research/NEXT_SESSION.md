@@ -2,115 +2,105 @@
 
 ## Current commit
 
-`865b59a` on `main`, pushed to origin. (Research round after this commit —
-`research/*.md` additions plus a kept RSS-instrumentation line in
-`tests/test_boot.cpp` — is in a NEW commit on top; check `git log -3`
-when you resume to confirm whether it landed before this session ended.)
+Check `git log -3` on resume. As of this writing: `93f2231` on `main`,
+pushed to origin (confirm push status — push again if `git status` shows
+ahead of origin).
 
 ## Read first
 
-`research/MASTER_STATE.md` (current state), then
-`research/EXPERIMENT_LEDGER.md` (what's been tried, what worked, what
-didn't). Both are more current than `docs/performance-baseline.md`, which
-predates this `research/` directory and is kept as historical detail only.
+`research/MASTER_STATE.md` (current state, written AFTER this round's
+real work — supersedes anything said earlier in the same file's history
+or in `docs/performance-baseline.md`). Then `research/EXPERIMENT_LEDGER.md`
+for the full experiment history including this round's additions.
 
-## FIRST thing to do, before any new experiment: diagnose/reset the GPU environment
+## Before trusting any new benchmark number
 
-This session's own measurements drifted substantially over many hours:
-the proven, UNCHANGED `rotate_ct_resident` code measured 62-66s early in
-the session and 71-76s late in the session, on the SAME commit, with no
-code change in between. This made the last experiment of the session
-(stage-scoped resident rotation, see ledger) impossible to validate.
-
-Before trusting ANY new benchmark number:
+GPU thermal state matters on this machine (Max-Q mobile part). Check:
 ```bash
-wsl -d Ubuntu -- bash -lc 'export PATH=/usr/bin:/bin:/usr/sbin:/sbin; /usr/lib/wsl/lib/nvidia-smi --query-gpu=name,clocks.sm,clocks.max.sm,temperature.gpu,power.draw --format=csv'
+wsl -d Ubuntu -- bash -lc 'export PATH=/usr/bin:/bin:/usr/sbin:/sbin; /usr/lib/wsl/lib/nvidia-smi --query-gpu=temperature.gpu,clocks.current.sm,power.draw --format=csv'
 ```
-Run this, let the GPU idle/cool for a few minutes if temperature is high,
-and run `test_boot` TWICE in a row to confirm two consecutive runs agree
-within a few seconds before trusting a third (experimental) run against
-them. If starting a brand new session/reboot, the GPU should be at a cold
-baseline — measure that baseline FIRST, before resuming any experiment.
+Use `research/benchmarks/run_trials.sh <label> <N>` for repeated-trial
+measurement, or `research/benchmarks/interleaved_ab.sh <rounds>` (requires
+two binaries, `test_boot` + a second one built from a modified copy, e.g.
+`test_boot_exp`) for a true A/B. Both log full GPU state per trial to
+`research/benchmarks/*.jsonl`. **Do not trust a single sequential run** —
+this session's own baseline drifted from 62-66s to 71-82s for the same
+unchanged code purely from thermal buildup.
 
-## Priority queue (highest value first)
+## Priority queue (highest value first, reflects this round's real results)
 
-1. **Re-validate experiment #1** (stage-scoped resident rotation — hoist
-   stream/DeviceKSWork/base-ciphertext residency out of the C2S/S2C
-   per-diagonal loop). The code is NOT currently in the tree (reverted for
-   inconclusive measurement, not disproven). To reapply: see
-   `EXPERIMENT_LEDGER.md`'s entry for the exact design (StageRotCtx struct
-   + stageRotBegin/stageRotDiag/stageRotEnd lambdas placed right before the
-   C2S loop in `tests/test_boot.cpp`, wired into both the C2S loop and the
-   S2C loop's `q2` sub-loop). Use `automorphism_eval_device` +
-   `keyswitch_resident` directly (not the `rotate_ct_device` convenience
-   wrapper — that has an unbatched per-tower `LaunchAddInto` loop for the
-   c0+=ba0 combine; keep that combine on the CPU instead, consistent with
-   this session's own profiling showing the CPU combine costs only ~0.6s
-   total). Validate with AT LEAST 3 repeated runs of baseline and 3 of the
-   experiment, interleaved (baseline, experiment, baseline, experiment...),
-   not sequential blocks, to separate real signal from environmental drift.
+1. **Fix `KROT`'s own memory scaling — the actual, quantified blocker for
+   n=131072.** `MEMORY_FEASIBILITY.md` has the exact numbers: 77 entries ×
+   62.9MB at n=8192 (4.84GB) → 77.5GB at n=131072. `KSC` is already fixed
+   (bounded LRU, cap=48, `93f2231`) and is NOT the remaining problem.
+   Options, hardest-but-best first: (a) change `KeySwitchConstants::av`/
+   `bv` from `std::vector<std::vector<uint64_t>>` to a shared/reference
+   type so `KSC`'s views (and any other derived key) stop deep-copying
+   `KROT`'s data — this is the structurally correct fix but touches a
+   core type used across `src/*.cpp`; get a cryptographic-correctness
+   review of the change before trusting it, and test exhaustively (every
+   place `.av`/`.bv` is read AND written, not just `test_boot.cpp`'s own
+   usage). (b) Verify whether `KROT`'s 77 entries are really all needed
+   simultaneously, or whether per-stage working-set analysis could safely
+   evict between C2S and S2C (current instrumentation says NO — S2C
+   reuses C2S's rotation amounts almost completely — so this option is
+   likely a dead end, but hasn't been rigorously disproven, just
+   observationally discouraged). (c) Stream av/bv to GPU on-demand without
+   a full host-resident copy (biggest architectural change, highest risk).
 
-2. **Eval-domain automorphism as a precomputed index permutation**
-   (ranked experiment #2, not yet attempted). Eliminates the
-   INTT→permute→NTT round-trip in `automorphism_eval_device` entirely,
-   replacing it with one permutation kernel operating directly on
-   eval-domain data (for a negacyclic NTT, ψ_k with odd k is a permutation
-   of the evaluation vector composed with bit-reversal on both sides — see
-   `LITERATURE_REVIEW.md`'s OpenFHE/FIDESlib citations for the precise
-   construction: `PrecomputeAutoMap`/`AutomorphismTransform`). Flagged by
-   the research agent as "the single largest win available." Needs a new
-   kernel + a correctness test against the existing coefficient-domain
-   path before touching the hot loop.
+2. **Eval-domain automorphism as a precomputed permutation** (ranked
+   experiment #2 — not yet attempted this round either). Eliminates the
+   INTT→permute→NTT round-trip in `automorphism_eval_device`
+   (`src/rotate.cpp`). Needs: (a) derive the exact permutation from this
+   codebase's specific NTT convention (read `kernels/ntt_ct.cu`'s actual
+   bit-reversal/ordering — the header comments say "standard-order in,
+   bit-reversed out" for forward NTT but the EXACT index formula needs
+   deriving from the kernel code itself, not assumed); (b) build a small,
+   isolated correctness test (exhaustive small n, randomized larger n)
+   BEFORE touching the hot loop; (c) only then benchmark, using the
+   interleaved harness.
 
 3. **Correct-order rotation hoisting** (ranked experiment #3). Per the
-   research agent's reading of OpenFHE's actual source: decompose the
-   UNPERMUTED ciphertext once; keyswitch; apply the automorphism to the
-   QP-basis OUTPUT (ba0/ba1, sizeQlP towers) AFTER the key-switch inner
-   product, not to the decomposed digits; fold c0 in as `ba0 += P*c0`
-   before the permutation; ModDown last. Requires regenerating rotation
-   keys as keyswitch-to-ψ_{k⁻¹}(s) (inverse automorphism convention), not
-   today's ψ_k(s). This is a bigger, higher-risk change than #1/#2 — do it
-   after they land, since it amortizes the (by-then smaller) per-rotation
-   cost they leave behind, making its own benefit cleaner to measure. Build
-   a STANDALONE correctness test (N independent rotations vs.
-   decompose-once + N finishes, bit-exact comparison) before touching
-   `test_boot.cpp`, exactly as the FIRST (failed) hoisting attempt should
-   have scoped more carefully from the start.
+   OpenFHE-source-grounded research from the prior round: decompose the
+   UNPERMUTED ciphertext once; keyswitch; permute the QP-basis OUTPUT
+   (ba0/ba1) after the key-switch inner product, not the decomposed
+   digits; regenerate rotation keys as keyswitch-to-ψ_{k⁻¹}(s). Build a
+   standalone correctness test (N independent rotations vs.
+   decompose-once + N finishes) before touching `test_boot.cpp`. Do this
+   AFTER #2 lands, since #2 changes the per-rotation baseline #3 would
+   amortize against.
 
-4. **KROT/KSC bounded host-side key cache.** Required before ANY attempt
-   to increase n. Current unbounded caching already uses ~10.78GB peak RSS
-   at n=8192 — see `MEMORY_FEASIBILITY.md`. Design a bounded LRU or
-   per-stage-scoped cache (keys needed only within the current C2S/S2C
-   stage do not need to survive past it) before n is touched at all.
-
-5. **Security parameter switch: sparse (h=64) → uniform ternary secret,
-   n=8192 → n=65536.** Verified via this repo's own `lwe_security.py` to
-   give 128/120-bit classical/quantum security at the existing 1775-bit
-   modulus budget — see `SECURITY_ASSESSMENT.md`. This is a LARGER,
-   separate effort: requires (a) the KROT/KSC fix above first (memory will
-   not survive n=65536 otherwise), (b) changing `set_secret_hamming_weight`
-   usage to a uniform-ternary secret generation path, (c) regenerating all
-   moduli/roots at n=65536, (d) full correctness re-verification, (e) a
-   fresh performance baseline (expect substantially slower than the
-   current ~115-130s; not yet measured, do not guess the number).
+4. **Run n=131072 end to end, once #1 above is actually fixed.** Keep the
+   sparse secret (h=64) — no `keygen.cpp` change needed, per the corrected
+   security analysis. Regenerate moduli/roots at n=131072 in
+   `tests/test_boot.cpp`. Full correctness re-verification (bit-exact vs.
+   OpenFHE oracle) before trusting any timing number. This is the
+   "make the secure configuration run end to end" deliverable — currently
+   NOT done, explicitly blocked on #1.
 
 ## What NOT to do
 
-- Do not re-attempt hoisting the OLD way (permuting the decomposed
-  digits) — rigorously falsified this session via an isolated debug test,
-  root-caused definitively by the literature research (wrong operation
-  order + wrong key convention, not an approximation-math dead end — see
-  `LITERATURE_REVIEW.md`).
-- Do not adopt n=131072 — confirmed wasteful (280 bits vs. the 128 needed).
-- Do not trust any single-run benchmark from a long-running session
-  without a fresh, immediately-preceding control run.
-- Do not use CKKS for the messaging use case — see
-  `MESSAGING_ARCHITECTURE.md` for the settled recommendation
-  (ML-KEM-768 + Double Ratchet + AEAD).
+- Do not re-attempt the OLD hoisting approach (permuting decomposed
+  digits) — falsified twice now (once via direct debug test, once via
+  literature confirming the correct order is different).
+- Do not switch to a uniform ternary secret — the corrected security
+  analysis shows it does not help for THIS codebase's circuit (needs more
+  EvalMod depth than the sparse secret, net worse at the n values that
+  matter). Keep h=64.
+- Do not re-attempt experiment #1 (resident-rotation context/stream
+  hoisting as previously scoped) expecting a different result — it was
+  PROPERLY validated as a null result this round (interleaved A/B,
+  post-thermal-equilibrium comparison), not just inconclusive. A
+  completely different design would be a new experiment, not a retry.
+- Do not trust a single-run benchmark on this machine without checking
+  GPU temperature first.
+- Do not use CKKS for messaging — `MESSAGING_ARCHITECTURE.md`'s
+  recommendation (ML-KEM-768 + Double Ratchet + AEAD) stands, unchanged
+  this round.
 
-## Standing environment facts (re-verify, don't assume stale)
+## Standing environment facts
 
 RTX 2060 Max-Q, 6144MB VRAM, CUDA 13.2, driver 595.97, WSL2 Ubuntu, 10GB
-host RAM visible to WSL2, 16 CPU threads. GPU clock throttling under WSL2
-is real and was NOT fixed (requires elevated privileges this session
-would not escalate to obtain without the user doing it themselves).
+host RAM visible to WSL2, 16 CPU threads. GPU clock throttling under
+WSL2 and thermal drift over long sessions are both real, measured, and
+not fixed (will not escalate privileges to force clock locking).

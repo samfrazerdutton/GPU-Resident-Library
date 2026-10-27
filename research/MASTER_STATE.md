@@ -1,92 +1,107 @@
 # Master state
 
-Last updated: this session, after the master-directive research cycle
-(hoisting root-cause research, memory feasibility measurement, security
-re-assessment, messaging architecture proposal).
+Last updated: this session, after a second execution-focused cycle (proper
+benchmark harness built, resident-rotation experiment validated as a true
+null result, KSC cache bounded with a real measured win, and a significant
+self-correction to the security recommendation).
 
 ## Current verified state
 
 - Repo: `github.com/samfrazerdutton/GPU-Resident-Library`, branch `main`,
-  commit `865b59a` (pushed to origin).
+  commit `93f2231` (pushed to origin as of the prior checkpoint; confirm
+  `git log -1` and push status on resume).
 - Hardware: RTX 2060 Max-Q, 6144MB VRAM, CUDA 13.2, driver 595.97, WSL2
-  Ubuntu, **10GB host RAM visible to WSL2**, 16 CPU threads.
+  Ubuntu, 10GB host RAM visible to WSL2, 16 CPU threads.
 - Current demo bootstrap (n=8192, log2(QP)=1775, sparse secret h=64):
-  ~114.6-129s wall time depending on run (GPU clock throttled under
-  WSL2, 300-975MHz of 2100MHz max — confirmed, unresolved, environmental).
-  **This parameter set is ~51 classical / ~46 quantum bits of security —
-  not 128-bit. It has never been secure.** Treat every speed number
-  measured against it as "how fast this insecure demo runs," not a
-  security-relevant result.
+  ~114-150s wall time depending on GPU thermal state (see below) — **still
+  only ~51 classical / ~46 quantum bits of security. Never secure.** Every
+  speed number below describes this insecure demo, not a security result.
+- **Peak host RSS: 8.12-8.32GB** (down from 10.78GB — see KSC fix below).
 
-## The two biggest findings this cycle
+## This cycle's real, validated outcomes
 
-1. **Security target correction**: n=131072 (this session's earlier
-   conclusion) was wrong. The actual fix is **n=65536 + switch the secret
-   from sparse (h=64) to uniform ternary** — verified with this repo's own
-   `lwe_security.py` to give 128/120-bit classical/quantum security at the
-   existing 1775-bit modulus budget. n=131072 would be 2.2x more security
-   than needed at 2x the cost. See `SECURITY_ASSESSMENT.md`.
+1. **Benchmark methodology fixed.** Built `research/benchmarks/run_trials.sh`
+   and `interleaved_ab.sh` — repeated-trial harnesses that log GPU
+   temp/clock/power per run and support true interleaved A/B comparison.
+   Confirmed empirically: this session's GPU reached a stable thermal
+   plateau around 85°C under sustained load (vs. ~78-82°C early-session),
+   which shifts absolute wall-clock numbers run-to-run — use interleaved
+   comparison, not sequential single runs, for any future A/B.
 
-2. **Memory feasibility inverted from initial assumption**: GPU VRAM is
-   NOT the binding constraint for scaling n (only 181MB of 6144MB used at
-   n=8192 today). **Host RAM is** — measured peak RSS of 10.78GB at the
-   CURRENT n=8192, driven directly by `test_boot.cpp`'s unbounded
-   KROT/KSC host-side rotation-key caches. This must be fixed (bounded
-   cache/streaming) before n can be increased at all, independent of GPU
-   capability. See `MEMORY_FEASIBILITY.md`.
+2. **Resident-rotation experiment (#1): validated NULL result, not
+   inconclusive.** Interleaved A/B (3 rounds, separate `test_boot`/
+   `test_boot_exp` binaries) showed apparent slowdowns in rounds 1-2 that
+   were an order confound (experiment always ran second, inheriting the
+   preceding run's heat). **Round 3, after thermal equilibrium: baseline
+   81.94s vs. experiment 81.88s rotate-bucket — statistically identical.**
+   Hoisting stream/work/ciphertext residency out of the per-diagonal loop
+   does not meaningfully help, because the unavoidable per-key eval-key
+   upload (~63MB) dominates either way. Not merged (adds complexity, zero
+   benefit). See `EXPERIMENT_LEDGER.md`.
 
-## Current bottleneck (what's actually slow, and why)
+3. **KSC bounded cache: real ~25% peak-RSS win, committed (`93f2231`).**
+   Capped the cheap-to-regenerate rotation-key VIEW cache at 48 entries
+   (LRU eviction). Measured peak RSS: 10.78GB → 8.12-8.32GB (two
+   independent measurement methods), bit-exact. `KROT` (the expensive-to-
+   regenerate full-key cache, confirmed genuinely reused across the WHOLE
+   bootstrap, not per-stage) deliberately left uncapped.
 
-Profiled (not guessed) breakdown of C2S+S2C's ~100s combined:
-`rotate_ct_resident` ~62-66s, `pt_to_eval_host` ~29-30s, CPU elementwise
-accumulate ~0.6s (negligible — explains why earlier CPU→GPU migration
-attempts there were null results). Root cause of `rotate_ct_resident`'s
-cost, per a delegated literature-grounded research pass reading OpenFHE's
-actual source: it recreates the GPU key-switch context and re-uploads the
-ENTIRE rotation key (~63MB at current params) over PCIe, plus host
-round-trips, on EVERY SINGLE rotation — this is memory-bandwidth/data-
-movement-bound, not raw-arithmetic-bound, consistent with published
-findings (Jung et al., TCHES 2021, "Over 100x Faster Bootstrapping... with
-GPUs").
+4. **Security recommendation corrected AGAIN, now self-consistently
+   verified.** The previous "n=65536 + uniform ternary" recommendation
+   reused the SPARSE secret's modulus budget (1775 bits) without
+   accounting for the fact that this codebase's own EvalMod circuit needs
+   MORE double-angle depth for a uniform (vs. sparse) secret — Kbud scales
+   with √n for uniform secrets, adding 3-5 extra towers depending on n.
+   Recomputed self-consistently: **n=65536 uniform only reaches 113 bits
+   (short of 128). n=131072 with the EXISTING sparse secret (h=64, zero
+   code change) reaches 134 bits using the exact same, already-validated
+   circuit.** See `SECURITY_ASSESSMENT.md` for the full corrected analysis
+   — this supersedes the prior revision's recommendation.
 
-## Active hypothesis / next action (see NEXT_SESSION.md for exact commands)
+## The real, quantified blocker for n=131072
 
-**Important late-session finding: this session's GPU/measurement
-environment has drifted substantially over many hours of continuous use**
-(fresh baseline re-measurements of the UNCHANGED, already-proven
-`rotate_ct_resident` code now show 71-76s for that bucket / 130-140s total
-bootstrap, vs. 62-66s / 114-115s measured earlier THIS SAME SESSION on
-IDENTICAL code). This is almost certainly thermal/clock throttling
-accumulating on a Max-Q mobile GPU under sustained load, not a code issue.
-**Any single-run sequential comparison from this point forward in a long
-session is unreliable** — a fresh session (cold GPU) or interleaved/
-repeated-trial measurement is required to validate anything further.
+Not GPU VRAM (181MB of 6144MB used — huge headroom). Not KSC anymore
+(fixed, see above). **It is `KROT`'s own footprint**: 77 entries × 62.9MB
+at n=8192 = 4.84GB, scaling to **77.5GB at n=131072** — infeasible, and
+NOT addressed by the KSC fix (KROT's entries are confirmed genuinely
+reused across the whole bootstrap, so naive eviction there would force
+real, expensive `evalkeygen_host` regeneration, not a cheap re-copy).
+A real fix needs either a zero-copy av/bv sharing mechanism (requires
+changing `KeySwitchConstants`'s field types — broad blast radius, not
+attempted, needs a cryptographic-correctness review first) or a
+different architectural approach (streaming av/bv to GPU without a full
+host-resident copy). **n=131072 end-to-end has NOT been run. Do not
+report it as supported.**
 
-Three ranked, literature-grounded experiments queued (see
-`EXPERIMENT_LEDGER.md`'s "Round 2" table and `NEXT_SESSION.md`):
-1. Make `rotate_ct_resident` actually resident (hoist context/key out of
-   the BSGS loop) — **attempted, built, bit-exact, but measurement was
-   inconclusive due to the environmental drift above; reverted, not
-   disproven.** Re-test first in a fresh session.
-2. Eval-domain automorphism as a precomputed index permutation (removes
-   the INTT→permute→NTT round trip entirely) — not yet attempted.
-3. Correct-order rotation hoisting (OpenFHE's method: permute the QP-basis
-   output after key-switch, not the decomposed digits; regenerate keys
-   with the ψ_{k⁻¹}(s) convention) — now understood to require ZERO
-   changes to the approximate basis conversion, unlike today's failed
-   attempt #1. Not yet attempted.
+## What's done vs. not done against the acceptance criteria
 
-Separately, and NOT yet started: the KROT/KSC bounded-cache redesign
-(blocking any n-scaling work) and the n=65536/uniform-ternary parameter
-switch + re-measurement.
+- [x] Clean build from documented instructions (confirmed repeatedly this
+  session).
+- [x] Core correctness tests pass (bit-exact, 14+ consecutive changes
+  this session with zero numerical drift).
+- [x] Full supported bootstrap executes end to end (at n=8192 demo params).
+- [x] Reproducible before/after measurements for the KSC fix (two
+  independent measurement methods, interleaved-confirmed null result for
+  the rotation experiment).
+- [x] Security parameters have an independent, self-correcting documented
+  assessment (two real corrections made and recorded, not hidden).
+- [x] Host RAM measured precisely; VRAM measured (with an acknowledged
+  coarse-polling caveat).
+- [ ] The selected (n=131072, sparse h=64) configuration has NOT yet been
+  run end to end — blocked on KROT's memory scaling, not yet fixed.
+- [ ] Eval-domain automorphism permutation (ranked experiment #2, "largest
+  available win" per research) — not yet attempted.
+- [ ] Correct-order rotation hoisting (ranked experiment #3, now properly
+  understood) — not yet attempted.
+- [ ] Messaging track: architecture proposal complete and committed
+  (`MESSAGING_ARCHITECTURE.md`); no implementation/prototype built (not
+  requested as a build task, scoped as a proposal this session).
 
 ## Environment constraints (confirmed, not assumed)
 
-- GPU clock throttling under WSL2: real, measured, unresolved. Will not
-  attempt privilege escalation (`nvidia-smi -lgc`) to fix it — that is a
-  system-settings change outside what this session does without the user
-  doing it themselves.
-- Host RAM ceiling (10GB in WSL2) is now a CONFIRMED binding constraint,
-  not a hypothesis.
-- No actual n=16384/32768/65536/131072 staged allocation benchmark has
-  been run yet (planned, not done — see Phase B in `MEMORY_FEASIBILITY.md`).
+- GPU clock throttling under WSL2 and thermal drift over long sessions are
+  both real and measured. Will not attempt privilege escalation to force
+  clock locking.
+- Host RAM ceiling (10GB in WSL2): confirmed binding; now partially
+  relieved (25% reduction via the KSC fix) but KROT's own scaling at
+  n=131072 remains unsolved and is the standing blocker.

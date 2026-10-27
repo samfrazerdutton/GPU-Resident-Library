@@ -75,6 +75,46 @@ one of:
 This is now the standing precondition for any n-scaling experiment, tracked
 as the first item in `NEXT_SESSION.md`.
 
+## UPDATE: KSC bounded (real win), KROT NOT yet solved (quantified gap)
+
+Implemented a bounded LRU cache for `KSC` specifically (commit `93f2231`):
+safe because `KSC` entries are cheap to regenerate on a miss (pure CPU copy
+from an already-resident `KROT` entry, no RNG, no `evalkeygen_host` call).
+Capped at 48 entries. **Measured result: peak RSS 10.78GB → 8.12-8.32GB
+(two independent measurements, `getrusage` and `/usr/bin/time -v`), a real
+~23-25% reduction, bit-exact.**
+
+`KROT` was deliberately left uncapped — instrumentation confirmed its ~77
+entries are genuinely reused across the ENTIRE bootstrap (count stayed
+flat from C2S's end through S2C's end, meaning S2C reuses C2S's rotation
+amounts almost completely), so naive LRU eviction there would force real,
+expensive `evalkeygen_host` regeneration, not a cheap re-copy. **This
+means `KROT` itself remains unsolved, and its own scaling is now the
+precise, quantified blocker for n=131072:**
+
+```
+KROT entry size at n=8192:  2(av,bv) x 15(numPart) x 32(sizeQlP) x 8192(n) x 8B = 62.9 MB
+KROT total at n=8192:       77 x 62.9 MB = 4.84 GB
+KROT total at n=131072:     77 x (62.9 MB x 16) = 77.5 GB   <-- infeasible, unaddressed by the KSC fix
+```
+
+**n=131072 end-to-end is NOT yet achievable — this is the specific,
+quantified reason, not a vague "memory might be tight."** A real fix needs
+one of: (a) a zero-copy reference mechanism so `KSC`'s views share
+`KROT`'s av/bv storage instead of deep-copying a subset of it (would also
+shrink `KROT`'s OWN effective footprint if applied consistently, but
+requires changing `KeySwitchConstants`'s `av`/`bv` field types from
+`std::vector<std::vector<uint64_t>>` to a shared/reference-counted type —
+a change with broad blast radius across `src/*.cpp`, not attempted this
+session given the risk, but the single most promising fix a future
+session should scope carefully with a cryptographic-correctness review
+first); (b) determining whether the 77 KROT entries are REALLY all needed
+simultaneously or whether a smarter per-stage working-set analysis (not
+yet done) could safely bound it; (c) streaming av/bv from host to GPU
+on-demand per rotation without a full host-resident copy at all (a bigger
+architectural change). None of these have been implemented. Do not claim
+n=131072 is memory-feasible until one of them is.
+
 ## GPU VRAM at n=131072 (for completeness, now secondary)
 
 Scaling the *resident* GPU-side structures (`DeviceKSContext`'s per-part
