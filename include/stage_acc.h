@@ -7,3 +7,6 @@ extern "C" void LaunchPtMulAcc(uint64_t* d_acc0, uint64_t* d_acc1,
                                cudaStream_t s);
 extern "C" void LaunchAddInto(uint64_t* d_a, const uint64_t* d_b,
                               uint64_t q, uint32_t n, cudaStream_t s);
+extern "C" void LaunchScaledAddInto(uint64_t* d_a, const uint64_t* d_b,
+                                    uint64_t scale, uint64_t q, uint32_t n,
+                                    cudaStream_t s);

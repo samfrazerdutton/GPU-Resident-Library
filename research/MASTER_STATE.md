@@ -1,21 +1,24 @@
 # Master state
 
-Last updated: this session, after a second execution-focused cycle (proper
-benchmark harness built, resident-rotation experiment validated as a true
-null result, KSC cache bounded with a real measured win, and a significant
-self-correction to the security recommendation).
+Last updated: this session, third execution-focused cycle. Delivered TWO
+real, validated wins (KSC bound, eval-domain automorphism), one safe
+prerequisite refactor (keyswitch_resident split), and attempted a third,
+riskier optimization (correct-order rotation hoisting) that failed twice
+on the key-generation convention specifically -- documented precisely
+rather than abandoned or faked.
 
 ## Current verified state
 
 - Repo: `github.com/samfrazerdutton/GPU-Resident-Library`, branch `main`,
-  commit `93f2231` (pushed to origin as of the prior checkpoint; confirm
+  commit `2080aa0` (pushed to origin as of the prior checkpoint; confirm
   `git log -1` and push status on resume).
 - Hardware: RTX 2060 Max-Q, 6144MB VRAM, CUDA 13.2, driver 595.97, WSL2
   Ubuntu, 10GB host RAM visible to WSL2, 16 CPU threads.
 - Current demo bootstrap (n=8192, log2(QP)=1775, sparse secret h=64):
-  ~114-150s wall time depending on GPU thermal state (see below) — **still
-  only ~51 classical / ~46 quantum bits of security. Never secure.** Every
-  speed number below describes this insecure demo, not a security result.
+  **108-114s wall time** (down from 125-150s at the start of this round;
+  see eval-domain automorphism below) — **still only ~51 classical / ~46
+  quantum bits of security. Never secure.** Every speed number describes
+  this insecure demo, not a security result.
 - **Peak host RSS: 8.12-8.32GB** (down from 10.78GB — see KSC fix below).
 
 ## This cycle's real, validated outcomes
@@ -58,6 +61,32 @@ self-correction to the security recommendation).
    circuit.** See `SECURITY_ASSESSMENT.md` for the full corrected analysis
    — this supersedes the prior revision's recommendation.
 
+5. **Eval-domain automorphism: real win, committed (`0043af3`).** Derived
+   and INDEPENDENTLY validated (GPU-free Python reference, 20 trials)
+   that this codebase's exact NTT convention makes Galois automorphism a
+   pure eval-domain permutation (no sign flip, no modular arithmetic) —
+   replaced the INTT→permute→NTT round trip with one gather kernel. Caught
+   a real async-host-buffer-lifetime bug via the standalone test before it
+   reached production. 40/40 bit-exact at n=8192. **Measured: rotate
+   bucket down to 55-60s (was 62-82s), total bootstrap down to 108-114s —
+   the lowest this entire session.**
+
+6. **keyswitch_resident split into ks_accumulate_qp + ks_moddown,
+   committed (`2080aa0`).** Safe mechanical extraction (zero behavior
+   change, verified via the full regression suite), creating the seam
+   needed to attempt correct-order rotation hoisting.
+
+7. **Correct-order rotation hoisting (experiment #3): attempted, FAILED
+   twice, precisely documented, NOT committed to anything live.** Built a
+   standalone single-rotation test. **k=1 (trivial identity) passes
+   0/491520 mismatches** — proves the surrounding plumbing (decompose,
+   new scaled-fold-in kernel, automorphism-on-QP-accumulator, moddown) is
+   correct. The remaining bug is isolated to the rotation-KEY-GENERATION
+   CONVENTION for k≠1 — two specific wrong attempts tried and ruled out
+   (see `EXPERIMENT_LEDGER.md`), neither of which should be retried as-is.
+   This needs a careful, line-by-line re-derivation against this
+   codebase's exact `evalkeygen_host_sold` structure, not another guess.
+
 ## The real, quantified blocker for n=131072
 
 Not GPU VRAM (181MB of 6144MB used — huge headroom). Not KSC anymore
@@ -89,10 +118,11 @@ report it as supported.**
   coarse-polling caveat).
 - [ ] The selected (n=131072, sparse h=64) configuration has NOT yet been
   run end to end — blocked on KROT's memory scaling, not yet fixed.
-- [ ] Eval-domain automorphism permutation (ranked experiment #2, "largest
-  available win" per research) — not yet attempted.
-- [ ] Correct-order rotation hoisting (ranked experiment #3, now properly
-  understood) — not yet attempted.
+- [x] Eval-domain automorphism permutation (ranked experiment #2) — DONE,
+  real win, committed `0043af3`.
+- [ ] Correct-order rotation hoisting (ranked experiment #3) — ATTEMPTED,
+  failed twice on the key-generation convention, precisely documented
+  (see above and `EXPERIMENT_LEDGER.md`), not yet resolved.
 - [ ] Messaging track: architecture proposal complete and committed
   (`MESSAGING_ARCHITECTURE.md`); no implementation/prototype built (not
   requested as a build task, scoped as a proposal this session).

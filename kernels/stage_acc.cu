@@ -54,3 +54,29 @@ extern "C" void LaunchAddInto(uint64_t* d_a, const uint64_t* d_b,
     uint32_t blocks = (n + 255) / 256;
     addinto_kernel<<<blocks, 256, 0, s>>>(d_a, d_b, q, n);
 }
+
+// a[k] = (a[k] + b[k]*scale) mod q, one tower -- a[k] += scale*b[k], scale a
+// per-tower SCALAR (not a per-coefficient array like LaunchPtMulAcc's d).
+// Used to fold c0*P into the QP-basis keyswitch accumulator for correct-
+// order rotation hoisting (see research/NEXT_SESSION.md): the accumulator
+// is implicitly scaled by P before moddown (confirmed from moddown.cu's own
+// combine formula, ans=(a-b)*PInvModq), so c0 must be scaled by P mod q
+// before being added, not added directly.
+__global__ void scaled_addinto_kernel(uint64_t* __restrict__ a,
+                                      const uint64_t* __restrict__ b,
+                                      uint64_t scale, uint64_t q, uint32_t n)
+{
+    uint32_t k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= n) return;
+    uint64_t p = (uint64_t)(((unsigned __int128)b[k] * scale) % q);
+    uint64_t s = a[k] + p; if (s >= q) s -= q;
+    a[k] = s;
+}
+
+extern "C" void LaunchScaledAddInto(uint64_t* d_a, const uint64_t* d_b,
+                                    uint64_t scale, uint64_t q, uint32_t n,
+                                    cudaStream_t s)
+{
+    uint32_t blocks = (n + 255) / 256;
+    scaled_addinto_kernel<<<blocks, 256, 0, s>>>(d_a, d_b, scale, q, n);
+}
