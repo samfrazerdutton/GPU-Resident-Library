@@ -286,3 +286,70 @@ IS done and real: the security target is independently reconfirmed
 (134 bits, see `SECURITY_ASSESSMENT.md`), and real (not extrapolated)
 per-key cost at this scale is measured (1085MB RSS, 7.5s keygen —
 `tests/test_n131072_keysize.cpp`).
+
+## UPDATE: per-diagonal instrumentation added, ONE real data point obtained before a 4th OOM
+
+Added per-diagonal `std::cerr` (unbuffered — unlike the per-stage
+`std::cout` checkpoints, guaranteed to survive a sudden kill) `[mem]`
+probes inside the C2S and S2C diagonal loops. A 4th attempt (same
+`KROT_CAP=2`/`KSC_CAP=1`) got MUCH further than the prior three before
+dying — it printed `ModRaise` and the analytic-inverse self-check
+lines (confirming setup completes in reasonable time, NOT itself a
+multi-minute bottleneck) and reached the very first C2S diagonal:
+
+```
+ModRaise: congruence mismatches = 0 (want 0), max|I| = 11
+analytic inverse self-check: diag err=0 offdiag=2.45581e-17
+      [mem] stage 0 diag 0/16 RSS=3506.18MB KROT=1 KSC=1
+```
+
+Then it OOM'd before printing diagonal 1. **This is still not fully
+explained**: baseline RSS with only ONE `KROT` entry + ONE `KSC` entry
+live (~1085MB each) plus `KREL` (the relin key, same ~1085MB magnitude,
+generated once at the very start, outside any bounded cache) sums to
+~3.25GB — close to but not exactly the observed 3506MB (plausibly base
+keypairs + working buffers account for the ~250MB gap, not concerning
+on its own). **What IS concerning**: it died within the next few
+diagonals, i.e. after growing by at most 1-2 more KROT/KSC entries
+(~1-2GB more, which the 10GB ceiling should comfortably absorb from a
+3.5GB baseline with ~6.5GB headroom) — a MUCH faster climb to the
+ceiling than "+1085MB per new distinct key" predicts. Two live
+hypotheses, NEITHER yet confirmed: (a) `evalkeygen_host_sold`'s own
+per-part working buffers (`uBuf`/`e0Buf`/`e1Buf`, each `sizeQlP*n*8`
+bytes ≈ 33.5MB at this scale, ×3, allocated/freed per PART inside a
+15-part loop) have some transient peak larger than the steady-state
+~1085MB this doc has been modeling, especially under aggressive
+cap-driven eviction+regeneration churn; (b) glibc's allocator does not
+promptly return freed medium-sized blocks to the OS under this
+allocation pattern, so apparent "freed" memory (an evicted cache entry,
+or `stageDiags`' S=65536-iteration temporary-vector churn — see the
+`stageDiags`/`applyMerged` O(S²) cost noted for a future performance
+pass, independent of this memory question) keeps inflating RSS well
+past what's actually live. **Next concrete step**: run under
+`/usr/bin/time -v` or a proper allocator-tracing tool (not just
+`getrusage` RSS, which conflates "ever touched" peak with "currently
+live") to distinguish these, and add a `[mem]` probe immediately AFTER
+`keyAt`'s/`rotFull`'s eviction point specifically, not just at the end
+of each diagonal, to see whether the spike happens AT eviction/regen
+or elsewhere in the diagonal's own processing.
+
+**Separate, independent observation from this same run (a performance
+concern, not a memory one)**: this attempt spent roughly 5-10 CPU-
+minutes between process start and the first C2S diagonal printing
+(stable 1.46GB RSS, climbing CPU time, consistent with a CPU-bound not
+memory-bound phase) — `tests/test_boot.cpp`'s `stageDiags`/
+`stageDiagsFwd` (lines ~268-277 and ~675-684) compute each stage's
+diagonal structure via a loop of `S` iterations (`S=n/2`), each doing
+an O(S) `applyMerged` call AND an O(S) zero-init of a fresh `S`-sized
+`std::vector<cd>` AND an O(S) scan — i.e. O(S²) total per `stageDiags`
+call, called once per C2S/S2C stage. At n=8192 (S=4096) this is
+~16.8M-scale work per call, imperceptible; at n=131072 (S=65536) it's
+~4.3B-scale, a 256x increase — plausibly several seconds to low
+minutes per call on a single CPU thread with no apparent
+parallelization, and called 8 times total (4 C2S + 4 S2C stages at
+`LST=4`). This was NOT precisely isolated from `ModRaise`'s own O(n)
+setup cost in this run (no per-phase timestamp exists yet), but is
+flagged here as a real, independent algorithmic scaling concern worth
+fixing (e.g. precomputing diagonal structure analytically instead of
+probing empirically) for ANY future large-n attempt, regardless of how
+the memory question above resolves.

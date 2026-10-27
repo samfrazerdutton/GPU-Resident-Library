@@ -455,7 +455,16 @@ int main(){
             auto _ta=NOW();
             gpufhe::ct_mul_pt_host(t0,t1,dE,ctw,n,ml);
             if(fst){a0=t0;a1=t1;fst=false;} else gpufhe::ct_add_ct_host(a0,a1,t0,t1,ctw,n,ml);
-            g_tCpuAcc+=EL(_ta); }
+            g_tCpuAcc+=EL(_ta);
+            // Per-diagonal [mem] probe: localizes the unidentified growth
+            // beyond KROT_CAP/KSC_CAP found in three prior n=131072 OOM
+            // attempts (research/MEMORY_FEASIBILITY.md). std::cerr is
+            // unbuffered -- this line is guaranteed to reach the log even
+            // if the process is killed moments later, unlike std::cout's
+            // per-stage [mem] prints (which never once appeared across
+            // all three prior attempts, since nothing had flushed yet).
+            std::cerr<<"      [mem] stage "<<g<<" diag "<<x<<"/"<<offs.size()
+                     <<" RSS="<<rssMB()<<"MB KROT="<<KROT.size()<<" KSC="<<KSC.size()<<"\n"; }
         stageRotEnd(R);
         rescaleAt(a0,a1,ctw);
         std::cerr<<"    C2S stage "<<g<<" tw="<<ctw<<" parts="<<npFor(ctw)
@@ -747,7 +756,9 @@ int main(){
             auto _ta=NOW();
             gpufhe::ct_mul_pt_host(t0,t1,dE,stw,n,ml);
             if(fst){a0=t0;a1=t1;fst=false;} else gpufhe::ct_add_ct_host(a0,a1,t0,t1,stw,n,ml);
-            g_tCpuAcc+=EL(_ta); }
+            g_tCpuAcc+=EL(_ta);
+            std::cerr<<"      [mem] S2C stage "<<g<<" q="<<q2<<" diag "<<x<<"/"<<offs.size()
+                     <<" RSS="<<rssMB()<<"MB KROT="<<KROT.size()<<" KSC="<<KSC.size()<<"\n"; }
           stageRotEnd(R); }
         rescaleAt(a0,a1,stw);
         std::cerr<<"    S2C stage "<<g<<" tw="<<stw<<" parts="<<npFor(stw)
