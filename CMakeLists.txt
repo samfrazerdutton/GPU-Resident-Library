@@ -25,6 +25,7 @@ add_library(gpufhe STATIC
   src/ptops.cpp
   src/params.cpp
   src/keyswitch_resident.cpp
+  src/keyswitch_hoist.cpp
   kernels/ntt_ct.cu
   kernels/rns_arith.cu
   kernels/intt_ct.cu
@@ -117,9 +118,11 @@ gpufhe_test(test_automorph_eval_fast tests/test_automorph_eval_fast.cpp)
 # unresolved; now passes 27/27 cases (3 ciphertexts x 9 rotation indices,
 # decrypted-plaintext comparison) and is promoted to the default suite.
 gpufhe_test(test_hoist_single tests/test_hoist_single.cpp)
+gpufhe_test(test_hoist_multi tests/test_hoist_multi.cpp)
 gpufhe_test(test_keyreuse tests/test_keyreuse.cpp)
 gpufhe_test(bench_resident_chain bench/bench_resident_chain.cpp)
 gpufhe_test(bench_batch bench/bench_batch.cpp)
 gpufhe_test(bench_evalmult bench/bench_evalmult.cpp)
 gpufhe_test(bench_evalmult_resident bench/bench_evalmult_resident.cpp)
+gpufhe_test(bench_hoist_multi bench/bench_hoist_multi.cpp)
 gpufhe_test(test_mult_barrett tests/test_mult_barrett.cpp)

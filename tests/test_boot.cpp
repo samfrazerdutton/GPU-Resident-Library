@@ -71,7 +71,25 @@ int main(){
     for(uint32_t i=0;i<sizeQ;++i){KREL.rootModList.push_back(mod[i]);KREL.rootValList.push_back(root[i]);}
     for(uint32_t j=0;j<sizeP;++j){KREL.rootModList.push_back(modP[j]);KREL.rootValList.push_back(rootQP[sizeQ+j]);}
     gpufhe::evalkeygen_host(KREL,KPqp.s,KPqp.pkA,KPqp.pkB,PModq,modQP,rootQP,ns,3.19,202);
+    // KROT is the EXPENSIVE-to-regenerate cache (real evalkeygen_host_sold
+    // call, ~0.64s/key measured at n=8192, vs. KSC's cheap pure-copy
+    // misses below) -- instrumentation confirmed all ~77 of its entries at
+    // n=8192 get reused across the WHOLE bootstrap (count stays flat from
+    // C2S's end through S2C's end), so capping it forces real re-keygen
+    // cost, not a free win. KROT_CAP defaults ABOVE the measured n=8192
+    // working set (77 distinct rotation amounts + 1 relin key) so this
+    // bound causes ZERO evictions and ZERO behavior change at the current
+    // scale -- it exists as the safety net for n=131072, where a key is
+    // ~16x bigger and 77 of them (~77.5GB, see MEMORY_FEASIBILITY.md) is
+    // infeasible regardless of compute cost. Lower this when actually
+    // attempting a larger n; the eviction/regen tradeoff at that point is
+    // real and must be measured, not assumed free -- see
+    // MEMORY_FEASIBILITY.md's KROT lever analysis for the n=131072
+    // extrapolated regen-cost numbers.
+    constexpr size_t KROT_CAP=96;
     std::map<uint32_t,gpufhe::KeySwitchConstants> KROT;
+    std::list<uint32_t> KROT_lru;
+    std::map<uint32_t,std::list<uint32_t>::iterator> KROT_lru_pos;
     uint32_t nKeygen=1; double tKeygen=0,tC2S=0,tEM=0,tS2C=0;
     // Lightweight standing diagnostic: splits C2S/S2C's per-diagonal loop body
     // into pt_to_eval_host (plaintext encode+GPU-NTT), rotate_ct_resident
@@ -81,7 +99,11 @@ int main(){
     auto NOW=[](){return std::chrono::steady_clock::now();};
     auto EL=[](auto a){return std::chrono::duration<double>(std::chrono::steady_clock::now()-a).count();};
     auto rotFull=[&](uint32_t k,uint32_t seed)->const gpufhe::KeySwitchConstants&{
-        auto it=KROT.find(k); if(it!=KROT.end())return it->second;
+        auto it=KROT.find(k);
+        if(it!=KROT.end()){
+            KROT_lru.erase(KROT_lru_pos[k]); KROT_lru.push_front(k); KROT_lru_pos[k]=KROT_lru.begin();
+            return it->second;
+        }
         auto _t=NOW();
         std::vector<uint64_t> sA=KPqp.s;
         gpufhe::automorphism_eval_host(sA,sizeQlP,n,k,modQP,rootQP);
@@ -90,7 +112,14 @@ int main(){
         for(uint32_t i=0;i<sizeQ;++i){K.rootModList.push_back(mod[i]);K.rootValList.push_back(root[i]);}
         for(uint32_t j=0;j<sizeP;++j){K.rootModList.push_back(modP[j]);K.rootValList.push_back(rootQP[sizeQ+j]);}
         gpufhe::evalkeygen_host_sold(K,KPqp.s,sA,KPqp.pkA,KPqp.pkB,PModq,modQP,rootQP,ns,3.19,seed);
-        ++nKeygen; tKeygen+=EL(_t); KROT.emplace(k,std::move(K)); return KROT[k]; };
+        ++nKeygen; tKeygen+=EL(_t);
+        if(KROT.size()>=KROT_CAP){
+            uint32_t victim=KROT_lru.back(); KROT_lru.pop_back();
+            KROT_lru_pos.erase(victim); KROT.erase(victim);
+        }
+        KROT.emplace(k,std::move(K));
+        KROT_lru.push_front(k); KROT_lru_pos[k]=KROT_lru.begin();
+        return KROT[k]; };
     auto atLevel=[&](const gpufhe::KeySwitchConstants& KF,uint32_t tw)->gpufhe::KeySwitchConstants{
         std::vector<uint64_t> ml(mod.begin(),mod.begin()+tw),rl(root.begin(),root.begin()+tw);
         gpufhe::KeySwitchConstants K; K.n=n;

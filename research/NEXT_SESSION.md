@@ -61,46 +61,73 @@ for repeated/interleaved measurement — never trust a single sequential run.
    Decrypted-coefficient error is a stable ~2000-3300 against a
    ~1e14-1e15 signal — consistent with ordinary keyswitch rounding noise.
 
-   **Next step (not yet started): build the actual multi-rotation
-   decompose-sharing mechanism.** Single-rotation correctness alone has
-   NO performance benefit over `rotate_ct_resident` (it does the same
-   work, just reordered). The real win requires: decompose(c1) ONCE
-   (`ks_accumulate_qp`'s steps 1-3, i.e. everything up to and including
-   the per-part `d_compl` basis conversion) and REUSE that decomposed
-   result across N different rotation indices in the SAME bootstrap
-   stage, paying only the cheap per-index cost (accumulate with that
-   index's key + automorphism + moddown) N times instead of paying full
-   decompose N times. This needs: (a) a way to cache/retain the
-   decomposed digits between `ks_accumulate_qp` calls for different keys
-   — NOT a change to `keyswitch_resident.cpp`'s logic, a NEW function/path
-   that factors step 1-3 (decompose) apart from step 4 (accumulate with a
-   specific key's bv/av), so step 4 can run multiple times against the
-   same decomposed digits; (b) verification that this factoring doesn't
-   change the result (bit-exact vs. the current monolithic
-   `ks_accumulate_qp`, since decompose-then-accumulate should be
-   EXACTLY equivalent to the current fused loop, no new approximation
-   introduced); (c) identify a real bootstrap stage that rotates the SAME
-   ciphertext by multiple indices in sequence (e.g. the BSGS-structured
-   C2S/S2C linear transforms) to actually exercise the shared-decompose
-   path; (d) interleaved A/B benchmark against the current
-   `rotate_ct_resident`-based implementation of that stage, thermal-
-   controlled, before claiming any speedup.
+   **Multi-rotation decompose-sharing mechanism: DONE, real measured win
+   (commit pending at time of writing — see git log for the actual hash).**
+   New, separate files (do NOT touch `src/keyswitch_resident.cpp`'s logic,
+   per the hard constraint): `include/keyswitch_hoist.h` +
+   `src/keyswitch_hoist.cpp` provide `hoist_digits_create`/
+   `hoist_digits_destroy`, `ks_decompose_only` (steps 1-3 of
+   `ks_accumulate_qp`, factored apart, storing per-part `d_compl` results
+   in a `HoistedDigits` struct instead of a single shared scratch buffer)
+   and `ks_accumulate_from_digits` (step 4 only, against a SPECIFIC
+   context's av/bv, reusing a previously-computed `HoistedDigits`).
+   `tests/test_hoist_multi.cpp` proves TWO things: (1) the decompose/
+   accumulate split is BIT-EXACT identical to the existing fused
+   `ks_accumulate_qp`, 0/524288 mismatches (the refactor itself changes
+   nothing); (2) decomposing c1 ONCE and reusing it across 6 different
+   rotation indices matches the proven ground truth within noise, same
+   magnitude (~2000-3300) as the single-rotation test. `bench/
+   bench_hoist_multi.cpp` measured the actual performance claim required
+   before trusting any speedup: interleaved A/B (baseline and hoisted
+   methods alternated every rep, 30 reps + 5 warmup, within one process
+   so GPU thermal drift is common-mode and cancels in the paired
+   difference, same statistical approach as `bench_resident_chain.cpp`) —
+   **N=5 rotation indices: baseline (5 independent full keyswitches)
+   median 94.49ms vs. hoisted (1 decompose + 5 cheap accumulates) median
+   46.32ms — a ~2.04x speedup, bootstrap 95% CI on the paired difference
+   [47.86, 48.60]ms, entirely excluding zero.** This is a real, clean win
+   at the micro-benchmark level, not noise.
 
-   Earlier design notes (`ks_decompose_once`/`PersistentDigits` from the
-   FIRST, different, also-abandoned hoisting attempt much earlier this
-   session) were mathematically fine for decompose-sharing itself, just
-   built around the wrong overall ordering — they are gone (reverted),
-   but the pattern (a struct holding the decomposed QP-basis digits,
-   produced once, consumed by N accumulate calls) is a reasonable
-   reference for the factoring in (a) above.
+   **Next step (not yet started): wire this into an actual bootstrap
+   stage and measure END-TO-END bootstrap time.** The micro-benchmark
+   above proves the mechanism works and is fast in isolation, but the
+   directive's bar for claiming a real win is full-bootstrap, interleaved
+   A/B, thermal-controlled measurement — not yet done. The natural target
+   is `tests/test_boot.cpp`'s C2S/S2C BSGS-structured rotation loops
+   (`rotFull`/`keyAt`/the per-diagonal `rotate_ct_resident` calls) —
+   within one baby-step bucket, several diagonals rotate the SAME base
+   ciphertext by different giant-step-scaled indices, exactly the
+   decompose-sharing opportunity this mechanism targets. Build this as a
+   SEPARATE code path in `test_boot.cpp` (or a new test_boot variant) so
+   the existing, trusted per-diagonal `rotate_ct_resident` path stays
+   available for the interleaved comparison; do not simply replace it.
 
-2. **Fix `KROT`'s own memory scaling — the blocker for n=131072.** 77
-   entries × 62.9MB at n=8192 (4.84GB) → 77.5GB at n=131072. `KSC` is
-   already fixed and is NOT the remaining problem. Needs a zero-copy
-   av/bv sharing mechanism (changes `KeySwitchConstants`'s field types —
-   broad blast radius, needs correctness review before trusting) or a
-   bigger architectural change (streaming). Not yet scoped in as much
-   detail as #1 above — do #1 first, it's better understood.
+2. **`KROT`'s own memory scaling — lever analysis DONE, safety-net
+   implemented, actual eviction tuning for n=131072 NOT yet done.** A
+   delegated investigation ruled out zero-copy host/device sharing with
+   direct code evidence (`ks_context_create` already re-uploads+frees
+   av/bv to device on EVERY call — there is no persistent device copy to
+   deduplicate; also VRAM 6GB < host RAM 10GB on this machine, so it
+   wouldn't help anyway), and rejected both BSGS/LST retuning (collides
+   with the fixed 1775-bit security budget; flagged as the highest
+   long-term-value lever, needs a dedicated session to re-derive the
+   scale-management chain safely) and numPart/alpha retuning (same
+   budget collision, PLUS surfaced a real pre-existing latent correctness
+   bug at alpha=10, `tests/test_alpha10.cpp`, previously undocumented).
+   Full analysis: `MEMORY_FEASIBILITY.md`'s "KROT lever analysis" section.
+   **Implemented**: `KROT_CAP` bounded LRU cache in `tests/test_boot.cpp`
+   (same pattern as the already-merged `KSC_CAP`), defaulted to 96 —
+   comfortably above the measured 77-entry n=8192 working set, so this
+   causes ZERO evictions and ZERO behavior change today (verified:
+   `test_boot` reproduces the exact same `max slot err = 5.47871e-4` and
+   peak RSS ~8.11GB as before this change). This is the SAFETY NET, not
+   yet a fix — at n=131072 the cap will need to be lowered well below the
+   full working set (infeasible at ~1GB/key × 77 keys), and doing so has
+   a real, measured regen cost (≈0.64s/key at n=8192, extrapolated
+   ≈10.9s/key at n=131072 — NOT measured at that scale) that must be
+   re-measured, not assumed free, once n=131072 is actually attempted
+   (item 3 below). Do not claim n=131072 is memory-feasible until that
+   measurement is done with a real cap chosen for that scale.
 
 3. **Run n=131072 end to end, once #2 above is fixed.** Keep the sparse
    secret (h=64) — no `keygen.cpp` change needed, per the corrected

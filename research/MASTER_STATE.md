@@ -94,6 +94,33 @@ rather than abandoned or faked.
    rotation indices in a bootstrap stage) is a separate mechanism, not
    yet built — see `NEXT_SESSION.md` priority queue item 1.
 
+8. **Multi-rotation decompose-sharing: DONE, real measured ~2.04x
+   speedup.** New, separate files `include/keyswitch_hoist.h` +
+   `src/keyswitch_hoist.cpp` (`keyswitch_resident.cpp` untouched).
+   `tests/test_hoist_multi.cpp`: bit-exact vs. the existing fused
+   `ks_accumulate_qp` (0/524288 mismatches), correct across 6 shared
+   rotation indices. `bench/bench_hoist_multi.cpp`: N=5 rotations,
+   interleaved A/B (30 reps), baseline median 94.49ms vs. hoisted median
+   46.32ms, bootstrap 95% CI on the paired difference [47.86,48.60]ms —
+   **entirely excludes zero, a real win, not noise.** Not yet wired into
+   the actual bootstrap's C2S/S2C stages — next step, see
+   `NEXT_SESSION.md` priority queue item 1.
+
+9. **`KROT` memory-scaling: lever analysis DONE, bounded-cache safety
+   net implemented.** Zero-copy ruled out with direct code evidence
+   (`ks_context_create` re-uploads+frees av/bv to device on every call —
+   no persistent device copy exists to deduplicate). BSGS/LST retuning
+   and numPart/alpha retuning both rejected for now (both collide with
+   the fixed 1775-bit security budget; alpha retuning additionally
+   surfaced a real, previously undocumented pre-existing bug at alpha=10,
+   `tests/test_alpha10.cpp`). `KROT_CAP=96` LRU bound added to
+   `tests/test_boot.cpp` (same pattern as the merged `KSC_CAP` fix),
+   verified ZERO behavior change at n=8192 (identical `max slot err =
+   5.47871e-4`, identical ~8.11GB peak RSS — cap never triggers, working
+   set stays at 77). This is the safety net for n=131072, not yet a
+   working fix at that scale — see `MEMORY_FEASIBILITY.md`'s "KROT lever
+   analysis" section for the measured regen-cost tradeoff numbers.
+
 ## The real, quantified blocker for n=131072
 
 Not GPU VRAM (181MB of 6144MB used — huge headroom). Not KSC anymore
@@ -130,9 +157,22 @@ report it as supported.**
 - [x] Correct-order rotation hoisting (ranked experiment #3), single-
   rotation correctness — DONE, `46998b7` (see above and
   `EXPERIMENT_LEDGER.md` entry #14).
-- [ ] Correct-order rotation hoisting, multi-rotation decompose-sharing
-  (the actual performance mechanism) — NOT yet built. See
-  `NEXT_SESSION.md` priority queue item 1.
+- [x] Correct-order rotation hoisting, multi-rotation decompose-sharing
+  — DONE. `include/keyswitch_hoist.h`+`src/keyswitch_hoist.cpp` (new,
+  separate files; `keyswitch_resident.cpp` untouched). Bit-exact vs. the
+  fused path (`tests/test_hoist_multi.cpp` check 1), correct across 6
+  shared rotation indices (check 2), and a REAL measured speedup:
+  **N=5 rotations, baseline median 94.49ms vs. hoisted median 46.32ms
+  (~2.04x), bootstrap 95% CI on the paired difference [47.86,48.60]ms,
+  excludes zero** (`bench/bench_hoist_multi.cpp`, interleaved A/B, 30
+  reps). Not yet wired into the real bootstrap's C2S/S2C stages — that
+  end-to-end measurement is the next step, see `NEXT_SESSION.md`.
+- [x] `KROT` memory-scaling lever analysis — DONE (zero-copy ruled out
+  with code evidence, BSGS/alpha retuning rejected for now, bounded-LRU
+  `KROT_CAP` implemented as the safety net, verified zero behavior
+  change at n=8192). NOT yet a fix for n=131072 — that needs the cap
+  actually lowered and the regen-cost tradeoff measured at that scale.
+  See `MEMORY_FEASIBILITY.md`.
 - [ ] Messaging track: architecture proposal complete and committed
   (`MESSAGING_ARCHITECTURE.md`); no implementation/prototype built (not
   requested as a build task, scoped as a proposal this session).

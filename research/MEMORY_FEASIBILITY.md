@@ -134,4 +134,79 @@ counter, not external polling) before being trusted — not yet done.
   measurement at n=8192; extrapolation to larger n is arithmetic, not yet
   empirically verified at those sizes.
 - Fine-grained (sub-2-second) VRAM peak measurement not yet done.
-- The bounded-cache redesign for KROT/KSC has not been implemented.
+- The bounded-cache redesign for KROT has not been implemented (see below
+  for the analysis that settles WHICH design to implement).
+
+## UPDATE: KROT lever analysis complete (delegated investigation) — zero-copy ruled out with code evidence, bounded-cache is the recommended next implementation
+
+A dedicated investigation (this session) read `ks_context_create`/
+`ks_context_destroy` directly and found: **every keyswitch call does a
+fresh `cudaMalloc`+`cudaMemcpyAsync` of the ENTIRE av/bv to device, then
+frees that device copy immediately after the call returns.** There is no
+persistent device-resident copy of any key at any time — the host
+`std::vector<std::vector<uint64_t>>` IS the only durable copy; the GPU
+side is pure per-call scratch. This settles option (a) above
+definitively: **zero-copy host/device sharing is not applicable — there
+is no second copy to deduplicate**, and separately, VRAM (6GB) < host RAM
+(10GB) on this machine anyway, so moving the single copy to device
+wouldn't even raise the ceiling. Reject (a).
+
+Two other levers were evaluated and rejected for now, both for reasons
+that touch currently-fixed, security-load-bearing budgets rather than
+being unsound in principle:
+
+- **BSGS/giant-step retuning in C2S/S2C** (fewer, larger rotation groups
+  → fewer distinct keys): a from-scratch Python/numpy simulation of this
+  codebase's exact `twd`/`applyMerged`/`stageDiags` BSGS structure,
+  cross-validated against the real measured run (predicted 76 rotation
+  keys for the CURRENT LST=3 split; the real run's instrumented
+  `evalkeygen calls total=77` = 76 rotation keys + 1 relin key, an exact
+  match), shows LST=12 (vs. current LST=3) would cut distinct keys
+  4096→24-ish down to **24 keys at the finest split, a ~3.2x reduction**.
+  **But** this needs 24 rescale levels for C2S+S2C combined vs. the
+  current 6, and `SECURITY_ASSESSMENT.md`'s n=131072/134-bit result holds
+  the ENTIRE modulus-chain shape fixed (`sizeQ=30, sizeP=2, numPart=15,
+  log2(QP)=1775 bits`) — covering 18 more rescale levels at the current
+  per-tower bit size would add >1000 bits to `log2(QP)`, which is exactly
+  the already-rejected "weaken security to save memory" move. Doing this
+  WITHOUT growing `log2(QP)` (more, smaller towers at fixed total budget)
+  is security-neutral in principle but requires re-deriving the entire
+  CKKS scale-management chain (`Delta_in`/`Delta_pt`/`Delta_w`), which
+  this codebase's own comments describe as extremely fragile to resize.
+  **This is the highest long-term value lever, but needs a dedicated
+  session to re-derive the scale chain safely — not attempted here.**
+- **numPart/alpha (dnum) retuning** (fewer, bigger digit groups → smaller
+  av/bv per key): directly collides with the same fixed 1775-bit budget
+  (bigger alpha needs bigger `sizeP` to keep the rounding-error bound
+  sound). Separately and more importantly: **`tests/test_alpha10.cpp`
+  already exists in this repo, isolating a reproducible correctness
+  failure at alpha=10 in a plaintext-multiply+rescale path with no
+  keyswitch involved at all** — a known, real numerical break in exactly
+  the direction this lever would push, previously undocumented in any
+  `research/*.md` file (confirmed via grep: zero mentions before now).
+  **Rejected for this reason, independent of the budget collision.**
+
+**Recommended next implementation: bound KROT itself with LRU eviction,
+same pattern as the already-merged `KSC_CAP` fix.** Measured this
+session: `evalkeygen calls total=77` took **49.3256s → ≈0.640s/key
+regen cost at n=8192** (sizeQl=30, numPart=15, sizeQlP=32). Every KROT
+key is used exactly twice per bootstrap (once in C2S, once in the
+mirrored S2C pass — by the end of C2S alone, 75 of the 77 keys are
+already live), so **any cap below ~76 forces real `evalkeygen_host_sold`
+regenerations, not cheap re-copies** — this is a genuine compute-for-
+memory trade, not a free win:
+
+| | n=8192 (measured regen cost) | n=131072 (extrapolated, NOT measured — assumes the same ~16x linear-in-n scaling already used elsewhere in this doc) |
+|---|---|---|
+| Per-key size | 62.9 MB | ≈1.0 GB |
+| Regen cost/key | ≈0.64s | ≈10.9s (extrapolated) |
+| Cap=40 example | saves (76-40)×62.9MB≈2.26GB, ≥36 forced regens ≈ +23s to a ~148s bootstrap | n/a |
+| Cap=8 example | n/a | fits in ~8GB of the 10GB ceiling; ≈68 forced regens ≈ +12 minutes (extrapolated) |
+
+This converts "OOM crash at n=131072" into "survives, but pays a large,
+honestly-uncertain compute tax" — it makes n=131072 FEASIBLE, not fast.
+Not yet implemented (the delegated investigation stopped short of
+implementing+building it due to a WSL2 filesystem I/O stall during this
+session, choosing to report the analysis rather than claim an unverified
+build/test result — correctly, per "never invent results"). This is the
+concrete next step for whoever picks up Objective B.
