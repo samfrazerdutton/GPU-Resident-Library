@@ -13,6 +13,7 @@
 #include <complex>
 #include <cmath>
 #include <map>
+#include <list>
 #include <functional>
 #include <chrono>
 #include <sys/resource.h>
@@ -245,14 +246,37 @@ int main(){
                 acc[d][ii]=u[ii]; } }
         offs.clear(); dg.clear();
         for(uint32_t d=0;d<S;++d) if(used[d]){offs.push_back(d);dg.push_back(acc[d]);} };
+    // KSC is a VIEW cache (atLevel() of a KROT full key) -- cheap to
+    // regenerate on a miss (pure CPU copy, no RNG, no evalkeygen_host call),
+    // unlike KROT itself (real keygen cost). Measured this session: KSC grew
+    // unbounded to 156 entries, each a full av/bv COPY (not a reference) at
+    // that level's numPart -- a real, measured contributor to this session's
+    // ~10.78GB peak host RSS at n=8192 (would scale ~16x at n=131072,
+    // catastrophically, if left unbounded). Bound it with LRU eviction: safe
+    // specifically because misses here are cheap, unlike KROT (left uncapped
+    // -- confirmed by instrumentation that ALL KROT entries get reused across
+    // the whole bootstrap, so capping it would force real re-keygen cost).
+    constexpr size_t KSC_CAP=48;
     std::map<uint64_t,gpufhe::KeySwitchConstants> KSC;
+    std::list<uint64_t> KSC_lru;   // front = most recently used
+    std::map<uint64_t,std::list<uint64_t>::iterator> KSC_lru_pos;
     auto keyAt=[&](uint32_t r,uint32_t tw)->gpufhe::KeySwitchConstants&{
-        uint64_t kk=((uint64_t)r<<8)|tw; auto it=KSC.find(kk); if(it!=KSC.end())return it->second;
+        uint64_t kk=((uint64_t)r<<8)|tw; auto it=KSC.find(kk);
+        if(it!=KSC.end()){
+            KSC_lru.erase(KSC_lru_pos[kk]); KSC_lru.push_front(kk); KSC_lru_pos[kk]=KSC_lru.begin();
+            return it->second;
+        }
         // alpha=2 tolerates key reuse across levels (the last part mismatches by
         // at most 1 tower); it is alpha=10 that breaks. So take a level VIEW of
         // one full-QP key instead of regenerating -- fresh keys per level cost
         // up to 105 keygens here with 14 parts.
-        KSC.emplace(kk,atLevel(rotFull(rotAmt(r),4000+r),tw)); return KSC[kk]; };
+        if(KSC.size()>=KSC_CAP){
+            uint64_t victim=KSC_lru.back(); KSC_lru.pop_back();
+            KSC_lru_pos.erase(victim); KSC.erase(victim);
+        }
+        KSC.emplace(kk,atLevel(rotFull(rotAmt(r),4000+r),tw));
+        KSC_lru.push_front(kk); KSC_lru_pos[kk]=KSC_lru.begin();
+        return KSC[kk]; };
     auto rescaleAt=[&](std::vector<uint64_t>& a0,std::vector<uint64_t>& a1,uint32_t tw){
         std::vector<uint64_t> ml(mod.begin(),mod.begin()+tw),rl(root.begin(),root.begin()+tw);
         gpufhe::KeySwitchConstants Kd; Kd.n=n;
@@ -274,6 +298,59 @@ int main(){
         cudaFree(d0);cudaFree(d1);cudaFree(sc2);cudaFree(dp2);gpufhe::ks_context_destroy(Cc);
         size_t T2b=(size_t)(tw-1)*n; a0.assign(g0.begin(),g0.begin()+T2b); a1.assign(g1.begin(),g1.begin()+T2b); };
 
+    // Stage-scoped resident rotation: hoists stream/DeviceKSWork/base-
+    // ciphertext residency out of the per-diagonal loop. Only the per-key
+    // DeviceKSContext av/bv upload remains per-diagonal (unavoidable).
+    struct StageRotCtx{
+        cudaStream_t s=0; gpufhe::DeviceKSWork W{};
+        uint64_t *d_base0=nullptr,*d_base1=nullptr,*d_w0=nullptr,*d_w1=nullptr;
+        uint64_t *d_scratch=nullptr,*d_b0=nullptr,*d_b1=nullptr; size_t cap=0;
+    };
+    auto stageRotBegin=[&](StageRotCtx& R,const std::vector<uint64_t>& c0,const std::vector<uint64_t>& c1,
+                          uint32_t towers,const gpufhe::KeySwitchConstants& anyKeyAtLevel){
+        size_t need=(size_t)towers*n*8;
+        if(need>R.cap){
+            if(R.d_base0){cudaFree(R.d_base0);cudaFree(R.d_base1);cudaFree(R.d_w0);cudaFree(R.d_w1);
+                          cudaFree(R.d_scratch);cudaFree(R.d_b0);cudaFree(R.d_b1);}
+            cudaMalloc(&R.d_base0,need);cudaMalloc(&R.d_base1,need);
+            cudaMalloc(&R.d_w0,need);cudaMalloc(&R.d_w1,need);
+            cudaMalloc(&R.d_scratch,(size_t)n*8);cudaMalloc(&R.d_b0,need);cudaMalloc(&R.d_b1,need);
+            R.cap=need;
+        }
+        cudaStreamCreate(&R.s);
+        gpufhe::DeviceKSContext Csize;
+        Csize.n=anyKeyAtLevel.n; Csize.sizeQl=anyKeyAtLevel.sizeQl; Csize.sizeP=anyKeyAtLevel.sizeP;
+        Csize.sizeQlP=anyKeyAtLevel.sizeQl+anyKeyAtLevel.sizeP; Csize.sizePart=anyKeyAtLevel.sizePart;
+        R.W=gpufhe::ks_work_create(Csize);
+        cudaMemcpyAsync(R.d_base0,c0.data(),need,cudaMemcpyHostToDevice,R.s);
+        cudaMemcpyAsync(R.d_base1,c1.data(),need,cudaMemcpyHostToDevice,R.s);
+    };
+    auto stageRotDiag=[&](StageRotCtx& R,std::vector<uint64_t>& out0,std::vector<uint64_t>& out1,
+                         uint32_t k,const gpufhe::KeySwitchConstants& Krot,uint32_t towers,
+                         const std::vector<uint64_t>& ml,const std::vector<uint64_t>& rl){
+        size_t B=(size_t)towers*n*8;
+        cudaMemcpyAsync(R.d_w0,R.d_base0,B,cudaMemcpyDeviceToDevice,R.s);
+        cudaMemcpyAsync(R.d_w1,R.d_base1,B,cudaMemcpyDeviceToDevice,R.s);
+        gpufhe::automorphism_eval_device(R.d_w0,towers,n,k,ml,rl,R.d_scratch,R.s);
+        gpufhe::automorphism_eval_device(R.d_w1,towers,n,k,ml,rl,R.d_scratch,R.s);
+        auto C=gpufhe::ks_context_create(Krot,R.s);
+        gpufhe::keyswitch_resident(R.d_w1,R.d_b0,R.d_b1,C,R.W,R.s);
+        gpufhe::ks_context_destroy(C);
+        out0.resize((size_t)towers*n); out1.resize((size_t)towers*n);
+        std::vector<uint64_t> ba0((size_t)towers*n);
+        cudaMemcpyAsync(out0.data(),R.d_w0,B,cudaMemcpyDeviceToHost,R.s);
+        cudaMemcpyAsync(ba0.data(),R.d_b0,B,cudaMemcpyDeviceToHost,R.s);
+        cudaMemcpyAsync(out1.data(),R.d_b1,B,cudaMemcpyDeviceToHost,R.s);
+        cudaStreamSynchronize(R.s);
+        for(uint32_t t=0;t<towers;++t){ uint64_t q=ml[t];
+            for(uint32_t kk=0;kk<n;++kk){ size_t x=(size_t)t*n+kk;
+                uint64_t s2=out0[x]+ba0[x]; out0[x]=(s2>=q)?s2-q:s2; } }
+    };
+    auto stageRotEnd=[&](StageRotCtx& R){
+        cudaStreamDestroy(R.s); R.s=0;
+        gpufhe::ks_work_destroy(R.W); R.W=gpufhe::DeviceKSWork{};
+    };
+
     std::vector<uint64_t> cs0=R0, cs1=R1;
     uint32_t ctw=sizeQ; double csc=(double)q0;      // declared input scale
     uint32_t ndiagTot=0;
@@ -291,19 +368,22 @@ int main(){
         // scale FLAT through the intermediate stages by encoding at the modulus
         // being dropped; only the last stage does the 2^60 -> 2^50 step.
         const double dpt = (g+1<LST) ? (double)mod[ctw-1] : Delta_pt;
+        StageRotCtx R; stageRotBegin(R,cs0,cs1,ctw,keyAt(offs[0],ctw));
         for(size_t x=0;x<offs.size();++x){
             auto _tp=NOW();
             std::vector<int64_t> md; gpufhe::encode_host(md,dg[x],n,dpt);
             std::vector<uint64_t> dE; gpufhe::pt_to_eval_host(dE,md,ctw,n,ml,rl);
             g_tPtEval+=EL(_tp);
-            std::vector<uint64_t> t0=cs0,t1=cs1;
+            std::vector<uint64_t> t0,t1;
             auto _tr=NOW();
-            if(offs[x]) gpufhe::rotate_ct_resident(t0,t1,rotAmt(offs[x]),keyAt(offs[x],ctw),ctw,n,ml,rl);
+            if(offs[x]) stageRotDiag(R,t0,t1,rotAmt(offs[x]),keyAt(offs[x],ctw),ctw,ml,rl);
+            else { t0=cs0; t1=cs1; }
             g_tRot+=EL(_tr);
             auto _ta=NOW();
             gpufhe::ct_mul_pt_host(t0,t1,dE,ctw,n,ml);
             if(fst){a0=t0;a1=t1;fst=false;} else gpufhe::ct_add_ct_host(a0,a1,t0,t1,ctw,n,ml);
             g_tCpuAcc+=EL(_ta); }
+        stageRotEnd(R);
         rescaleAt(a0,a1,ctw);
         std::cerr<<"    C2S stage "<<g<<" tw="<<ctw<<" parts="<<npFor(ctw)
                  <<" diags="<<offs.size()<<" keys="<<KSC.size()<<" t="<<EL(_t)<<"s\n";
@@ -577,7 +657,8 @@ int main(){
         if((uint32_t)g==LST-1){ srcs0={{&oR.c0,cd{1,0}},{&oI.c0,cd{0,1}}};
                                 srcs1={{&oR.c1,cd{1,0}},{&oI.c1,cd{0,1}}}; }
         else { srcs0={{&sa0,cd{1,0}}}; srcs1={{&sa1,cd{1,0}}}; }
-        for(size_t q2=0;q2<srcs0.size();++q2)
+        for(size_t q2=0;q2<srcs0.size();++q2){
+          StageRotCtx R; stageRotBegin(R,*srcs0[q2].first,*srcs1[q2].first,stw,keyAt(offs[0],stw));
           for(size_t x=0;x<offs.size();++x){
             auto _tp=NOW();
             std::vector<cd> dd(S);
@@ -585,14 +666,16 @@ int main(){
             std::vector<int64_t> md; gpufhe::encode_host(md,dd,n,dpt);
             std::vector<uint64_t> dE; gpufhe::pt_to_eval_host(dE,md,stw,n,ml,rl);
             g_tPtEval+=EL(_tp);
-            std::vector<uint64_t> t0=*srcs0[q2].first, t1=*srcs1[q2].first;
+            std::vector<uint64_t> t0,t1;
             auto _tr=NOW();
-            if(offs[x]) gpufhe::rotate_ct_resident(t0,t1,rotAmt(offs[x]),keyAt(offs[x],stw),stw,n,ml,rl);
+            if(offs[x]) stageRotDiag(R,t0,t1,rotAmt(offs[x]),keyAt(offs[x],stw),stw,ml,rl);
+            else { t0=*srcs0[q2].first; t1=*srcs1[q2].first; }
             g_tRot+=EL(_tr);
             auto _ta=NOW();
             gpufhe::ct_mul_pt_host(t0,t1,dE,stw,n,ml);
             if(fst){a0=t0;a1=t1;fst=false;} else gpufhe::ct_add_ct_host(a0,a1,t0,t1,stw,n,ml);
             g_tCpuAcc+=EL(_ta); }
+          stageRotEnd(R); }
         rescaleAt(a0,a1,stw);
         std::cerr<<"    S2C stage "<<g<<" tw="<<stw<<" parts="<<npFor(stw)
                  <<" diags="<<offs.size()<<" keys="<<KSC.size()<<" t="<<EL(_t)<<"s\n";
