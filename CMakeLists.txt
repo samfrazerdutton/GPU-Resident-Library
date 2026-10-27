@@ -111,13 +111,12 @@ gpufhe_test(test_stage_acc tests/test_stage_acc.cpp)
 gpufhe_test(test_ntt_batched tests/test_ntt_batched.cpp)
 gpufhe_test(test_intt_batched tests/test_intt_batched.cpp)
 gpufhe_test(test_automorph_eval_fast tests/test_automorph_eval_fast.cpp)
-# test_hoist_single.cpp intentionally NOT registered as a normal test: it is
-# a known-FAILING, documented reference for an in-progress experiment (see
-# research/NEXT_SESSION.md and research/EXPERIMENT_LEDGER.md). Build it
-# explicitly with: cmake --build . --target test_hoist_single
-if(GPUFHE_BUILD_EXPERIMENTAL_TESTS)
-  gpufhe_test(test_hoist_single tests/test_hoist_single.cpp)
-endif()
+# test_hoist_single.cpp: correct-order rotation-hoisting single-rotation
+# correctness test (see research/NEXT_SESSION.md). Previously gated out as
+# a known-failing reference while the key-generation convention was
+# unresolved; now passes 27/27 cases (3 ciphertexts x 9 rotation indices,
+# decrypted-plaintext comparison) and is promoted to the default suite.
+gpufhe_test(test_hoist_single tests/test_hoist_single.cpp)
 gpufhe_test(test_keyreuse tests/test_keyreuse.cpp)
 gpufhe_test(bench_resident_chain bench/bench_resident_chain.cpp)
 gpufhe_test(bench_batch bench/bench_batch.cpp)
