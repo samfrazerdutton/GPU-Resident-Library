@@ -145,12 +145,18 @@ static int row_of(const DeviceKSContext& C, uint64_t q){
     throw std::runtime_error("no root table for modulus");
 }
 
-void keyswitch_resident(const uint64_t* d_a, uint64_t* d_ba0, uint64_t* d_ba1,
-                        const DeviceKSContext& C, DeviceKSWork& W, cudaStream_t s)
+// Mechanical extraction from the original monolithic keyswitch_resident
+// (same body, zero logic change) -- creates a callable seam between the
+// QP-basis accumulate step and moddown, so a caller can insert work (e.g.
+// applying an automorphism to the QP-basis accumulator) in between. Added
+// to support correct-order rotation hoisting (see research/NEXT_SESSION.md);
+// keyswitch_resident below is now a thin wrapper and is UNCHANGED in
+// behavior -- verified via the existing test_ks_resident/test_rot_resident/
+// test_boot suite, not just asserted.
+void ks_accumulate_qp(const uint64_t* d_a, const DeviceKSContext& C, DeviceKSWork& W, cudaStream_t s)
 {
-    const uint32_t n=C.n, sizeQl=C.sizeQl, sizeP=C.sizeP, sizeQlP=C.sizeQlP;
+    const uint32_t n=C.n, sizeQl=C.sizeQl, sizeQlP=C.sizeQlP;
     const uint32_t delta=C.fullQ - sizeQl;
-    const size_t B=(size_t)n*8;
 
     cudaMemsetAsync(W.d_res0,0,(size_t)sizeQlP*n*8,s);
     cudaMemsetAsync(W.d_res1,0,(size_t)sizeQlP*n*8,s);
@@ -227,51 +233,64 @@ void keyswitch_resident(const uint64_t* d_a, uint64_t* d_ba0, uint64_t* d_ba1,
                                    C.d_keyRow, C.d_modsQlP, sizeQlP, n, s);
         }
     }
+}
 
-    // moddown QlP->Q on res0 -> ba0, res1 -> ba1
-    auto moddown=[&](uint64_t* d_res, uint64_t* d_out){
-        cudaMemcpyAsync(W.d_pwork, d_res+(size_t)sizeQl*n, (size_t)sizeP*n*8,
-                        cudaMemcpyDeviceToDevice, s);
-        {
-            std::vector<const uint64_t*> hir(sizeP),hip(sizeP);
-            std::vector<uint64_t> hmod(sizeP),hninv(sizeP),hninvp(sizeP);
-            for(uint32_t j=0;j<sizeP;++j){
-                uint64_t q=C.pModHost[j]; int r=row_of(C,q);
-                hir[j]=C.d_ir[r]; hip[j]=C.d_ip[r];
-                hmod[j]=q; hninv[j]=C.ninv[r]; hninvp[j]=C.ninv_p[r];
-            }
-            cudaMemcpyAsync(W.d_rootsA,hir.data(),sizeP*sizeof(uint64_t*),cudaMemcpyHostToDevice,s);
-            cudaMemcpyAsync(W.d_rootsB,hip.data(),sizeP*sizeof(uint64_t*),cudaMemcpyHostToDevice,s);
-            cudaMemcpyAsync(W.d_towerMods,hmod.data(),sizeP*8,cudaMemcpyHostToDevice,s);
-            cudaMemcpyAsync(W.d_nInv,hninv.data(),sizeP*8,cudaMemcpyHostToDevice,s);
-            cudaMemcpyAsync(W.d_nInvPrecon,hninvp.data(),sizeP*8,cudaMemcpyHostToDevice,s);
-            LaunchINTT_GS_Batched(W.d_pwork, W.d_rootsA, W.d_rootsB, W.d_towerMods,
-                                  W.d_nInv, W.d_nInvPrecon, sizeP, n, s);
+// Mechanical extraction (same body as the original inline moddown lambda,
+// zero logic change) -- the other half of the seam described above.
+void ks_moddown(const DeviceKSContext& C, DeviceKSWork& W,
+                uint64_t* d_res, uint64_t* d_out, cudaStream_t s)
+{
+    const uint32_t n=C.n, sizeQl=C.sizeQl, sizeP=C.sizeP;
+    cudaMemcpyAsync(W.d_pwork, d_res+(size_t)sizeQl*n, (size_t)sizeP*n*8,
+                    cudaMemcpyDeviceToDevice, s);
+    {
+        std::vector<const uint64_t*> hir(sizeP),hip(sizeP);
+        std::vector<uint64_t> hmod(sizeP),hninv(sizeP),hninvp(sizeP);
+        for(uint32_t j=0;j<sizeP;++j){
+            uint64_t q=C.pModHost[j]; int r=row_of(C,q);
+            hir[j]=C.d_ir[r]; hip[j]=C.d_ip[r];
+            hmod[j]=q; hninv[j]=C.ninv[r]; hninvp[j]=C.ninv_p[r];
         }
-        LaunchApproxSwitchCRTBasis(W.d_pwork, W.d_qsw,
-            C.d_pHatInv, C.d_pHatInvPrec, C.d_pMod,
-            C.d_pHatModq, C.d_qMod, C.d_mdMuLo, C.d_mdMuHi,
-            sizeP, sizeQl, n, s);
-        {
-            std::vector<const uint64_t*> hfr(sizeQl),hfp(sizeQl);
-            std::vector<uint64_t> hmod(sizeQl);
-            for(uint32_t i=0;i<sizeQl;++i){
-                uint64_t q=C.qModHost[i]; int r=row_of(C,q);
-                hfr[i]=C.d_fr[r]; hfp[i]=C.d_fp[r]; hmod[i]=q;
-            }
-            cudaMemcpyAsync(W.d_rootsA,hfr.data(),sizeQl*sizeof(uint64_t*),cudaMemcpyHostToDevice,s);
-            cudaMemcpyAsync(W.d_rootsB,hfp.data(),sizeQl*sizeof(uint64_t*),cudaMemcpyHostToDevice,s);
-            cudaMemcpyAsync(W.d_towerMods,hmod.data(),sizeQl*8,cudaMemcpyHostToDevice,s);
-            LaunchNTT_CT_Batched(W.d_qsw, W.d_rootsA, W.d_rootsB, W.d_towerMods, sizeQl, n, s);
-        }
+        cudaMemcpyAsync(W.d_rootsA,hir.data(),sizeP*sizeof(uint64_t*),cudaMemcpyHostToDevice,s);
+        cudaMemcpyAsync(W.d_rootsB,hip.data(),sizeP*sizeof(uint64_t*),cudaMemcpyHostToDevice,s);
+        cudaMemcpyAsync(W.d_towerMods,hmod.data(),sizeP*8,cudaMemcpyHostToDevice,s);
+        cudaMemcpyAsync(W.d_nInv,hninv.data(),sizeP*8,cudaMemcpyHostToDevice,s);
+        cudaMemcpyAsync(W.d_nInvPrecon,hninvp.data(),sizeP*8,cudaMemcpyHostToDevice,s);
+        LaunchINTT_GS_Batched(W.d_pwork, W.d_rootsA, W.d_rootsB, W.d_towerMods,
+                              W.d_nInv, W.d_nInvPrecon, sizeP, n, s);
+    }
+    LaunchApproxSwitchCRTBasis(W.d_pwork, W.d_qsw,
+        C.d_pHatInv, C.d_pHatInvPrec, C.d_pMod,
+        C.d_pHatModq, C.d_qMod, C.d_mdMuLo, C.d_mdMuHi,
+        sizeP, sizeQl, n, s);
+    {
+        std::vector<const uint64_t*> hfr(sizeQl),hfp(sizeQl);
+        std::vector<uint64_t> hmod(sizeQl);
         for(uint32_t i=0;i<sizeQl;++i){
-            uint64_t q=C.qModHost[i];
-            LaunchModDownCombine(d_out+(size_t)i*n, d_res+(size_t)i*n,
-                                 W.d_qsw+(size_t)i*n, C.pInvModqHost[i], q, n, s);
+            uint64_t q=C.qModHost[i]; int r=row_of(C,q);
+            hfr[i]=C.d_fr[r]; hfp[i]=C.d_fp[r]; hmod[i]=q;
         }
-    };
-    moddown(W.d_res0, d_ba0);
-    moddown(W.d_res1, d_ba1);
+        cudaMemcpyAsync(W.d_rootsA,hfr.data(),sizeQl*sizeof(uint64_t*),cudaMemcpyHostToDevice,s);
+        cudaMemcpyAsync(W.d_rootsB,hfp.data(),sizeQl*sizeof(uint64_t*),cudaMemcpyHostToDevice,s);
+        cudaMemcpyAsync(W.d_towerMods,hmod.data(),sizeQl*8,cudaMemcpyHostToDevice,s);
+        LaunchNTT_CT_Batched(W.d_qsw, W.d_rootsA, W.d_rootsB, W.d_towerMods, sizeQl, n, s);
+    }
+    for(uint32_t i=0;i<sizeQl;++i){
+        uint64_t q=C.qModHost[i];
+        LaunchModDownCombine(d_out+(size_t)i*n, d_res+(size_t)i*n,
+                             W.d_qsw+(size_t)i*n, C.pInvModqHost[i], q, n, s);
+    }
+}
+
+// keyswitch_resident: unchanged behavior, now a thin wrapper over the two
+// pieces above (verified via test_ks_resident/test_rot_resident/test_boot,
+// not just asserted).
+void keyswitch_resident(const uint64_t* d_a, uint64_t* d_ba0, uint64_t* d_ba1,
+                        const DeviceKSContext& C, DeviceKSWork& W, cudaStream_t s)
+{
+    ks_accumulate_qp(d_a, C, W, s);
+    ks_moddown(C, W, W.d_res0, d_ba0, s);
+    ks_moddown(C, W, W.d_res1, d_ba1, s);
 }
 
 void rescale_resident_raw(uint64_t* d_c, uint32_t towers,

@@ -48,6 +48,17 @@ DeviceKSWork    ks_work_create(const DeviceKSContext& C);
 void ks_context_destroy(DeviceKSContext& C);
 void ks_work_destroy(DeviceKSWork& W);
 
+// The two halves keyswitch_resident (below) composes unchanged. Exposed as
+// a seam for correct-order rotation hoisting (see research/NEXT_SESSION.md):
+// a caller can run ks_accumulate_qp, modify W.d_res0/d_res1 in place (e.g.
+// apply an automorphism -- the result is QP-basis, sizeQlP towers, eval
+// domain), then call ks_moddown -- composing to something OTHER than plain
+// keyswitch_resident's behavior, while keyswitch_resident itself stays
+// byte-for-byte identical to before this seam existed.
+void ks_accumulate_qp(const uint64_t* d_a, const DeviceKSContext& C, DeviceKSWork& W, cudaStream_t s);
+void ks_moddown(const DeviceKSContext& C, DeviceKSWork& W,
+                uint64_t* d_res, uint64_t* d_out, cudaStream_t s);
+
 // Fully resident Hybrid keyswitch: d_a (sizeQl*n eval, DEVICE) -> d_ba0/d_ba1
 // (sizeQl*n, DEVICE, preallocated by caller). Pure kernel launches + DtoD
 // copies on `s`; no malloc, no host transfer. Caller syncs the stream.
