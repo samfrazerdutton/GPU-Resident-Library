@@ -1,14 +1,15 @@
 // End-to-end validation of correct-order rotation hoisting (research/
-// NEXT_SESSION.md priority queue item 1's "next step") against a REAL
-// bootstrap stage, not synthetic rotation indices. Identical to
-// test_boot.cpp up through C2S stage 0, where it computes a SECOND,
-// hoisted-mechanism version of that same stage's result (own fresh
-// hoisted-convention keys, no cache advantage over the trusted path),
-// compares the two, reports the keygen+compute cost of each, and exits
-// -- it does not run the rest of the bootstrap (EvalMod/S2C), since the
-// question this answers is narrowly "does hoisting work and help on a
-// REAL stage's REAL diagonal structure," not "does the whole bootstrap
-// still work" (already covered by test_boot.cpp itself, unmodified).
+// NEXT_SESSION.md priority queue item 1's "next step") against REAL
+// bootstrap stages, not synthetic rotation indices. Identical to
+// test_boot.cpp through ModRaise, then for EACH of the 3 real C2S
+// stages it computes a SECOND, hoisted-mechanism version of that
+// stage's result (own fresh hoisted-convention keys, no cache
+// advantage over the trusted path), compares the two, reports the
+// keygen+compute cost of each, then exits after C2S -- it does not run
+// the rest of the bootstrap (EvalMod/S2C), since the question this
+// answers is narrowly "does hoisting work and help on REAL stages'
+// REAL diagonal structure," not "does the whole bootstrap still work"
+// (already covered by test_boot.cpp itself, unmodified).
 //
 // FULL COMPOSED BOOTSTRAP: ModRaise -> C2S -> real/imag split.
 // Declared input scale s_in = q0, so C2S slots come out as y_k = a_k/q0 =
@@ -408,8 +409,10 @@ int main(){
     std::vector<uint64_t> cs0=R0, cs1=R1;
     uint32_t ctw=sizeQ; double csc=(double)q0;      // declared input scale
     uint32_t ndiagTot=0;
+    double totalHoistT=0, totalTrustT=0; bool anyFail=false;
     { auto _t=NOW();
       for(uint32_t g=0;g<LST;++g){
+        auto _tstage=NOW();
         std::vector<uint32_t> offs; std::vector<std::vector<cd>> dg;
         stageDiags(g,offs,dg); ndiagTot+=(uint32_t)offs.size();
         std::vector<uint64_t> ml(mod.begin(),mod.begin()+ctw),rl(root.begin(),root.begin()+ctw);
@@ -437,7 +440,8 @@ int main(){
             gpufhe::ct_mul_pt_host(t0,t1,dE,ctw,n,ml);
             if(fst){a0=t0;a1=t1;fst=false;} else gpufhe::ct_add_ct_host(a0,a1,t0,t1,ctw,n,ml);
             g_tCpuAcc+=EL(_ta); }
-        if(g==0){
+        {   // validate + benchmark hoisting against THIS stage's real,
+            // live state -- every C2S stage, not just stage 0.
             // ---- HOISTED VALIDATION against the REAL, live C2S stage 0
             // state (research/NEXT_SESSION.md priority queue item 1's
             // "next step"). Decompose cs1 (the actual bootstrap ciphertext
@@ -463,7 +467,6 @@ int main(){
             double tDecomposeOnce=EL(t0h);
 
             std::vector<uint64_t> a0h(TT,0),a1h(TT,0); bool fsth=true;
-            std::vector<uint64_t> a0g(TT,0),a1g(TT,0); bool fstg=true;
             double tHoistKeygen=0, tHoistCompute=0;
             uint32_t sizeQlP_loc=ctw+sizeP;
             uint64_t *d_scratch_qp; cudaMalloc(&d_scratch_qp,(size_t)sizeQlP_loc*n*8);
@@ -506,57 +509,8 @@ int main(){
                     gpufhe::ks_work_destroy(Wk); gpufhe::ks_context_destroy(Ck);
                     tHoistCompute+=EL(_tc);
                 } else { t0=cs0; t1=cs1; }
-                // Parallel re-computed-trusted accumulation (gt0,gt1, summed
-                // into a0g,a1g the SAME way a0h,a1h accumulates) -- isolates
-                // whether a mismatch is in the per-diagonal keyswitch (would
-                // show here, comparing against t0,t1 directly) or purely in
-                // how the OFFICIAL a0,a1 (computed by the earlier, unmodified
-                // x-loop using a shared StageRotCtx) relates to a fresh
-                // per-diagonal recomputation.
-                std::vector<uint64_t> gt0,gt1;
-                if(offs[x]){
-                    StageRotCtx Rdbg; stageRotBegin(Rdbg,cs0,cs1,ctw,keyAt(offs[x],ctw));
-                    stageRotDiag(Rdbg,gt0,gt1,rotAmt(offs[x]),keyAt(offs[x],ctw),ctw,ml,rl);
-                    stageRotEnd(Rdbg);
-                    std::vector<int64_t> dmg,dmh;
-                    gpufhe::decrypt_host(dmg,gt0,gt1,KPq.s,n,ml,rl);
-                    gpufhe::decrypt_host(dmh,t0,t1,KPq.s,n,ml,rl);
-                    int64_t dmaxAbs=0,dmaxDiff=0;
-                    for(size_t i=0;i<dmg.size();++i){
-                        int64_t av=(dmg[i]<0?-dmg[i]:dmg[i]); if(av>dmaxAbs)dmaxAbs=av;
-                        int64_t dd=dmg[i]-dmh[i]; if(dd<0)dd=-dd; if(dd>dmaxDiff)dmaxDiff=dd; }
-                    std::cout<<"  [debug] isolated diag x="<<x<<" offs[x]="<<offs[x]
-                              <<" trusted-vs-hoisted maxAbs="<<dmaxAbs<<" maxDiff="<<dmaxDiff<<"\n";
-                } else { gt0=cs0; gt1=cs1; }
-                gpufhe::ct_mul_pt_host(gt0,gt1,dE,ctw,n,ml);
-                if(fstg){a0g=gt0;a1g=gt1;fstg=false;} else gpufhe::ct_add_ct_host(a0g,a1g,gt0,gt1,ctw,n,ml);
                 gpufhe::ct_mul_pt_host(t0,t1,dE,ctw,n,ml);
                 if(fsth){a0h=t0;a1h=t1;fsth=false;} else gpufhe::ct_add_ct_host(a0h,a1h,t0,t1,ctw,n,ml);
-            }
-            {
-                // decrypt_host returns int64_t; the PRE-rescale accumulated
-                // product (16 ciphertext*plaintext multiplies summed, never
-                // meant to be decrypted directly -- rescaleAt always runs
-                // immediately after this sum in the real pipeline) sits at
-                // a combined scale that can exceed what int64_t represents,
-                // so compare AFTER rescale (on copies), matching what every
-                // real downstream consumer of this stage's output actually
-                // sees.
-                auto a0o2=a0,a1o2=a1, a0r2=a0g,a1r2=a1g, a0h2c=a0h,a1h2c=a1h;
-                rescaleAt(a0o2,a1o2,ctw); rescaleAt(a0r2,a1r2,ctw); rescaleAt(a0h2c,a1h2c,ctw);
-                std::vector<uint64_t> mlr(mod.begin(),mod.begin()+ctw-1),rlr(root.begin(),root.begin()+ctw-1);
-                std::vector<int64_t> mo,mr,mh2;
-                gpufhe::decrypt_host(mo,a0o2,a1o2,KPq.s,n,mlr,rlr);
-                gpufhe::decrypt_host(mr,a0r2,a1r2,KPq.s,n,mlr,rlr);
-                gpufhe::decrypt_host(mh2,a0h2c,a1h2c,KPq.s,n,mlr,rlr);
-                int64_t d_or=0,d_rh=0,maxA=0;
-                for(size_t i=0;i<mo.size();++i){
-                    int64_t av=(mo[i]<0?-mo[i]:mo[i]); if(av>maxA)maxA=av;
-                    int64_t a=mo[i]-mr[i]; if(a<0)a=-a; if(a>d_or)d_or=a;
-                    int64_t b=mr[i]-mh2[i]; if(b<0)b=-b; if(b>d_rh)d_rh=b; }
-                std::cout<<"  [debug] three-way (POST-rescale): maxAbs="<<maxA
-                          <<" |official-recomputedTrusted|="<<d_or
-                          <<" |recomputedTrusted-hoisted|="<<d_rh<<"\n";
             }
             cudaFree(d_cs0); cudaFree(d_cs1); cudaFree(d_scratch_qp);
             gpufhe::hoist_digits_destroy(Dh);
@@ -572,16 +526,15 @@ int main(){
                 int64_t av=(mg[i]<0?-mg[i]:mg[i]); if(av>maxAbs)maxAbs=av;
                 int64_t dd=mg[i]-mh[i]; if(dd<0)dd=-dd; if(dd>maxDiff)maxDiff=dd; }
             bool ok = maxDiff < (maxAbs>>18) + (1LL<<32);
-            std::cout<<"\n=== HOISTED C2S STAGE 0 VALIDATION (real bootstrap state) ===\n";
+            double hoistTotal=tDecomposeOnce+tHoistKeygen+tHoistCompute, trustTotal=EL(_tstage);
+            totalHoistT+=hoistTotal; totalTrustT+=trustTotal; if(!ok) anyFail=true;
+            std::cout<<"\n=== HOISTED C2S STAGE "<<g<<" VALIDATION (real bootstrap state) ===\n";
             std::cout<<"  trusted vs hoisted decrypted maxAbs="<<maxAbs<<" maxDiff="<<maxDiff
                       <<(ok?" [MATCH within noise]":" [MISMATCH]")<<"\n";
             std::cout<<"  hoisted: decompose-once="<<tDecomposeOnce<<"s  keygen("<<offs.size()<<" keys, fresh)="
-                      <<tHoistKeygen<<"s  compute="<<tHoistCompute<<"s  total="
-                      <<(tDecomposeOnce+tHoistKeygen+tHoistCompute)<<"s\n";
-            std::cout<<"  trusted: elapsed since C2S start="<<EL(_t)<<"s (stage 0 is the first work done,"
-                      <<" so this is ~stage 0's own cost; includes fresh keygen via keyAt)\n";
-            std::cout<<(ok?"[PASS]":"[FAIL]")<<" stage-0 hoisting validation against the REAL bootstrap state\n";
-            return ok?0:1;
+                      <<tHoistKeygen<<"s  compute="<<tHoistCompute<<"s  total="<<hoistTotal<<"s\n";
+            std::cout<<"  trusted: this stage's own elapsed="<<trustTotal<<"s (includes fresh keygen via keyAt)\n";
+            std::cout<<(ok?"[PASS]":"[FAIL]")<<" stage "<<g<<" hoisting validation against the REAL bootstrap state\n";
         }
         stageRotEnd(R);
         rescaleAt(a0,a1,ctw);
@@ -593,6 +546,11 @@ int main(){
              <<" diagonals vs "<<S<<" dense, rotation keys="<<KSC.size()<<"\n";
     std::cout<<"  [mem] after C2S: KROT="<<KROT.size()<<" KSC="<<KSC.size()
              <<" peak RSS="<<rssMB()<<" MB\n";
+    std::cout<<"\n=== HOISTING ACROSS ALL "<<LST<<" C2S STAGES ===\n";
+    std::cout<<"  total hoisted="<<totalHoistT<<"s  total trusted="<<totalTrustT<<"s  speedup="
+              <<(totalTrustT/totalHoistT)<<"x\n";
+    std::cout<<(anyFail?"[FAIL]":"[PASS]")<<" all C2S stages hoisting validation against the REAL bootstrap state\n";
+    return anyFail?1:0;
     uint32_t nt=ctw; size_t T2=(size_t)nt*n; (void)T2;
     std::vector<uint64_t> y0=cs0,y1=cs1;
     const double sOut=csc;

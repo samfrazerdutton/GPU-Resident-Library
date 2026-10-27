@@ -130,8 +130,29 @@ for repeated/interleaved measurement — never trust a single sequential run.
    the mechanism. Always rescale before decrypting an intermediate
    stage's accumulator.
 
-   **Next step: extend from "validated on stage 0 in isolation" to "wired
-   into the live, full bootstrap across all 6 C2S+S2C stages."** This
+   **Reproduced**: re-ran stage 0's validation a second time independently
+   — [PASS] again, maxDiff=613 (bit-identical to the first run, since
+   decrypted noise from a deterministic pipeline is itself deterministic),
+   ~3.0x-3.4x speedup across the two runs (normal thermal/timing variance,
+   not a correctness concern). Extended `tests/test_hoist_stage0.cpp` to
+   attempt ALL 3 C2S stages in one run (not just stage 0) — it OOM'd
+   entering stage 1 (31 diagonals vs stage 0's 16) on BOTH attempts, after
+   stage 0 itself passed cleanly both times. This is consistent with
+   this session's established ~10GB ceiling being tight even at n=8192
+   when stacking: the trusted path's own `KROT`/`KSC` caches accumulating
+   across multiple stages' worth of keys, PLUS the hoisted path's fresh,
+   uncached per-diagonal key generation (by design, for a fair
+   no-cache-advantage comparison) adds real additional pressure on top.
+   Not chased further — the single-stage result (now reproduced twice)
+   is strong enough evidence for this round; a multi-stage or full-C2S
+   validation run should get a dedicated memory budget (e.g. an
+   explicit bounded cache for the hoisted path's own temporary keys, or
+   running stages one-at-a-time in separate processes) rather than
+   accumulating unbounded across stages in one process.
+
+   **Next step: extend from "validated on stage 0 (reproduced twice) in
+   isolation" to "wired into the live, full bootstrap across all 6
+   C2S+S2C stages."** This
    needs a real architectural decision, not a quick swap — `test_boot.cpp`'s
    `rotFull`/`keyAt`/`KROT`/`KSC` build and cache TEXTBOOK-convention
    keys (permute the payload secret by `k`); the hoisted mechanism needs
