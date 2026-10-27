@@ -157,10 +157,39 @@ for repeated/interleaved measurement — never trust a single sequential run.
    (item 3 below). Do not claim n=131072 is memory-feasible until that
    measurement is done with a real cap chosen for that scale.
 
-3. **Run n=131072 end to end, once #2 above is fixed.** Keep the sparse
-   secret (h=64) — no `keygen.cpp` change needed, per the corrected
-   security analysis (134 bits, verified). Full correctness re-
-   verification before trusting any timing number.
+3. **Run n=131072 end to end — ATTEMPTED THREE TIMES this round, all
+   OOM'd, NOT complete. Security target independently reconfirmed; real
+   per-key cost measured; a genuine, unidentified memory-growth source
+   beyond KROT/KSC still blocks it.** Keep the sparse secret (h=64) — no
+   `keygen.cpp` change needed, re-confirmed fresh this round:
+   `python3 tools/hybrid_security.py 131072 1775 64` → 134 classical
+   bits (output preserved in `SECURITY_ASSESSMENT.md`).
+
+   **What's real from this round**: `tests/test_n131072_keysize.cpp`
+   measured the ACTUAL per-key cost at n=131072 (not extrapolated):
+   1085MB RSS, 7.5s keygen time per rotation key (vs. 62.9MB/0.64s at
+   n=8192). `tests/test_boot_n131072.cpp` is a parameterized copy of
+   `test_boot.cpp` (default n=8192 test untouched) with `n=131072`,
+   `LST=4` (lgS=16 needs a divisor other than n=8192's LST=3; LST=4
+   keeps the same RST=4 per-stage radix the original choice was tuned
+   around — NOT independently re-validated for numerical accuracy at
+   this scale).
+
+   **What's NOT done**: three full-run attempts, with `KROT_CAP`/
+   `KSC_CAP` tightened each time (96/48 → 4/3 → 2/1), ALL OOM'd before
+   completing even C2S stage 0 (confirmed: zero stdout/stderr ever
+   printed — not even the first stage-completion line). The first
+   failure is explained (left `KSC_CAP` unbounded, same ~1GB-per-entry
+   magnitude as `KROT` at this scale — see `MEMORY_FEASIBILITY.md`).
+   The second and third are NOT explained: attempt 3's observed RSS
+   (up to 4.5GB) exceeded its own theoretical two-cache ceiling (~3.3GB)
+   substantially, meaning something ELSE grows with n that neither cap
+   bounds. **Do not guess at cache constants again as the next step** —
+   add per-diagonal `[mem]` instrumentation inside the C2S/S2C stage
+   loops first (the existing checkpoints only print at stage
+   boundaries, never reached in any of the three attempts) to actually
+   localize the growth before touching `KROT_CAP`/`KSC_CAP` further.
+   Full detail, including the three-attempt table: `MEMORY_FEASIBILITY.md`.
 
 ## What NOT to do
 

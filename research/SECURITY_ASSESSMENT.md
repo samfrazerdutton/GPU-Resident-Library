@@ -204,3 +204,26 @@ host RAM pressure ~16x over the already-near-ceiling n=8192 measurement),
 performance (expected substantially slower than the current ~115-140s;
 do not guess the number), (4) revisit the residual sparse-secret caveat
 above if an independent security review becomes available.
+
+## UPDATE: estimator output independently re-run and preserved (this round)
+
+Re-ran both tools fresh for the exact candidate, output preserved
+verbatim:
+
+```
+$ python3 tools/hybrid_security.py 131072 1775 64
+n=131072 log2(QP)=1775 h=64: 134 classical bits  (k=79034, beta=225)
+
+$ python3 tools/lwe_security.py 131072 1775 64
+n=131072 log2(QP)=1775 sparse h=64: beta=828 -> 279 classical / 257 quantum bits
+  NOTE: primal only; hybrid MITM not modelled -- upper bound.
+```
+
+Confirms the 134-classical-bit figure above (hybrid model, the binding
+attack for a sparse secret) exactly, independent of the prior revision's
+number. The primal model's 279/257 classical/quantum is a LOOSE upper
+bound (does not model the sparse-specific MITM attack) — do not quote
+257 quantum bits as the actual quantum security margin; no tight
+quantum number exists for this candidate (see the standing caveats
+above, unchanged). Target (128 bits) is met by the tight model with a
+6-bit margin, not a wide one.

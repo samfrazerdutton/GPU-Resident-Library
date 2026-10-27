@@ -152,20 +152,31 @@ rather than abandoned or faked.
    working fix at that scale — see `MEMORY_FEASIBILITY.md`'s "KROT lever
    analysis" section for the measured regen-cost tradeoff numbers.
 
-## The real, quantified blocker for n=131072
+## n=131072: real numbers now known, three real attempts made, still blocked by an UNIDENTIFIED cause
 
-Not GPU VRAM (181MB of 6144MB used — huge headroom). Not KSC anymore
-(fixed, see above). **It is `KROT`'s own footprint**: 77 entries × 62.9MB
-at n=8192 = 4.84GB, scaling to **77.5GB at n=131072** — infeasible, and
-NOT addressed by the KSC fix (KROT's entries are confirmed genuinely
-reused across the whole bootstrap, so naive eviction there would force
-real, expensive `evalkeygen_host` regeneration, not a cheap re-copy).
-A real fix needs either a zero-copy av/bv sharing mechanism (requires
-changing `KeySwitchConstants`'s field types — broad blast radius, not
-attempted, needs a cryptographic-correctness review first) or a
-different architectural approach (streaming av/bv to GPU without a full
-host-resident copy). **n=131072 end-to-end has NOT been run. Do not
-report it as supported.**
+Not GPU VRAM (181MB of 6144MB used at n=8192 — huge headroom). Real,
+MEASURED (not extrapolated) per-key cost at n=131072 this round:
+**1085MB RSS, 7.5s keygen** per rotation key (`tests/
+test_n131072_keysize.cpp`) — confirms the ~1GB/key, ~71-77GB-for-76-keys
+estimate used throughout earlier revisions of this file was accurate,
+not overblown. `KROT_CAP` (added this round) and `KSC_CAP` (both now
+bounded — `KSC_CAP` was the ORIGINAL oversight: it caches full-size
+`KROT`-entry-sized views and was left at its n=8192 default of 48,
+which alone could reach ~48GB at this scale) together make the KEY
+CACHES bounded and feasible in principle.
+
+**But three actual end-to-end attempts this round, with progressively
+tighter caps (96/48 → 4/3 → 2/1), ALL OOM'd before completing even C2S
+stage 0** (confirmed: zero progress output ever printed). The tightest
+attempt's observed RSS (up to 4.5GB) exceeded its OWN theoretical
+two-cache ceiling (~3.3GB) substantially — **something besides
+`KROT`/`KSC` also grows with n and is not yet identified.** Do not
+re-attempt this by further shrinking cache constants; the next step is
+per-diagonal `[mem]` instrumentation to actually localize the growth
+(full detail and the three-attempt table: `MEMORY_FEASIBILITY.md`).
+**n=131072 end-to-end has NOT been run successfully. Do not report it
+as supported — this is a harder-than-modeled problem, not a solved one
+with an untested implementation.**
 
 ## What's done vs. not done against the acceptance criteria
 

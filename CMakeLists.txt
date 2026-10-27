@@ -119,6 +119,8 @@ gpufhe_test(test_automorph_eval_fast tests/test_automorph_eval_fast.cpp)
 # decrypted-plaintext comparison) and is promoted to the default suite.
 gpufhe_test(test_hoist_single tests/test_hoist_single.cpp)
 gpufhe_test(test_hoist_multi tests/test_hoist_multi.cpp)
+gpufhe_test(test_n131072_keysize tests/test_n131072_keysize.cpp)
+gpufhe_test(test_boot_n131072 tests/test_boot_n131072.cpp)
 gpufhe_test(test_keyreuse tests/test_keyreuse.cpp)
 gpufhe_test(bench_resident_chain bench/bench_resident_chain.cpp)
 gpufhe_test(bench_batch bench/bench_batch.cpp)

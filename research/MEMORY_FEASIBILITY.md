@@ -205,8 +205,84 @@ memory trade, not a free win:
 
 This converts "OOM crash at n=131072" into "survives, but pays a large,
 honestly-uncertain compute tax" — it makes n=131072 FEASIBLE, not fast.
-Not yet implemented (the delegated investigation stopped short of
-implementing+building it due to a WSL2 filesystem I/O stall during this
-session, choosing to report the analysis rather than claim an unverified
-build/test result — correctly, per "never invent results"). This is the
-concrete next step for whoever picks up Objective B.
+
+## UPDATE: KROT_CAP implemented; REAL (not extrapolated) n=131072 per-key numbers measured
+
+`KROT_CAP` is now implemented in `tests/test_boot.cpp` (bounded LRU,
+same pattern as `KSC_CAP`), defaulted to 96 — comfortably above the
+n=8192 working set, verified to cause ZERO evictions/behavior change at
+that scale (identical `max slot err`, identical peak RSS).
+
+A standalone test (`tests/test_n131072_keysize.cpp`) built the REAL
+n=131072 modulus chain (same shape: sizeQ=30, sizeP=2, log2(QP)=1775 —
+unchanged circuit) and generated ONE actual rotation key, measuring
+`getrusage` RSS directly rather than extrapolating:
+
+```
+RSS before any rotation key: 228 MB
+ONE rotation key (evalkeygen_host_sold) generated in 7.49601s
+RSS after one rotation key: 1313 MB
+REAL measured per-key delta: 1085 MB
+Exact structural size (2*numPart*sizeQlP*n*8B): 960 MB
+Extrapolated total for 76 such keys: 71 GB (structural only)
+```
+
+This CONFIRMS the earlier extrapolation was accurate (960MB structural,
+~1085MB real including ~13% allocator overhead, vs. the ~1000MB assumed
+above) — not an overestimate. Keygen time (7.5s/key) came in LOWER than
+the ~10.9s/key extrapolated above (real scaling ≈11.7x over n=8192's
+measured 0.64s/key, not the naive ~17x linear-in-n guess).
+
+Based on these real numbers, `tests/test_boot_n131072.cpp` (a
+parameterized copy of `test_boot.cpp`, default n=8192 test left
+UNTOUCHED) sets `LST=4` (lgS=16 at n=131072 needs a divisor other than
+the n=8192 default LST=3; LST=4 keeps the same RST=4 per-stage radix the
+original choice was tuned around — the most conservative available
+choice, NOT independently re-validated for numerical accuracy at this
+new scale).
+
+## UPDATE: three real attempts, all OOM'd — an unidentified memory
+## growth source exists BEYOND KROT/KSC; Objective C is NOT complete
+
+Three actual end-to-end attempts were made this round, each with
+successively more conservative cache bounds, all ending in an OOM kill
+before any stage completed (confirmed by empty stdout logs each time —
+`std::cerr`'s per-stage progress lines never printed, meaning not even
+C2S stage 0's first 16 diagonals finished):
+
+| Attempt | `KROT_CAP` | `KSC_CAP` | Theoretical cache ceiling | Observed RSS before OOM |
+|---|---|---|---|---|
+| 1 | 6 | 48 (unchanged — the bug) | ~6.5GB + up to ~48GB(!) | grew past 3.25GB, killed before next check |
+| 2 | 4 | 3 | ~4.3GB + ~3.3GB ≈ 7.6GB | grew to ~3.5GB then OOM'd shortly after |
+| 3 | 2 | 1 | ~2.2GB + ~1.1GB ≈ 3.3GB | **fluctuated 1.5GB→4.5GB→4.0GB→4.5GB over ~15 CPU-minutes, then OOM'd** |
+
+Attempt 1's failure is fully explained (KSC caches FULL-SIZE views of
+KROT entries — see above — and was left unbounded for this scale).
+Attempts 2 and 3 are **not** fully explained: attempt 3's observed RSS
+(up to 4.5GB) exceeds its own theoretical two-cache ceiling (~3.3GB) by
+a wide margin, meaning **some other allocation grows with n in a way
+neither `KROT_CAP` nor `KSC_CAP` bounds** — plausible candidates, NOT
+yet investigated: `DeviceKSContext`/`DeviceKSWork` host-side staging
+vectors inside `ks_context_create`/`stageRotBegin` (sized by `towers*n`,
+which is large at n=131072 even for a single instance, and several may
+be transiently live at once during a stage transition), the per-
+diagonal plaintext arrays (`dg[]`, `S=n/2=65536` complex doubles each,
+times up to 16 diagonals held simultaneously per stage), or something
+else entirely. **Do not assume it is KROT/KSC again — that hypothesis
+is now exhausted; further guessing at cache constants is not a sound
+next step.**
+
+**Correct next step for whoever picks up Objective C**: add fine-grained
+`[mem]` instrumentation INSIDE the C2S stage loop (per-diagonal, not
+just per-stage — the existing checkpoints only print at stage
+boundaries, which never even reached once in three attempts) to
+localize exactly which allocation grows, before touching any cache
+constant again. `tests/test_boot_n131072.cpp` is committed as-is (at
+its last, most conservative `KROT_CAP=2`/`KSC_CAP=1` setting) as a
+ready starting point for that diagnosis, not as a working configuration
+— it has not yet completed a single bootstrap stage at n=131072.
+**Objective C (full n=131072 end-to-end run) is NOT complete.** What
+IS done and real: the security target is independently reconfirmed
+(134 bits, see `SECURITY_ASSESSMENT.md`), and real (not extrapolated)
+per-key cost at this scale is measured (1085MB RSS, 7.5s keygen —
+`tests/test_n131072_keysize.cpp`).
