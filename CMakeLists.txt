@@ -119,16 +119,20 @@ gpufhe_test(test_automorph_eval_fast tests/test_automorph_eval_fast.cpp)
 # decrypted-plaintext comparison) and is promoted to the default suite.
 gpufhe_test(test_hoist_single tests/test_hoist_single.cpp)
 gpufhe_test(test_hoist_multi tests/test_hoist_multi.cpp)
+gpufhe_test(test_hoist_levelreduced tests/test_hoist_levelreduced.cpp)
 gpufhe_test(test_n131072_keysize tests/test_n131072_keysize.cpp)
 gpufhe_test(test_boot_n131072 tests/test_boot_n131072.cpp)
 gpufhe_test(test_hoist_stage0 tests/test_hoist_stage0.cpp)
-#   NOT registered via gpufhe_test (which would add it to the default
-#   `ctest` run): it crashes on multi-stage input (see
-#   research/NEXT_SESSION.md for the two bugs found/fixed-so-far) and
-#   should not show up as an unexplained red test. Build it explicitly
-#   with: cmake --build . --target test_hoist_allstages
-add_executable(test_hoist_allstages tests/test_hoist_allstages.cpp)
-target_link_libraries(test_hoist_allstages PRIVATE gpufhe CUDA::cudart)
+# Validates rotation hoisting across ALL 3 real C2S stages (not just
+# stage 0). Found and fixed two real bugs this round (segfault in
+# ks_context_create from an empty-av/bv shape-only key; a correctness
+# bug from generating a hoisted key directly at a reduced tower count
+# instead of via the trusted path's own build-full-then-atLevel-view
+# pattern) -- see research/NEXT_SESSION.md for the full story. Now
+# passes. Heavy like test_boot (runs a full trusted C2S pass plus a
+# full hoisted-only C2S pass, ~8GB peak RSS, ~2 min) -- same ctest
+# memory caution as test_boot applies, nothing new.
+gpufhe_test(test_hoist_allstages tests/test_hoist_allstages.cpp)
 gpufhe_test(test_keyreuse tests/test_keyreuse.cpp)
 gpufhe_test(bench_resident_chain bench/bench_resident_chain.cpp)
 gpufhe_test(bench_batch bench/bench_batch.cpp)

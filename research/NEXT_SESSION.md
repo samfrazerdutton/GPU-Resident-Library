@@ -146,14 +146,16 @@ for repeated/interleaved measurement — never trust a single sequential run.
    Not chased further via that design — the single-stage result (now
    reproduced twice) is strong enough evidence for this round.
 
-   **Follow-up attempt: `tests/test_hoist_allstages.cpp`** (new file,
+   **Follow-up: `tests/test_hoist_allstages.cpp` — NOW PASSING, all 3
+   real C2S stages, after fixing two bugs found in sequence** (new file,
    sequential-pass design: run the trusted path's existing, UNMODIFIED
    C2S loop to completion first, THEN reset to the same ModRaise output
    and run a SEPARATE hoisted-only pass over all 3 stages — never
    holding both paths' keys simultaneously, avoiding the memory
    coexistence problem above). Pass 1 (trusted) completed cleanly every
    time (matches known timings). Pass 2 (hoisted) surfaced TWO distinct
-   bugs, in sequence:
+   bugs, in sequence (both now fixed, see below for the resolution and
+   final result):
    1. The per-stage hoisted key construction (`Kh`) and the decompose
       shape reference (`Cshape`) both passed the FULL, un-sliced `mod`
       array (30 entries) to `compute_keyswitch_constants` even after
@@ -164,19 +166,67 @@ for repeated/interleaved measurement — never trust a single sequential run.
       table for modulus")` entering stage 1. **Fixed** by slicing to
       `hml` (already computed per-stage) before calling
       `compute_keyswitch_constants`, matching `atLevel`'s pattern.
-   2. After that fix, pass 2 instead SEGFAULTS (not a clean exception)
-      partway through, cause not yet identified — plausibly a shape
-      mismatch between `Dh` (sized by `Cshape`'s `numPart`/`sizeQlP`)
-      and a per-diagonal `Ck`/`Wk` at some later stage/diagonal, but
-      not confirmed. **Not pursued further this round** — two bugs
-      deep into a secondary validation path, with each build+run cycle
-      costing significant time in this session's WSL environment, is
-      past the point of good ROI when the primary, single-stage result
-      is already solid and twice-reproduced. `tests/
-      test_hoist_allstages.cpp` is committed AS-IS, NOT WORKING (crashes
-      on multi-stage), as a starting point and a documented pitfall
-      list (both bugs above) for whoever picks this up next — do not
-      assume it works; re-verify after any further fix.
+   2. After that fix, pass 2 instead SEGFAULTS. **RESOLVED (later
+      continuation round)**: ran under `gdb --batch -ex run -ex "bt full"`
+      on a fast, memory-light repro (a scratch copy with pass 1 skipped
+      entirely, `g<0` instead of `g<LST`, to avoid pass 1's own ~7.5GB
+      RSS competing with gdb's overhead) — crash squarely inside
+      `gpufhe::ks_context_create` (existing, proven, untouched). Root
+      cause: a hand-built "shape-only" `KeySwitchConstants` (correct
+      `sizeQl`/`numPart`/root-tables, but default-constructed EMPTY
+      `av`/`bv`, since decompose doesn't read them) — but
+      `ks_context_create` unconditionally uploads every part's `av`/`bv`
+      regardless of caller intent, indexing the empty vectors. Fixed by
+      never hand-rolling a shape-only key for anything passed to
+      `ks_context_create`: use `atLevel(KREL,hctw)` instead (the trusted
+      path's own existing mechanism for exactly this — re-shape a FULL
+      key down to `hctw` towers while copying its REAL, non-empty
+      `av`/`bv` across). Added `tests/test_hoist_levelreduced.cpp` as a
+      permanent regression test for this exact defect class (builds a
+      real level-reduced context via the correct pattern, asserts no
+      CUDA error) — now in the default test suite.
+   3. **A second, more subtle bug surfaced immediately after fixing #2**:
+      with the segfault gone, pass 2 completed all 3 stages but produced
+      a real correctness MISMATCH (`maxDiff` exceeding `maxAbs` — not
+      noise, wrong). Cause (found by reasoning through
+      `ks_accumulate_qp`'s own `fullQ`/`delta` indexing, not another
+      gdb session): `evalkeygen_host_sold` always writes `av`/`bv` using
+      the FULL, fixed 32-tower `modQP` layout (real Q at indices 0-29,
+      real P at 30-31) — generating the hoisted rotation key directly at
+      a REDUCED `sizeQl=hctw` (as the code did) does not shrink that
+      layout, it only changes which towers get the "+P*s2" payload. The
+      later accumulate step locates the P-range WITHIN `av`/`bv` using
+      `sizeQl` as an offset into that fixed layout — correct only when
+      `hctw==sizeQ` (stage 0 exclusively, which is exactly why ONLY
+      stage 0 ever passed in every earlier single-stage test). Fixed by
+      using the same two-step pattern the trusted path already uses for
+      every rotation key at every level (`rotFull`+`atLevel`): build the
+      hoisted key ONCE at full `sizeQl=sizeQ`, then take an
+      `atLevel`-style view for the current `hctw` (`atLevel` already
+      sets `K.fullQ=sizeQ`, which is what makes `ks_accumulate_qp`'s
+      `delta=fullQ-sizeQl` correctly skip the now-irrelevant dropped
+      towers and land on the real P-range).
+
+   **Result after both fixes: `[PASS]` across ALL 3 real C2S stages**
+   (not just stage 0) — `maxDiff=35` against `maxAbs=5.26e15` (negligible
+   noise, ~6.7e-15 relative). This is the strongest correctness evidence
+   yet for the hoisting mechanism: proven right across every stage of
+   a real bootstrap's C2S phase, not just one stage or synthetic data.
+
+   **Timing from this specific run: 0.93x (pass 2 slightly SLOWER than
+   pass 1) — do NOT read this as "hoisting doesn't help."** This
+   benchmark's sequential-pass design (deliberately, for a fair
+   no-cache-advantage comparison) makes the hoisted path pay full fresh
+   `evalkeygen_host_sold` cost on EVERY diagonal, while the trusted
+   path's `keyAt` benefits from its own `KSC` view-cache (cheap
+   re-copies, not fresh keygen, for most diagonals after the first few).
+   This conflates "decompose-sharing vs. not" with "no cache vs. has a
+   cache" — two different variables — unlike the EARLIER, still-valid
+   `bench/bench_hoist_multi.cpp` (N=5/N=16, ~2.04x/~2.44x) and
+   `tests/test_hoist_stage0.cpp` (stage 0 alone, ~3.4x) results, where
+   BOTH sides paid fresh keygen fairly. A clean multi-stage speedup
+   measurement would need the hoisted path to ALSO use a bounded view
+   cache analogous to `KSC`, not fresh-every-diagonal — not yet built.
 
    **Next step: extend from "validated on stage 0 (reproduced twice) in
    isolation" to "wired into the live, full bootstrap across all 6

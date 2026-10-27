@@ -470,17 +470,21 @@ int main(){
             size_t hTT=(size_t)hctw*n;
             const double hdpt = (g+1<LST) ? (double)mod[hctw-1] : Delta_pt;
 
-            // Shape-only reference sized to THIS stage's hctw (shrinks by 1
-            // tower per stage via rescale) -- KREL is fixed at the FULL
-            // sizeQ=30 towers, which only coincidentally matched at g=0 and
-            // is wrong for g>0 (same bug class the trusted path's atLevel()
-            // avoids by always slicing mod to the current tw before calling
-            // compute_keyswitch_constants).
-            gpufhe::KeySwitchConstants Kshape; Kshape.n=n;
-            gpufhe::compute_keyswitch_constants(Kshape,hml,modP,npFor(hctw));
-            for(uint32_t i=0;i<hctw;++i){Kshape.rootModList.push_back(hml[i]);Kshape.rootValList.push_back(hrl[i]);}
-            for(uint32_t j=0;j<sizeP;++j){Kshape.rootModList.push_back(modP[j]);Kshape.rootValList.push_back(rootQP[sizeQ+j]);}
-            auto Cshape=gpufhe::ks_context_create(Kshape);
+            // Shape reference sized to THIS stage's hctw (shrinks by 1
+            // tower per stage via rescale). SEGFAULT ROOT CAUSE (found via
+            // gdb): a hand-built shape-only KeySwitchConstants has correct
+            // sizeQl/numPart/etc. but EMPTY av/bv vectors (never populated
+            // -- decompose doesn't need them) -- but ks_context_create
+            // (existing, proven, untouched code) unconditionally uploads
+            // EVERY part's av[part]/bv[part] to device, so it indexes an
+            // empty vector and segfaults. Fixed by reusing the trusted
+            // path's OWN pattern for this exact situation: atLevel(KF,tw)
+            // re-shapes a FULL key (KREL, sizeQ=30 towers, real non-empty
+            // av/bv) down to hctw towers while copying its REAL av/bv data
+            // across (same mechanism rotFull/keyAt already use for every
+            // rotation key at every level) -- never hand-roll a shape-only
+            // key for anything that gets passed to ks_context_create.
+            auto Cshape=gpufhe::ks_context_create(atLevel(KREL,hctw));
             auto Dh=gpufhe::hoist_digits_create(Cshape);
             size_t hBc=hTT*8;
             uint64_t *d_hs0,*d_hs1;
@@ -506,11 +510,32 @@ int main(){
                     std::vector<uint64_t> pkA_h=KPqp.pkA, pkB_h=KPqp.pkB;
                     gpufhe::automorphism_eval_host(pkA_h,sizeQlP,n,(uint32_t)kinv,modQP,rootQP);
                     gpufhe::automorphism_eval_host(pkB_h,sizeQlP,n,(uint32_t)kinv,modQP,rootQP);
-                    gpufhe::KeySwitchConstants Kh; Kh.n=n;
-                    gpufhe::compute_keyswitch_constants(Kh,hml,modP,npFor(hctw));
-                    for(uint32_t i=0;i<hctw;++i){Kh.rootModList.push_back(hml[i]);Kh.rootValList.push_back(hrl[i]);}
-                    for(uint32_t j=0;j<sizeP;++j){Kh.rootModList.push_back(modP[j]);Kh.rootValList.push_back(rootQP[sizeQ+j]);}
-                    gpufhe::evalkeygen_host_sold(Kh,KPqp.s,KPqp.s,pkA_h,pkB_h,PModq,modQP,rootQP,ns,3.19,6000+(uint64_t)offs[x]);
+                    // SECOND BUG (found by reasoning through ks_accumulate_qp's
+                    // own fullQ/delta indexing after fixing the segfault):
+                    // evalkeygen_host_sold always writes av/bv using the FULL,
+                    // fixed 32-tower modQP layout (real Q at indices 0-29, real
+                    // P at 30-31) -- generating the key directly with a
+                    // REDUCED sizeQl=hctw (as the previous version of this
+                    // code did) does NOT shrink that layout, it just changes
+                    // which towers get the "+P*s2" payload. The later
+                    // accumulate step locates the P-range WITHIN av/bv using
+                    // sizeQl as an offset -- correct only when hctw==sizeQ
+                    // (stage 0 only, which is exactly why only stage 0 ever
+                    // passed). Fixed by using the SAME two-step pattern the
+                    // trusted path already uses for every rotation key at
+                    // every level (rotFull+atLevel): build the key ONCE at
+                    // FULL sizeQl=sizeQ, then take an atLevel-style view for
+                    // the current hctw (reusing atLevel directly -- it
+                    // already sets K.fullQ=sizeQ, which is what makes
+                    // ks_accumulate_qp's delta=fullQ-sizeQl correctly skip
+                    // the now-irrelevant dropped towers and land on the REAL
+                    // P-range instead of reading the wrong indices).
+                    gpufhe::KeySwitchConstants KhFull; KhFull.n=n;
+                    gpufhe::compute_keyswitch_constants(KhFull,mod,modP,npFor(sizeQ));
+                    for(uint32_t i=0;i<sizeQ;++i){KhFull.rootModList.push_back(mod[i]);KhFull.rootValList.push_back(root[i]);}
+                    for(uint32_t j=0;j<sizeP;++j){KhFull.rootModList.push_back(modP[j]);KhFull.rootValList.push_back(rootQP[sizeQ+j]);}
+                    gpufhe::evalkeygen_host_sold(KhFull,KPqp.s,KPqp.s,pkA_h,pkB_h,PModq,modQP,rootQP,ns,3.19,6000+(uint64_t)offs[x]);
+                    auto Kh = atLevel(KhFull, hctw);
 
                     auto Ck=gpufhe::ks_context_create(Kh);
                     auto Wk=gpufhe::ks_work_create(Ck);

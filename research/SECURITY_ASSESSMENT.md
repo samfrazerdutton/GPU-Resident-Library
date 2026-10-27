@@ -164,19 +164,147 @@ dual/hybrid attacks) remains true in the abstract, but in THIS codebase's
 concrete circuit, going uniform costs more in required depth than it saves
 in attack resistance, at the n values actually in play.
 
+## Quantum-adjusted hybrid estimate: derived, with an honest split verdict
+
+The prior gap: `hybrid_security.py`'s hybrid dual+MITM model is the
+BINDING attack for this codebase's sparse secret (h=64) — tighter than
+the primal model, which doesn't capture the sparse-specific MITM
+leverage — but it reported only a classical bit count. Deriving a sound
+quantum-adjusted version requires treating its TWO distinct attack
+phases separately; they do not share a single quantum speedup.
+
+**The model's exact structure** (reconstructed from `tools/
+hybrid_security.py`'s `hybrid()`, confirmed by reading the whole file):
+for a guessing-window size `k` (0 to n, searched), split the n secret
+coordinates into a `k`-sized MITM-guessing window and an `n-k`-sized
+dual-attack window. For each bet `w` on how many of the window's
+coordinates are actually nonzero (cheaper to enumerate for small `w`,
+but wrong with probability governed by the hypergeometric distribution
+`P[w'<=w] = sum_j C(k,j)*C(n-k,h-j)/C(n,h)`), the attack cost is:
+
+```
+cost(k,b,m,w) = lR(b,m)                [dual-attack repeat/sample count, statistical]
+              + (-log2 P_w)            [expected restarts if the w-bet was wrong]
+              + max( BKZ_cost(b,d),    [lattice-reduction phase, dimension d=m+(n-k)]
+                     MITM_cost(k,w) )  [[combinatorial enumeration, classical sqrt(N)]]
+```
+minimized over `(k,b,m,w)`. `BKZ_cost(b,d) = 0.292*b + log2(8d) + 16.4`
+is the SAME classical BDGL16 sieve-cost formula `lwe_security.py` already
+uses for its own (unrelated, primal-attack) lattice reduction step.
+`MITM_cost(k,w) = 0.5*log2(N)` for `N` = the size of the "at most w
+nonzero positions among k, each +-1" enumeration space — i.e. the
+classical meet-in-the-middle time-memory tradeoff (O(sqrt(N)) time via
+a two-list sort/hash split, not a search algorithm).
+
+**Reference verification (both supplied PDFs actually read, not
+assumed from title):**
+- The "Mosca" link resolves to Kaye, Laflamme & Mosca, *An Introduction
+  to Quantum Computing* (Oxford, 2007) — a full co-authored textbook,
+  not a standalone paper. Its own preface states it deliberately
+  "avoided... the mathematical formalism of quantum information theory
+  and quantum cryptography." Chapter 8 ("Algorithms Based on Amplitude
+  Amplification," p152) covers Grover's search (8.1, p152) and
+  amplitude amplification (8.2, p163) in the abstract. The index (p270)
+  has no entry for "collision," "claw," "meet-in-the-middle," "lattice,"
+  "LWE," or "hybrid attack."
+- Nielsen & Chuang, *Quantum Computation and Quantum Information* (10th
+  Anniversary Ed., Cambridge) — the standard comprehensive QC reference.
+  Chapter 6 ("Quantum search algorithms," p248) covers Grover's
+  algorithm (6.1-6.2), quantum counting (6.3), and explicitly "Speeding
+  up the solution of NP-complete problems" (6.4, p263) — read directly:
+  it applies Grover's GENERIC quadratic speedup to a SINGLE-LIST
+  brute-force witness search (worked example: the Hamiltonian cycle
+  problem, O(2^n) classical -> O(2^(n/2)) quantum). This is the exact
+  same single-list speedup already reflected in `lwe_security.py`'s
+  existing 0.292->0.265 sieve-exponent substitution. Chapter 6 contains
+  no two-list/collision/meet-in-the-middle-specific algorithm.
+
+**Conclusion from both references**: they establish the FOUNDATIONAL
+Grover/amplitude-amplification material, confirming that a generic
+single-list O(N)->O(sqrt(N)) quantum speedup is standard and
+well-established — but NEITHER contains the specialized quantum
+algorithm needed for this model's actual MITM structure (a two-list
+meet-in-the-middle/collision search, not a single-list brute-force
+search). That specific algorithm is Brassard-Hoyer-Tapp (1997),
+"Quantum Cryptanalysis of Hash and Claw-Free Functions" (outside both
+supplied references — general lattice/post-quantum cryptanalysis
+literature, not covered by either introductory/comprehensive QC
+textbook), giving O(N^(1/3)) time for two-list collision-finding — a
+REAL but SMALLER speedup than naively squaring the classical sqrt(N)
+exponent down to N^(1/4) would suggest (that naive move is EXACTLY the
+"substituting a generic quantum speedup" the governing directive warns
+against — rejected). Critically, BHT's N^(1/3) result REQUIRES
+O(N^(1/3)) quantum-accessible quantum RAM (QRACM) — an assumption many
+post-quantum security analyses (including NIST's own PQC methodology
+discussions, and submissions such as Kyber/Dilithium's specifications)
+explicitly decline to credit an attacker with for exactly this kind of
+combinatorial/MITM attack component, treating the no-large-QRACM cost
+as the conservative floor.
+
+**What was implemented** (`tools/hybrid_security.py`'s new
+`hybrid_quantum(n, logq, h, sigma, credit_mitm_qracm)`, classical
+`hybrid()` left completely unchanged for regression comparison):
+- BKZ/lattice-reduction phase: quantum sieve exponent 0.265 substituted
+  for 0.292, unconditionally — same subroutine, same substitution
+  `lwe_security.py` already makes, not new reasoning.
+- MITM phase: classical exponent 1/2 by DEFAULT (`credit_mitm_qracm=
+  False`) — Grover's generic speedup does not cleanly apply a second
+  time on top of an already-sqrt(N)-optimized classical MITM. Set
+  `credit_mitm_qracm=True` for a separate, more aggressive bound using
+  BHT's 1/3 exponent, under the explicit, contested large-QRACM
+  assumption.
+- NOT adjusted, deliberately: the dual-attack's own repeat/sample count
+  (`lR`, a statistical-averaging term, not a search problem) and the
+  sparse-window-guess retry amplification (`-log2(P_w)`, "redo the
+  WHOLE attack because the w-bet was wrong"). No literature establishing
+  a sound quantum treatment of either, for this specific construction,
+  was found in the two references consulted or in general knowledge of
+  the hybrid-attack literature. Left classical rather than guessed —
+  this means both reported quantum bounds below are themselves slightly
+  CONSERVATIVE (a fully-quantum-adjusted attacker, if these two terms
+  do turn out to admit some speedup, could do marginally better than
+  either number states).
+
+**Real output** (`python3 tools/hybrid_security.py 131072 1775 64
+--quantum`, and `tools/test_hybrid_security.py`, 10/10 checks pass
+including: classical calibration unchanged, quantum bounds both <=
+classical, QRACM bound <= no-QRACM bound, h=0 and small-n edge cases):
+
+```
+n=131072 log2(QP)=1775 h=64: 134 classical bits  (k=79034, beta=225)
+  quantum (no large QRACM credited to MITM, conservative/NIST-floor): 130 bits  (k=79034, beta=225)
+  quantum (BHT-style N^(1/3) MITM credited, assumes large QRACM): 114 bits  (k=83948, beta=190)
+```
+
+**This is a genuine, non-trivial finding that must not be glossed
+over: under the conservative/no-QRACM assumption, n=131072/h=64 still
+clears the 128-bit target — but only by 2 bits, a much thinner margin
+than the classical 134-bit figure suggested.** Under the more aggressive
+QRACM-crediting assumption, it does NOT clear 128 bits (114 < 128). The
+honest position is: this candidate's quantum security against the
+BINDING sparse-secret attack is somewhere in the 114-130 bit range
+depending on an attacker's access to large quantum-accessible quantum
+memory, a genuinely unsettled assumption in the literature — not a
+single confident number. The previously-reported 257-quantum-bit figure
+(from the loose primal model) should NOT be read as this candidate's
+quantum security margin; it significantly overstates it by not
+modeling the MITM attack at all.
+
 ## Standing, unresolved caveats (explicit, not glossed over)
 
 - Neither estimator here has been cross-checked against the SageMath
   lattice-estimator (the de facto standard tool) for THESE specific
   parameters. This remains open regardless of which secret distribution is
   chosen.
-- `hybrid_security.py` (the binding, tighter model for sparse secrets)
-  reports only a classical-bit estimate — it has no quantum-adjusted
-  variant in this repo's tooling. The 134-bit figure for n=131072/h=64 has
-  no corresponding quantum number from the tighter model; `lwe_security.py`
-  (looser, primal, upper-bound-only for sparse secrets) would need to be
-  consulted for a quantum estimate, with the explicit caveat that it is
-  less tight than the hybrid model for a sparse secret.
+- `hybrid_security.py` now HAS a quantum-adjusted variant
+  (`hybrid_quantum`, see the dedicated section below) — this caveat is
+  RESOLVED, not fully, but with an honest range rather than a missing
+  number. Previously: "reports only a classical-bit estimate... no
+  corresponding quantum number from the tighter model." Now: two bounds
+  under two different, explicitly labeled hardware assumptions (130 bits
+  conservative, 114 bits if a large quantum-RAM attacker is credited) —
+  see below for the full derivation and what remains genuinely
+  unresolved within even the new quantum estimator.
 - The Bossuat et al. paper's concern about sparse-secret attacks specific
   to bootstrapping evaluation keys (not just generic LWE hardness) may not
   be fully captured by `hybrid_security.py`'s calibration (validated
@@ -186,6 +314,20 @@ in attack resistance, at the n values actually in play.
 - No independent, external cryptographic review has occurred. Nothing in
   this repository should be described as "production-grade" or "secure
   for real data" on the basis of this assessment alone.
+- The new `hybrid_quantum` estimator (see dedicated section above) only
+  partially closes the quantum gap: it quantum-adjusts the BKZ/sieve
+  phase (well-established) and offers two bounds for the MITM phase
+  under two different, both-defensible QRACM assumptions, but leaves
+  the dual-attack's repeat-count term and the sparse-window retry
+  amplification UNADJUSTED, because no literature basis for a sound
+  quantum treatment of either was found. If such a basis is later
+  found, both reported quantum bit counts (130 and 114) could move
+  LOWER, not higher — they are not final numbers, they are the best
+  currently-derivable bounds. Neither has been cross-checked against
+  the SageMath lattice-estimator or published hybrid-attack papers'
+  own quantum variants (if any exist) — this was a literature search
+  within the scope of one delegated investigation, not an exhaustive
+  survey.
 
 ## Disposition
 
@@ -195,7 +337,19 @@ ternary.** Do not implement the secret-distribution switch that the
 previous revision of this document recommended; it has been superseded by
 the analysis above. Do not continue treating the current n=8192 instance
 as anything other than an explicitly insecure (~51-bit) demo/research
-configuration. The next concrete security task is: (1) regenerate moduli/
+configuration.
+
+**Updated, with the quantum derivation above factored in**: classical
+security is solid (134 bits, 6-bit margin over the 128-bit target).
+Quantum security is NOT a single comfortable number — it is 130 bits
+under a conservative, no-large-quantum-memory attacker (2-bit margin,
+thin) and 114 bits (short of 128) under a more aggressive attacker
+credited with large quantum-accessible quantum RAM. This is a real,
+literature-grounded range, not an artifact of this repo's tooling — do
+not report "134 bits" or "257 bits" as this candidate's quantum margin
+without the caveats above.
+
+The next concrete security task is: (1) regenerate moduli/
 roots at n=131072 with the existing sparse-secret code path (no keygen.cpp
 change needed), (2) fix the KROT/KSC bounded-cache prerequisite (see
 `MEMORY_FEASIBILITY.md` — mandatory before n=131072, which will multiply
@@ -203,7 +357,13 @@ host RAM pressure ~16x over the already-near-ceiling n=8192 measurement),
 (3) run the full bootstrap end to end at n=131072 and measure real
 performance (expected substantially slower than the current ~115-140s;
 do not guess the number), (4) revisit the residual sparse-secret caveat
-above if an independent security review becomes available.
+above if an independent security review becomes available, (5) if a
+wider quantum margin is later judged necessary (e.g. if the project's
+threat model must credit a large-QRACM attacker), re-run
+`hybrid_quantum(..., credit_mitm_qracm=True)` against candidate n values
+above 131072 to find where the 114-bit figure clears 128 — not yet done,
+out of scope for this round since the conservative bound already meets
+the target.
 
 ## UPDATE: estimator output independently re-run and preserved (this round)
 

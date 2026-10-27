@@ -121,28 +121,49 @@ rather than abandoned or faked.
    rotation indices in a bootstrap stage) is a separate mechanism, not
    yet built — see `NEXT_SESSION.md` priority queue item 1.
 
-8. **Multi-rotation decompose-sharing: DONE, validated on a REAL live
-   bootstrap stage, not just synthetic benchmarks.** New, separate
-   files `include/keyswitch_hoist.h` + `src/keyswitch_hoist.cpp`
-   (`keyswitch_resident.cpp` untouched). `tests/test_hoist_multi.cpp`:
-   bit-exact vs. the existing fused `ks_accumulate_qp` (0/524288
-   mismatches), correct across 6 shared rotation indices. `bench/
-   bench_hoist_multi.cpp`, interleaved A/B: N=5 ~2.04x, N=16 (matching
-   the real C2S stage 0 bucket size) ~2.44x, both CIs exclude zero.
-   **`tests/test_hoist_stage0.cpp` then validated the mechanism against
-   test_boot.cpp's ACTUAL first C2S stage** (identical setup through
-   ModRaise, same real diagonal structure, own fresh hoisted-convention
-   keys with no cache advantage over the trusted path): decrypted
-   output matches within negligible noise (maxDiff=613 vs
-   maxAbs=5.76e17), and **real timing: hoisted 7.53s vs trusted
-   25.89s — a ~3.4x speedup on the actual live stage**, both sides
-   paying real keygen cost. This is the strongest evidence yet — a
-   real bootstrap stage, not a synthetic approximation. Not yet wired
-   into ALL stages of the live bootstrap (needs a parallel hoisted-key
-   cache, since the hoisted convention is structurally different from
-   today's `KROT`'s textbook convention) — scoped in detail in
-   `NEXT_SESSION.md` priority queue item 1, with `test_hoist_stage0.cpp`
-   as the proven template to extend.
+8. **Multi-rotation decompose-sharing: DONE, validated on ALL 3 real
+   C2S stages of a live bootstrap, not just one stage or synthetic
+   benchmarks.** New, separate files `include/keyswitch_hoist.h` +
+   `src/keyswitch_hoist.cpp` (`keyswitch_resident.cpp` untouched).
+   `tests/test_hoist_multi.cpp`: bit-exact vs. the existing fused
+   `ks_accumulate_qp` (0/524288 mismatches), correct across 6 shared
+   rotation indices. `bench/bench_hoist_multi.cpp`, interleaved A/B:
+   N=5 ~2.04x, N=16 (matching the real C2S stage 0 bucket size) ~2.44x,
+   both CIs exclude zero. `tests/test_hoist_stage0.cpp` validated the
+   mechanism against test_boot.cpp's ACTUAL first C2S stage alone:
+   maxDiff=613 vs maxAbs=5.76e17, **real timing: hoisted 7.53s vs
+   trusted 25.89s — ~3.4x** (both sides paying real keygen cost).
+
+   **`tests/test_hoist_allstages.cpp` then extended this to ALL 3 C2S
+   stages** (sequential-pass design: trusted path's own unmodified loop
+   to completion, then a separate hoisted-only pass over all 3 stages,
+   so the two paths' keys never coexist in memory). Found and fixed
+   TWO real bugs in sequence via careful diagnosis (gdb for the first,
+   reasoning through `ks_accumulate_qp`'s own `fullQ`/`delta` indexing
+   for the second — full story in `NEXT_SESSION.md`): (1) a segfault in
+   `ks_context_create` from a hand-built shape-only key with empty
+   `av`/`bv` (fixed by reusing the trusted path's own `atLevel()`
+   pattern; added `tests/test_hoist_levelreduced.cpp` as a permanent
+   regression test, now in the default suite); (2) a correctness bug
+   from generating the hoisted key directly at a reduced tower count
+   instead of building it full-size and taking an `atLevel` view (same
+   root cause class as #1 — the trusted path's two-step key pattern
+   exists for exactly this reason, and skipping it broke silently for
+   any level other than the full one). **Result after both fixes:
+   `[PASS]` across all 3 real C2S stages, maxDiff=35 against
+   maxAbs=5.26e15 (negligible, ~6.7e-15 relative) — the strongest
+   correctness evidence yet.** Timing from this run (0.93x, pass 2
+   marginally slower) is NOT a speedup regression — this benchmark's
+   fair, no-cache-advantage design makes the hoisted side pay fresh
+   keygen every diagonal while the trusted side's own `KSC` view-cache
+   makes most of ITS diagonals cheap re-copies, conflating "decompose-
+   sharing" with "caching strategy." The earlier N=5/N=16/stage-0-alone
+   results (both sides fresh-keygen, apples-to-apples) remain the valid
+   speedup evidence. Not yet wired into the live, production bootstrap
+   (needs a parallel hoisted-key cache analogous to `KSC`, since the
+   hoisted convention is structurally different from today's `KROT`'s
+   textbook convention) — scoped in `NEXT_SESSION.md` priority queue
+   item 1.
 
 9. **`KROT` memory-scaling: lever analysis DONE, bounded-cache safety
    net implemented.** Zero-copy ruled out with direct code evidence
@@ -158,6 +179,29 @@ rather than abandoned or faked.
    set stays at 77). This is the safety net for n=131072, not yet a
    working fix at that scale — see `MEMORY_FEASIBILITY.md`'s "KROT lever
    analysis" section for the measured regen-cost tradeoff numbers.
+
+10. **Quantum-adjusted hybrid security estimate: derived, with an
+    honest split verdict — the standing "`hybrid_security.py` has no
+    quantum variant" gap is resolved, partially, not glossed over.**
+    Both user-supplied reference PDFs actually read (not assumed):
+    "Mosca" resolved to the Kaye/Laflamme/Mosca QC textbook (explicitly
+    disclaims covering quantum cryptography), Nielsen & Chuang is the
+    full comprehensive reference. Both verified to cover only the
+    generic single-list Grover speedup — neither contains the
+    specialized two-list quantum meet-in-the-middle algorithm
+    (Brassard-Hoyer-Tapp 1997) this model's MITM phase actually needs.
+    Implemented `hybrid_quantum()` (classical `hybrid()` untouched) with
+    two honestly-separated bounds instead of one invented number: BKZ
+    phase gets the same quantum sieve exponent `lwe_security.py` already
+    uses; MITM phase stays classical by default (naive double-Grover
+    would double-count a speedup that isn't there), with an opt-in
+    BHT-exponent bound requiring a large-QRACM attacker (a real,
+    contested assumption). New `tools/test_hybrid_security.py`, 10/10
+    pass. **Real result for n=131072/h=64: 134 classical (unchanged) /
+    130 quantum conservative (2-bit margin over 128 — thin) / 114
+    quantum if large QRACM is credited (FAILS 128).** A genuine finding,
+    not an artifact: full derivation and citations in
+    `SECURITY_ASSESSMENT.md`.
 
 ## n=131072: real numbers now known, three real attempts made, still blocked by an UNIDENTIFIED cause
 
