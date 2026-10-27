@@ -76,16 +76,23 @@ rather than abandoned or faked.
    change, verified via the full regression suite), creating the seam
    needed to attempt correct-order rotation hoisting.
 
-7. **Correct-order rotation hoisting (experiment #3): attempted, FAILED
-   twice, precisely documented, NOT committed to anything live.** Built a
-   standalone single-rotation test. **k=1 (trivial identity) passes
-   0/491520 mismatches** — proves the surrounding plumbing (decompose,
-   new scaled-fold-in kernel, automorphism-on-QP-accumulator, moddown) is
-   correct. The remaining bug is isolated to the rotation-KEY-GENERATION
-   CONVENTION for k≠1 — two specific wrong attempts tried and ruled out
-   (see `EXPERIMENT_LEDGER.md`), neither of which should be retried as-is.
-   This needs a careful, line-by-line re-derivation against this
-   codebase's exact `evalkeygen_host_sold` structure, not another guess.
+7. **Correct-order rotation hoisting (experiment #3): single-rotation
+   correctness RESOLVED this round (commit `46998b7`).** The "100%
+   mismatch" recorded in the previous revision of this file was a TEST
+   BUG — comparing raw ciphertexts for bit-exactness instead of decrypted
+   plaintexts within CKKS's noise budget (full explanation:
+   `EXPERIMENT_LEDGER.md` entry #14). Fixed the test to decrypt-and-
+   compare; the key-generation convention already tried (permute
+   `pkA_QP`/`pkB_QP` by `k^-1`, keep payload as the unpermuted base
+   secret) was correct all along. Expanded to 3 independently-encrypted
+   random ciphertexts x 9 rotation indices (incl. k=M-1, k=M/2-1 edge
+   cases): **27/27 pass**, stable ~2000-3300 decrypted-coefficient error
+   against a ~1e14-1e15 signal (ordinary keyswitch noise). Promoted
+   `tests/test_hoist_single.cpp` into the default test suite. **This is
+   single-rotation correctness only — zero performance benefit by
+   itself.** The actual win (sharing one `decompose(c1)` across multiple
+   rotation indices in a bootstrap stage) is a separate mechanism, not
+   yet built — see `NEXT_SESSION.md` priority queue item 1.
 
 ## The real, quantified blocker for n=131072
 
@@ -120,9 +127,12 @@ report it as supported.**
   run end to end — blocked on KROT's memory scaling, not yet fixed.
 - [x] Eval-domain automorphism permutation (ranked experiment #2) — DONE,
   real win, committed `0043af3`.
-- [ ] Correct-order rotation hoisting (ranked experiment #3) — ATTEMPTED,
-  failed twice on the key-generation convention, precisely documented
-  (see above and `EXPERIMENT_LEDGER.md`), not yet resolved.
+- [x] Correct-order rotation hoisting (ranked experiment #3), single-
+  rotation correctness — DONE, `46998b7` (see above and
+  `EXPERIMENT_LEDGER.md` entry #14).
+- [ ] Correct-order rotation hoisting, multi-rotation decompose-sharing
+  (the actual performance mechanism) — NOT yet built. See
+  `NEXT_SESSION.md` priority queue item 1.
 - [ ] Messaging track: architecture proposal complete and committed
   (`MESSAGING_ARCHITECTURE.md`); no implementation/prototype built (not
   requested as a build task, scoped as a proposal this session).
