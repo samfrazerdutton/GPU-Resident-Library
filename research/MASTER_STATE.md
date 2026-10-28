@@ -369,6 +369,29 @@ NOT clearly distinguishable from run-to-run/order/thermal noise at this
 sample size. The single order-balanced pair (7↔8) that most directly
 isolates the true effect from the warm-up confound shows it near zero.
 
+**Explicit order-effect decomposition (requested follow-up check:
+"does order itself have a systematic effect, separate from the flag").**
+The composition is 3 OFF-first pairs + 1 ON-first pair (not a balanced
+2-and-2 design — only one pair breaks the order/flag confound). Computing
+(2nd-run time − 1st-run time) regardless of which flag ran in which
+position: `[−11.246, −3.483, +4.641, −0.169]` → median=−1.826s,
+mean=−2.564s, stdev=6.680s. There IS a consistent-direction tendency (3
+of 4 pairs) for whichever condition runs SECOND to finish faster,
+matching the GPU-warm-up hypothesis — but its own stdev also exceeds its
+mean, so it is not crisply established at n=4 either. Because OFF ran
+first and ON ran second in 3 of the 4 pairs, order and flag are
+confounded there and the apparent "ON is faster" signal in those three
+pairs cannot be attributed to the flag with confidence. The single pair
+that breaks the confound (7↔8: ON first, unfavored position; OFF
+second, favored position) showed ON essentially matching OFF
+(108.673s vs 108.504s, diff 0.169s) despite NOT having the order
+advantage — consistent with either "no real flag effect" or "a small
+real flag effect that roughly cancels the order disadvantage"; this
+one data point cannot distinguish between those two readings. **A
+properly randomized (not block-alternated) trial series with more
+samples, ideally with GPU clock/temp logged per trial via `nvidia-smi`,
+is required to resolve order vs. flag — not yet done.**
+
 **Honest verdict: the hoisted path has NOT been shown to deliver a
 clean, reproducible end-to-end speedup once order bias is controlled
 for.** The ~16% win from the single first post-fix comparison

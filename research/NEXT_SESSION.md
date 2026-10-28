@@ -36,10 +36,53 @@ Secondary open items from this round (lower priority than the above):
 - A larger, truly-randomized (not block-alternated) A/B trial series to
   settle whether rotation hoisting's end-to-end effect on the full
   bootstrap is real-but-small or statistically zero — the current
-  8-trial, order-balanced series could not distinguish the two.
+  8-trial, order-balanced series could not distinguish the two (explicit
+  order-effect decomposition: median=-1.826s, mean=-2.564s, stdev=6.680s
+  across the 4 pairs — a direction consistent with GPU warm-up but not
+  statistically crisp at this sample size; see `MASTER_STATE.md`).
 - The SageMath lattice-estimator cross-check and the direct
   eprint-2021/152 / eprint-2026/1060 parameter check named in
   `SECURITY_ASSESSMENT.md`'s updated `## Disposition`.
+
+## Two pre-existing bugs newly discovered this round (NOT caused by
+## this round's changes, NOT fixed — out of scope for this directive)
+
+A full `ctest` run (excluding `test_boot_n131072`, the known-blocked
+n=131072 feasibility target) was completed for the first time all
+session — every prior attempt had been OOM-killed partway through, so
+these two failures had never actually been observed before now:
+
+1. **`test_polyeval` fails deterministically**: `deg-7 poly eval, final
+   tw=1 scale=2^50 maxerr=2376.98` (`[FAIL]`), reproduced identically
+   twice (same exact error values both times, in and out of the full
+   ctest run). `git log -- tests/test_polyeval.cpp` shows it was last
+   touched in `78d7407`, long before this session's hoisting work —
+   this round touched none of the C2S/polynomial-evaluation code paths.
+   Not investigated further (out of scope for the current directive);
+   whoever picks this up next should treat it as a real, pre-existing,
+   previously-undiscovered correctness bug, not a flake.
+2. **`bench_evalmult_resident` aborts**: `terminate called after
+   throwing an instance of 'std::runtime_error' what(): ShadowRegistry
+   cudaMalloc failed (VRAM exhausted?)`, reproduced standalone with GPU
+   VRAM confirmed otherwise idle (`nvidia-smi`: 10MiB/6144MiB used
+   immediately before the retry). `git log -- bench/
+   bench_evalmult_resident.cpp` shows it was last touched in `6efc812`
+   (CUDA-graphs-era commit, well before this session). "ShadowRegistry"
+   does not appear anywhere in this repo's own source — it is coming
+   from CUDA's own graph-capture machinery, suggesting a driver/CUDA-
+   graph resource limit specific to this old benchmark on this GPU,
+   not a host-RAM or this-round issue. Not investigated further (out of
+   scope); this is a benchmark, not a correctness test.
+
+**Everything else in the full suite passed**, including all of this
+round's own correctness evidence: `test_boot` (113.71s, matching
+established timing), `test_hoist_single`/`test_hoist_multi`/
+`test_hoist_levelreduced`/`test_hoist_stage0`/`test_hoist_allstages`
+(the last one needed to be run standalone after the first full-suite
+attempt OOM'd entering it — passed cleanly alone: `[PASS] all-stage C2S
+hoisting validation`, maxDiff=35 vs maxAbs=5.26e15, speedup=1.297x in
+that one specific sequential-pass comparison — consistent with entry
+#20's prior result, not a new number to generalize from).
 
 ## Before trusting any new benchmark number
 
