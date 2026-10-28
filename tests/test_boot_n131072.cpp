@@ -51,6 +51,12 @@
 #include <chrono>
 #include <sys/resource.h>
 static double rssMB(){ struct rusage ru; getrusage(RUSAGE_SELF,&ru); return ru.ru_maxrss/1024.0; }
+// GPU free/used memory via cudaMemGetInfo -- a direct driver query, not
+// external polling (no sync needed, cheap). Added this round specifically
+// to distinguish host-RAM growth from GPU-VRAM growth at each probe point;
+// prior attempts only tracked RSS. research/MEMORY_FEASIBILITY.md's
+// "per-diagonal instrumentation" round got RSS-only data; this extends it.
+static double gpuUsedMB(){ size_t f=0,t=0; cudaMemGetInfo(&f,&t); return (double)(t-f)/1024.0/1024.0; }
 namespace gpufhe {
 void encode_host(std::vector<int64_t>&, const std::vector<std::complex<double>>&, uint32_t, double);
 void decode_host(std::vector<std::complex<double>>&, const std::vector<int64_t>&, uint32_t, double);
@@ -430,7 +436,17 @@ int main(){
     { auto _t=NOW();
       for(uint32_t g=0;g<LST;++g){
         std::vector<uint32_t> offs; std::vector<std::vector<cd>> dg;
+        auto _tsd=NOW();
         stageDiags(g,offs,dg); ndiagTot+=(uint32_t)offs.size();
+        // [mem] probe immediately after stageDiags -- this call is O(S^2)
+        // single-threaded CPU work (S=65536 at n=131072; flagged as a severe
+        // but previously unmeasured TIME cost in research/MEMORY_FEASIBILITY.md's
+        // last update) and happens BEFORE the diagonal loop's own probes, so
+        // without this line any RSS growth or wall-clock cost incurred here
+        // is invisible -- the per-diagonal probes below only see what's left
+        // AFTER this already ran.
+        std::cerr<<"    [mem] C2S stage "<<g<<" stageDiags done: t="<<EL(_tsd)<<"s diags="<<offs.size()
+                 <<" RSS="<<rssMB()<<"MB GPU="<<gpuUsedMB()<<"MB\n";
         std::vector<uint64_t> ml(mod.begin(),mod.begin()+ctw),rl(root.begin(),root.begin()+ctw);
         size_t TT=(size_t)ctw*n;
         std::vector<uint64_t> a0(TT,0),a1(TT,0); bool fst=true;
@@ -464,7 +480,7 @@ int main(){
             // per-stage [mem] prints (which never once appeared across
             // all three prior attempts, since nothing had flushed yet).
             std::cerr<<"      [mem] stage "<<g<<" diag "<<x<<"/"<<offs.size()
-                     <<" RSS="<<rssMB()<<"MB KROT="<<KROT.size()<<" KSC="<<KSC.size()<<"\n"; }
+                     <<" RSS="<<rssMB()<<"MB GPU="<<gpuUsedMB()<<"MB KROT="<<KROT.size()<<" KSC="<<KSC.size()<<"\n"; }
         stageRotEnd(R);
         rescaleAt(a0,a1,ctw);
         std::cerr<<"    C2S stage "<<g<<" tw="<<ctw<<" parts="<<npFor(ctw)
@@ -730,7 +746,10 @@ int main(){
     { auto _t=NOW();
       for(int g=(int)LST-1; g>=0; --g){
         std::vector<uint32_t> offs; std::vector<std::vector<cd>> dg;
+        auto _tsdf=NOW();
         stageDiagsFwd((uint32_t)g,offs,dg); s2cdiag+=(uint32_t)offs.size();
+        std::cerr<<"    [mem] S2C stage "<<g<<" stageDiagsFwd done: t="<<EL(_tsdf)<<"s diags="<<offs.size()
+                 <<" RSS="<<rssMB()<<"MB GPU="<<gpuUsedMB()<<"MB\n";
         std::vector<uint64_t> ml(mod.begin(),mod.begin()+stw),rl(root.begin(),root.begin()+stw);
         size_t TT=(size_t)stw*n;
         std::vector<uint64_t> a0(TT,0),a1(TT,0); bool fst=true;
@@ -758,7 +777,7 @@ int main(){
             if(fst){a0=t0;a1=t1;fst=false;} else gpufhe::ct_add_ct_host(a0,a1,t0,t1,stw,n,ml);
             g_tCpuAcc+=EL(_ta);
             std::cerr<<"      [mem] S2C stage "<<g<<" q="<<q2<<" diag "<<x<<"/"<<offs.size()
-                     <<" RSS="<<rssMB()<<"MB KROT="<<KROT.size()<<" KSC="<<KSC.size()<<"\n"; }
+                     <<" RSS="<<rssMB()<<"MB GPU="<<gpuUsedMB()<<"MB KROT="<<KROT.size()<<" KSC="<<KSC.size()<<"\n"; }
           stageRotEnd(R); }
         rescaleAt(a0,a1,stw);
         std::cerr<<"    S2C stage "<<g<<" tw="<<stw<<" parts="<<npFor(stw)

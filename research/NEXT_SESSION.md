@@ -3,33 +3,57 @@
 ## Current commit
 
 Check `git log -3` on resume. As of this writing, HEAD is a new commit
-on top of `02e84eb` (the production-integration/A-B/security-re-review
-round — see `MASTER_STATE.md`'s `## This round` section and
-`EXPERIMENT_LEDGER.md` entry #21 for what it contains). Confirm push
-status — push again if `git status` shows ahead of origin.
+on top of `f1978ab` (the n=131072 memory-investigation round — see
+`MEMORY_FEASIBILITY.md`'s final `## UPDATE` section for the full story,
+condensed in `MASTER_STATE.md`'s latest `## This round` section and
+`EXPERIMENT_LEDGER.md` entry #22). Confirm push status — push again if
+`git status` shows ahead of origin.
 
 ## Read first
 
+`research/MEMORY_FEASIBILITY.md`'s final `## UPDATE (new round): KROT/KSC
+cache mechanism DEFINITIVELY CLEARED...` section — it supersedes the
+"something besides KROT/KSC grows with n, not yet identified" framing
+used everywhere earlier in that file and in this document. Then
 `research/MASTER_STATE.md`'s `## This round: production integration,
-honest A/B, security re-review` section (near the end of the file) for
-the CURRENT state — it supersedes several claims earlier in that same
-file and in this document below. Then `research/EXPERIMENT_LEDGER.md`
-entry #21 for the condensed version. `docs/performance-baseline.md`
-predates `research/` and is historical only.
+honest A/B, security re-review` section for the PRIOR round's findings
+(still current), and `research/EXPERIMENT_LEDGER.md` entries #21-#22.
 
 ## Immediate next action (the one concrete, executable item left open)
 
-**n=131072 secure-parameter feasibility test — not attempted this
-round, unchanged from before it.** Three prior attempts all OOM'd before
-printing even C2S stage 0's completion line, with `KROT_CAP`/`KSC_CAP`
-tightened each time (96/48 → 4/3 → 2/1) and the last attempt's observed
-RSS (4.5GB) still exceeding its own theoretical two-cache ceiling
-(~3.3GB) — something besides `KROT`/`KSC` also grows with n and is not
-yet identified. **Do not guess at cache constants again.** Add
-per-diagonal `[mem]` instrumentation inside the C2S/S2C stage loops
-first (the existing checkpoints only print at stage boundaries, never
-reached in any of the three attempts) to actually localize the growth
-before touching cache capacities further. Full three-attempt detail:
+**n=131072 feasibility is now believed to be blocked by this specific
+machine's total physical RAM (~15.4GB), not by an unidentified
+implementation bug.** This round isolated the KROT/KSC bounded-LRU
+cache mechanism in a standalone experiment (`tests/
+test_n131072_cache_churn.cpp`) and proved it plateaus at a bounded
+~3.2GB through 22+11 real evictions — it is NOT the runaway cause.
+Enhanced instrumentation on a 5th real attempt showed RSS was only
+1436MB (safely low) immediately before the crash, which happened
+inside the very first `keyAt()`/`stageRotBegin()` call of stage 0 —
+code-reading ruled out that call's own allocations (device-side,
+~350MB-1.35GB, all previously-established patterns) as the explanation.
+Checking the Windows host directly found the real likely cause: this
+machine has only ~15.42GB total physical RAM, `.wslconfig` caps WSL2 at
+11GB, but Windows itself already uses ~11.8GB at near-idle (only ~3.6GB
+free) — WSL2's internal `free -h` ("10Gi free") reflects a *promised*
+allocation, not memory the host can actually back under real
+contention. **Next concrete steps, in order**: (1) close other
+Windows-side memory consumers and retry the exact same
+`./test_boot_n131072` command to see if it survives further with
+maximum real host headroom — the cheapest, most direct test of this
+diagnosis, not yet done; (2) if it still fails with minimal other
+load, treat ~15.4GB total physical RAM as a hard blocker for n=131072
+on this specific machine and stop retrying cache-constant tweaks — the
+realistic paths forward are more physical RAM or a streaming
+(non-cached) key-material architecture, both out of scope for a single
+session. **Do NOT further lower `KROT_CAP`/`KSC_CAP` expecting a
+different result** — `test_n131072_cache_churn.cpp` already proved the
+cache mechanism itself is not the limiting factor at the caps already
+in use. Also note: `stageDiags`/`stageDiagsFwd` (O(S²), now measured at
+268s/call at n=131072, ~35 CPU-minutes for all 8 C2S+S2C stages) is a
+severe, separate, real performance cost independent of whether the
+memory question resolves — worth fixing (precompute diagonal structure
+analytically) before any future large-n attempt regardless. Full detail:
 `MEMORY_FEASIBILITY.md`.
 
 Secondary open items from this round (lower priority than the above):

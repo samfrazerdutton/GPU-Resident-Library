@@ -353,3 +353,212 @@ flagged here as a real, independent algorithmic scaling concern worth
 fixing (e.g. precomputing diagonal structure analytically instead of
 probing empirically) for ANY future large-n attempt, regardless of how
 the memory question above resolves.
+
+## UPDATE (new round): KROT/KSC cache mechanism DEFINITIVELY CLEARED;
+## true root cause found to be the WINDOWS HOST's total physical RAM,
+## not WSL2's self-reported 10GB ceiling
+
+This round answered the two live hypotheses the previous update left
+open (transient `cap+1` keygen-before-evict peak vs. allocator
+retention across repeated evictions) with a direct, isolated
+experiment, then went further and found the actual environmental root
+cause, which had been mis-framed all session.
+
+### Experiment 1: `tests/test_n131072_cache_churn.cpp` (new, committed)
+
+Isolates the KROT+KSC bounded-LRU cache mechanism from the rest of the
+bootstrap entirely (no ModRaise, no ciphertexts, no `stageDiags`) and
+drives it through 24 distinct rotation-key generations at the real
+n=131072 scale, with `KROT_CAP=2`/`KSC_CAP=1` (identical to
+`tests/test_boot_n131072.cpp`), forcing 22 real KROT evictions and 11
+real KSC evictions. Result, exactly reproduced across every call after
+the third:
+
+```
+RSS plateaus at EXACTLY 3233MB from call #3 onward, through all 22
+KROT evictions and 11 KSC evictions. GPU used stays flat at 1264MB
+throughout. Zero growth with call index.
+```
+
+**This conclusively confirms hypothesis (a) (the real `rotFull()`/
+`keyAt()` code in `tests/test_boot_n131072.cpp` generates the NEW key
+via `evalkeygen_host_sold` BEFORE checking/evicting the cap — so the
+true transient peak is `(cap+1)` keys resident, not `cap` keys; 3233MB
+÷ 3 ≈ 1077MB/key, matching the independently measured per-key cost
+almost exactly) and DEFINITIVELY REFUTES hypothesis (b) (allocator
+retention across repeated evict+regenerate cycles) — glibc correctly
+reuses freed same-sized blocks here; RSS does not ratchet up with
+eviction count.** The KROT/KSC cache mechanism — including the
+previously-undocumented `cap+1` transient — is bounded, well-behaved,
+and NOT the runaway cause of the repeated OOMs. This is new, direct
+evidence, not a re-confirmation of the prior round's single data point.
+
+### Experiment 2: enhanced instrumentation, 5th real n=131072 attempt
+
+Added `gpuUsedMB()` (via `cudaMemGetInfo`, no sync needed) alongside
+the existing RSS probes in `tests/test_boot_n131072.cpp`, plus a new
+probe immediately after `stageDiags`/`stageDiagsFwd` returns (before
+the diagonal loop starts) — the existing per-diagonal probes only see
+state AFTER that call already ran, so its own cost and any RSS it
+leaves behind were previously invisible. Result:
+
+```
+ModRaise: congruence mismatches = 0 (want 0), max|I| = 11
+analytic inverse self-check: diag err=0 offdiag=2.45581e-17
+    [mem] C2S stage 0 stageDiags done: t=268.047s diags=16 RSS=1436.15MB GPU=1254.69MB
+```
+then killed (host-memory pressure) before the next line — i.e. inside
+the FIRST `keyAt(offs[0],30)`/`stageRotBegin`/`stageRotDiag` call of
+stage 0, before even diagonal 0's own per-diagonal probe could print.
+
+Two real findings here:
+1. **`stageDiags` for ONE stage costs 268 seconds** — a real, measured
+   (not estimated) confirmation of the O(S²) scaling concern flagged in
+   the previous update. At `LST=4` (8 stages total, 4 C2S + 4 S2C),
+   this alone could cost **~35 minutes of single-threaded CPU time**
+   before any bootstrap compute happens, independent of whether the
+   memory question is ever resolved. This is now a measured, documented
+   cost, not a guess.
+2. **RSS was only 1436MB right before the crash** — far below any
+   previously-modeled danger threshold (even the old cap-based ~3.3GB
+   estimate, let alone the 10GB nominal ceiling). Reading
+   `stageRotBegin`/`ks_work_create`/`ks_context_create`'s actual
+   allocation sizes (`src/keyswitch_resident.cpp`,
+   `tests/test_boot_n131072.cpp` lines ~372-427) confirms their device
+   (GPU VRAM) allocations are modest at this scale (~350MB combined,
+   `ks_context_create`'s per-call av/bv upload another ~1GB, freed
+   immediately after each call per the established "fresh
+   cudaMalloc+upload, freed after" pattern) — nothing in the code this
+   round read explains a sudden multi-GB host-RAM spike from a 1436MB
+   baseline. The expected `keyAt()` growth (one fresh KROT entry +
+   one atLevel KSC copy, ≈2.15GB) would only bring RSS to ≈3.6GB,
+   matching the EARLIER (less-instrumented) attempt's "diag 0" RSS of
+   3506MB almost exactly — still nowhere near 10GB.
+
+### The actual root cause: this machine's physical RAM, not WSL2's internal accounting
+
+Given neither the cache mechanism (Experiment 1) nor the stage-setup
+code's own allocation sizes (Experiment 2's code reading) explain a
+sudden OOM from a 1436MB-3.6GB baseline, the investigation moved to the
+Windows host itself:
+
+```
+PS> Get-CimInstance Win32_OperatingSystem | Select TotalVisibleMemorySize,FreePhysicalMemory
+TotalVisibleMemorySize: 16,168,544 KB (~15.42 GB)
+FreePhysicalMemory:      3,792,048 KB (~3.62 GB)   <- measured with vmmemWSL near-idle (434.8MB)
+```
+
+```
+C:\Users\samca\.wslconfig:
+[wsl2]
+memory=11GB
+swap=8GB
+```
+
+**This machine has only ~15.42GB of TOTAL physical RAM, and `vmmemWSL`
+(the WSL2 VM) draws from that SAME shared pool as every other Windows
+process — it is not a separate, independent 10-11GB allocation as this
+entire session's prior analysis assumed.** `.wslconfig` explicitly caps
+WSL2 at 11GB (matching the "~10GB visible to WSL2" figure used
+throughout this doc), but even with the WSL2 VM nearly idle, Windows
+itself already has only ~3.6GB free out of 15.42GB total — meaning
+roughly 11.8GB is already committed to the Windows OS, background
+services, and whatever else is running (this Claude Code session's own
+Windows-side process included) BEFORE WSL2 grows into its 11GB
+allowance at all. **WSL2's internal `free -h` (which has reported
+"10Gi total, 10Gi free" throughout this whole session, including
+immediately before every one of the five n=131072 attempts) reflects
+memory Hyper-V's dynamic-memory mechanism has PROMISED the VM, not
+memory the HOST can actually back under real contention.** When WSL2
+tries to actually commit several more GB (generating large keys,
+building ciphertext buffers), Windows' own memory manager has to find
+that RAM from an already-tight ~3.6GB of real headroom — exactly the
+kind of pressure that triggers an abrupt kill (or, in earlier attempts,
+the "D-state disk-wait stalls" and "frequent OOM-kills, must retry"
+pattern this whole session documented as standing environmental
+friction, for ordinary n=8192 workloads too, not just n=131072).
+
+**This reframes the entire feasibility question.** It is not that
+n=131072's structural memory requirement (modeled at ~4.3-5GB including
+KREL+KROT+KSC's bounded peak, now empirically tighter-bounded by
+Experiment 1) exceeds a real 10GB WSL2 ceiling — it is that **this
+specific machine's total physical RAM (~15.4GB) cannot reliably back
+even the modeled ~4-5GB structural requirement once Windows' own
+baseline usage and WSL2's configured-but-not-actually-available 11GB
+allowance are both accounted for.** Lowering `KROT_CAP`/`KSC_CAP`
+further (as attempts 1-4 did) was always fighting a host-level
+constraint those caps cannot fix, which explains why progressively more
+conservative caps never converged on a working configuration.
+
+**Objective C (full n=131072 end-to-end run) is NOT complete, and this
+round's evidence points to an ENVIRONMENT BLOCKER rather than a fixable
+implementation bug**: this specific machine likely does not have enough
+real, available physical RAM to run the n=131072 feasibility test to
+completion, independent of further cache-tuning. Concrete next actions,
+in order of how directly they test this diagnosis: (1) close other
+Windows-side memory-consuming processes (browser, IDEs, etc.) and retry
+with maximum real headroom, to see whether the SAME attempt survives
+further when host contention is minimized — the cheapest, most direct
+test of this round's diagnosis; (2) if it still fails, the machine's
+~15.4GB total physical RAM is very likely a hard blocker for n=131072
+on this hardware, and the honest path forward is either acquiring a
+machine with more RAM, or redesigning the bootstrap to stream key
+material rather than holding even 2-3 full rotation keys host-resident
+at once (a bigger architectural change, not scoped here); (3) do NOT
+re-attempt with further-lowered `KROT_CAP`/`KSC_CAP` values expecting a
+different result — Experiment 1 already proved the cache mechanism
+itself is not the limiting factor at the caps already in use.
+
+### Caught in the act: an ordinary, previously-reliable `test_boot` (n=8192) run was itself OOM-killed minutes later, with WSL reporting "10Gi free" throughout
+
+Immediately after writing up the diagnosis above, a routine post-change
+regression check — plain `./test_boot` at n=8192, the SAME binary that
+has completed successfully dozens of times this session, normally
+peaking at ~8.3GB RSS with no history of failing — was itself
+OOM-killed. `free -h` INSIDE WSL at that exact moment still reported
+"10Gi total, 10Gi free." The Windows host, checked in the same moment:
+
+```
+PS> Get-CimInstance Win32_OperatingSystem | Select TotalVisibleMemorySize,FreePhysicalMemory
+TotalGB: 15.42   FreeGB: 2.83
+
+PS> Get-Process | Sort WorkingSet64 -Descending | Select -First 10
+Memory Compression   1111.5 MB   <- Windows already compressing pages: real pressure
+claude (x2)            963.5 MB   <- this session's own Windows-side processes
+opera (x4)             1434.1 MB  <- browser, several tabs/processes
+vmmemWSL                453.8 MB
+MsMpEng                 320.1 MB
+ChatGPT                 178.2 MB
+```
+
+This is a second, independent, live-caught data point for the SAME
+mechanism this round diagnosed from the n=131072 crash: WSL2's internal
+memory accounting ("10Gi free") is disconnected from whether the
+Windows host can actually back that promise, and ordinary
+Windows-side memory pressure from OTHER running applications (a
+browser with multiple tabs, other app instances, routine background
+services) is sufficient to OOM-kill even a modest, previously-reliable
+n=8192 workload — not just the much larger n=131072 attempt. **This is
+not something to fix in the codebase**: it is a statement about this
+machine's current operating conditions. The most direct, lowest-cost
+next action for anyone continuing this work is simply to close other
+memory-heavy applications (the browser especially, at ~1.4GB across its
+processes) before any further large-n attempt or even routine
+regression run, and to treat intermittent OOM kills on ordinary
+n=8192 workloads as a signal to check real host memory first, not as
+evidence of a new code regression.
+
+A retry of the identical `./test_boot` command a few minutes later was
+ALSO OOM-killed, with Windows host free memory still only ~3.85GB at
+that point — consistent with sustained, not momentary, host pressure
+this specific session. No further retries were attempted (per this
+session's own established practice: accept the data in hand rather than
+loop indefinitely against a known environmental condition). This round's
+code changes (`tests/test_boot_n131072.cpp`'s added instrumentation, the
+new `tests/test_n131072_cache_churn.cpp`, `CMakeLists.txt`'s new target)
+do not touch `tests/test_boot.cpp` at all, and that file has passed
+consistently (`max slot err=0.000547871`, bit-exact) across dozens of
+runs earlier in this same session under normal host conditions,
+including as recently as the immediately prior commit (`f1978ab`) — the
+two OOM kills here are classified as environmental/resource-related,
+not a regression from this round's changes, on that basis.

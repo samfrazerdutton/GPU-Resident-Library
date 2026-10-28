@@ -131,6 +131,16 @@ gpufhe_test(test_hoist_single tests/test_hoist_single.cpp)
 gpufhe_test(test_hoist_multi tests/test_hoist_multi.cpp)
 gpufhe_test(test_hoist_levelreduced tests/test_hoist_levelreduced.cpp)
 gpufhe_test(test_n131072_keysize tests/test_n131072_keysize.cpp)
+# Isolates the n=131072 KROT-cache churn mechanism (bounded LRU eviction +
+# evalkeygen_host_sold) from the rest of the bootstrap, to distinguish two
+# competing explanations for why n=131072 OOMs far sooner than the
+# KROT_CAP/KSC_CAP bound predicts: (a) the real rotFull()/keyAt() code
+# generates the new key BEFORE evicting the old one, so the transient peak
+# is (cap+1) keys, not cap; (b) allocator retention across repeated
+# evict+regenerate cycles. See research/MEMORY_FEASIBILITY.md and
+# research/NEXT_SESSION.md for context. Fast (~12 keygens, ~90s), no
+# bootstrap/ciphertext machinery involved.
+gpufhe_test(test_n131072_cache_churn tests/test_n131072_cache_churn.cpp)
 gpufhe_test(test_boot_n131072 tests/test_boot_n131072.cpp)
 gpufhe_test(test_hoist_stage0 tests/test_hoist_stage0.cpp)
 # Validates rotation hoisting across ALL 3 real C2S stages (not just

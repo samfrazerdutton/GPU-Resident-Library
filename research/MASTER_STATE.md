@@ -445,3 +445,41 @@ warning, not a resolved footnote.**
 - The SageMath lattice-estimator cross-check and the direct
   eprint-2021/152 / eprint-2026/1060 parameter check named in
   `SECURITY_ASSESSMENT.md`'s updated Disposition.
+
+## Later round: n=131072 memory investigation — cache mechanism cleared, real root cause found to be host physical RAM
+
+A dedicated round on the standing n=131072 feasibility blocker (full
+detail: `MEMORY_FEASIBILITY.md`'s final `## UPDATE` section;
+condensed: `EXPERIMENT_LEDGER.md` entry #22). Three results:
+
+1. **New isolated experiment (`tests/test_n131072_cache_churn.cpp`)
+   definitively clears the KROT/KSC bounded-LRU cache mechanism as the
+   runaway OOM cause.** Drove 24 real rotation-key generations through
+   the same `KROT_CAP=2`/`KSC_CAP=1` logic as the real bootstrap, no
+   ciphertext/ModRaise machinery involved: RSS plateaus at exactly
+   3233MB from the 3rd call onward, through 22 KROT evictions and 11
+   KSC evictions — zero growth. Confirms a real, previously
+   undocumented mechanism (the actual code generates each new key
+   BEFORE evicting the old one, so the true transient peak is `cap+1`
+   keys, not `cap`) and refutes allocator-retention growth across
+   repeated evictions.
+2. **Enhanced instrumentation (GPU memory via `cudaMemGetInfo`, a probe
+   right after `stageDiags`) localized the 5th real attempt's crash
+   precisely**: `stageDiags` for ONE stage took a measured 268 seconds
+   (confirming an O(S²) algorithmic concern flagged in an earlier
+   round, now quantified — ~35 CPU-minutes for all 8 C2S+S2C stages at
+   n=131072), and RSS was a safe 1436MB immediately before the crash,
+   which happened inside the very first `keyAt()`/`stageRotBegin()`
+   call — well short of any modeled danger threshold.
+3. **Root cause: this machine's total physical RAM (~15.42GB), not
+   WSL2's self-reported "10GB ceiling."** `.wslconfig` caps WSL2 at
+   11GB, but Windows itself already uses ~11.8GB at near-idle (only
+   ~3.6GB free) — WSL2's internal `free -h` reflects a *promised*
+   Hyper-V dynamic-memory allocation, not memory the host can actually
+   back under real contention. **This reframes all of this session's
+   recurring OOM/stall friction (not just n=131072) as likely rooted in
+   genuine host-level memory pressure, not purely WSL2-internal
+   accounting.** Treated as an environment blocker, not an
+   implementation bug: next step is retrying with other Windows
+   processes closed to test this diagnosis directly, not further
+   cache-constant tuning (already proven not the limiting factor).
