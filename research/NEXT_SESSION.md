@@ -2,15 +2,44 @@
 
 ## Current commit
 
-Check `git log -3` on resume. As of this writing: `2080aa0` on `main`,
-pushed to origin (confirm push status — push again if `git status` shows
-ahead of origin).
+Check `git log -3` on resume. As of this writing, HEAD is a new commit
+on top of `02e84eb` (the production-integration/A-B/security-re-review
+round — see `MASTER_STATE.md`'s `## This round` section and
+`EXPERIMENT_LEDGER.md` entry #21 for what it contains). Confirm push
+status — push again if `git status` shows ahead of origin.
 
 ## Read first
 
-`research/MASTER_STATE.md` (current state, written AFTER this round's
-real work), then `research/EXPERIMENT_LEDGER.md` for full history.
-`docs/performance-baseline.md` predates `research/` and is historical only.
+`research/MASTER_STATE.md`'s `## This round: production integration,
+honest A/B, security re-review` section (near the end of the file) for
+the CURRENT state — it supersedes several claims earlier in that same
+file and in this document below. Then `research/EXPERIMENT_LEDGER.md`
+entry #21 for the condensed version. `docs/performance-baseline.md`
+predates `research/` and is historical only.
+
+## Immediate next action (the one concrete, executable item left open)
+
+**n=131072 secure-parameter feasibility test — not attempted this
+round, unchanged from before it.** Three prior attempts all OOM'd before
+printing even C2S stage 0's completion line, with `KROT_CAP`/`KSC_CAP`
+tightened each time (96/48 → 4/3 → 2/1) and the last attempt's observed
+RSS (4.5GB) still exceeding its own theoretical two-cache ceiling
+(~3.3GB) — something besides `KROT`/`KSC` also grows with n and is not
+yet identified. **Do not guess at cache constants again.** Add
+per-diagonal `[mem]` instrumentation inside the C2S/S2C stage loops
+first (the existing checkpoints only print at stage boundaries, never
+reached in any of the three attempts) to actually localize the growth
+before touching cache capacities further. Full three-attempt detail:
+`MEMORY_FEASIBILITY.md`.
+
+Secondary open items from this round (lower priority than the above):
+- A larger, truly-randomized (not block-alternated) A/B trial series to
+  settle whether rotation hoisting's end-to-end effect on the full
+  bootstrap is real-but-small or statistically zero — the current
+  8-trial, order-balanced series could not distinguish the two.
+- The SageMath lattice-estimator cross-check and the direct
+  eprint-2021/152 / eprint-2026/1060 parameter check named in
+  `SECURITY_ASSESSMENT.md`'s updated `## Disposition`.
 
 ## Before trusting any new benchmark number
 
@@ -228,9 +257,25 @@ for repeated/interleaved measurement — never trust a single sequential run.
    measurement would need the hoisted path to ALSO use a bounded view
    cache analogous to `KSC`, not fresh-every-diagonal — not yet built.
 
-   **Next step: extend from "validated on stage 0 (reproduced twice) in
-   isolation" to "wired into the live, full bootstrap across all 6
-   C2S+S2C stages."** This
+   **DONE, in a later round (see `MASTER_STATE.md`'s `## This round`
+   section and `EXPERIMENT_LEDGER.md` entry #21 — this paragraph is
+   preserved for history, do not re-plan it from scratch).** Extended
+   from "validated on stage 0 in isolation" to "wired into the live
+   full bootstrap, both C2S and S2C," via exactly the separate
+   `KROT_hoist` cache design this paragraph called for, feature-flagged
+   behind `HOIST_ROTATION_ENABLED` (off by default) with per-diagonal/
+   per-stage CUDA-error fallback to the trusted path. Correctness is
+   proven (byte-identical flag-off behavior; byte-identical `max slot
+   err` with the flag on across 4 trials). **What that later round did
+   NOT achieve: a clean, statistically solid performance win** — an
+   8-trial order-balanced A/B series found the effect small and within
+   noise once the warm-up order confound (the original design below
+   didn't anticipate it) is controlled for. `HOIST_ROTATION_ENABLED`
+   remains `false` by default and `test_boot_hoist_enabled` remains
+   un-promoted (not in the default ctest run) pending a larger,
+   fully-randomized trial series. The paragraph below (describing the
+   design BEFORE it was built) stays for history:
+
    needs a real architectural decision, not a quick swap — `test_boot.cpp`'s
    `rotFull`/`keyAt`/`KROT`/`KSC` build and cache TEXTBOOK-convention
    keys (permute the payload secret by `k`); the hoisted mechanism needs

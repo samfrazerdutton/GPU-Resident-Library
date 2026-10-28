@@ -5,8 +5,10 @@
 // the 1/2 and 1/(2i) get absorbed into EvalMod's affine multiply => 0 levels.
 #include "keyswitch.h"
 #include "keyswitch_resident.h"
+#include "keyswitch_hoist.h"
 #include "keygen.h"
 #include "rns_arith.h"
+#include "stage_acc.h"
 #include <cuda_runtime.h>
 #include <iostream>
 #include <vector>
@@ -306,6 +308,146 @@ int main(){
         KSC.emplace(kk,atLevel(rotFull(rotAmt(r),4000+r),tw));
         KSC_lru.push_front(kk); KSC_lru_pos[kk]=KSC_lru.begin();
         return KSC[kk]; };
+
+    // ==================== HOISTED ROTATION PATH (feature-flagged) ====================
+    // Production integration of correct-order rotation hoisting (research/
+    // NEXT_SESSION.md priority queue item 1), built on the validated
+    // mechanism in include/keyswitch_hoist.h + src/keyswitch_hoist.cpp and
+    // the two bug fixes from tests/test_hoist_allstages.cpp (segfault from
+    // an empty-av/bv shape-only key; correctness bug from generating a
+    // hoisted key directly at a reduced tower count instead of building
+    // full-size and taking an atLevel() view). DEFAULT OFF -- the existing
+    // trusted path (KROT/KSC/stageRotDiag, all completely unmodified above
+    // this point) remains the production behavior until this is proven
+    // correct AND faster end-to-end, per the governing directive.
+    //
+    // KROT_hoist: same role as KROT (expensive-to-regenerate, real
+    // evalkeygen_host_sold cost), same bounded-LRU pattern, same cap --
+    // deliberately NOT a second, independent cache sized differently,
+    // to avoid retaining more duplicate key material than the trusted
+    // path already does. Stores FULL-size (sizeQl=sizeQ) hoisted-convention
+    // keys; views at a reduced level are taken via atLevel() on demand
+    // (not cached separately, matching "avoid generating and retaining
+    // duplicate key material unnecessarily" -- atLevel's own copy is
+    // already the minimum duplication this design needs, same as KSC's
+    // relationship to KROT for the trusted path).
+    constexpr bool HOIST_ROTATION_ENABLED = false;   // feature flag: OFF by default
+    constexpr size_t KROT_HOIST_CAP = KROT_CAP;       // same safety margin as KROT
+    std::map<uint32_t,gpufhe::KeySwitchConstants> KROT_hoist;
+    std::list<uint32_t> KROT_hoist_lru;
+    std::map<uint32_t,std::list<uint32_t>::iterator> KROT_hoist_lru_pos;
+    uint32_t nKeygenHoist=0; double tKeygenHoist=0; uint32_t nHoistHits=0, nHoistEvictions=0;
+    auto rotFullHoist=[&](uint32_t k,uint32_t seed)->const gpufhe::KeySwitchConstants&{
+        auto it=KROT_hoist.find(k);
+        if(it!=KROT_hoist.end()){
+            ++nHoistHits;
+            KROT_hoist_lru.erase(KROT_hoist_lru_pos[k]); KROT_hoist_lru.push_front(k);
+            KROT_hoist_lru_pos[k]=KROT_hoist_lru.begin();
+            return it->second;
+        }
+        auto _t=NOW();
+        uint64_t kinv; { uint64_t a=(uint64_t)k%M, mmo=M; int64_t old_r=(int64_t)a,r=(int64_t)mmo,old_s=1,s=0;
+            while(r!=0){int64_t qd=old_r/r,tr=old_r-qd*r;old_r=r;r=tr;int64_t ts=old_s-qd*s;old_s=s;s=ts;}
+            int64_t res=old_s%(int64_t)mmo; if(res<0)res+=(int64_t)mmo; kinv=(uint64_t)res; }
+        std::vector<uint64_t> pkA_h=KPqp.pkA, pkB_h=KPqp.pkB;
+        gpufhe::automorphism_eval_host(pkA_h,sizeQlP,n,(uint32_t)kinv,modQP,rootQP);
+        gpufhe::automorphism_eval_host(pkB_h,sizeQlP,n,(uint32_t)kinv,modQP,rootQP);
+        gpufhe::KeySwitchConstants K; K.n=n;
+        gpufhe::compute_keyswitch_constants(K,mod,modP,npFor(sizeQ));
+        for(uint32_t i=0;i<sizeQ;++i){K.rootModList.push_back(mod[i]);K.rootValList.push_back(root[i]);}
+        for(uint32_t j=0;j<sizeP;++j){K.rootModList.push_back(modP[j]);K.rootValList.push_back(rootQP[sizeQ+j]);}
+        // Payload = KPqp.s UNPERMUTED, encrypting pk = pkA_h/pkB_h PERMUTED
+        // by k^-1 -- the proven hoisted convention (research/EXPERIMENT_LEDGER.md
+        // entry #14/#18). Built FULL-size (npFor(sizeQ)) -- never at a
+        // reduced sizeQl directly; that was bug #2 (see file header of
+        // tests/test_hoist_allstages.cpp).
+        gpufhe::evalkeygen_host_sold(K,KPqp.s,KPqp.s,pkA_h,pkB_h,PModq,modQP,rootQP,ns,3.19,seed);
+        ++nKeygenHoist; tKeygenHoist+=EL(_t);
+        if(KROT_hoist.size()>=KROT_HOIST_CAP){
+            uint32_t victim=KROT_hoist_lru.back(); KROT_hoist_lru.pop_back();
+            KROT_hoist_lru_pos.erase(victim); KROT_hoist.erase(victim);
+            ++nHoistEvictions;
+        }
+        KROT_hoist.emplace(k,std::move(K));
+        KROT_hoist_lru.push_front(k); KROT_hoist_lru_pos[k]=KROT_hoist_lru.begin();
+        return KROT_hoist[k]; };
+    auto keyAtHoist=[&](uint32_t r,uint32_t tw)->gpufhe::KeySwitchConstants{
+        return atLevel(rotFullHoist(rotAmt(r),9000+r),tw); };
+
+    // Per-stage hoisted context: decompose ONCE per stage (not per
+    // diagonal), reused across all of that stage's diagonals -- the
+    // actual decompose-sharing mechanism. CUDA-error-checked at every
+    // step; on ANY failure (allocation, kernel launch, decompose) this
+    // returns false and the caller falls back to the trusted path for
+    // that unit of work, never corrupting or blocking it.
+    struct HoistedStageCtx{
+        gpufhe::DeviceKSContext Cshape{};
+        gpufhe::HoistedDigits D{};
+        uint64_t *d_c0=nullptr,*d_c1=nullptr,*d_scratch=nullptr;
+        uint32_t towers=0; bool valid=false;
+    };
+    auto cudaOK=[&](const char* where)->bool{
+        cudaError_t e=cudaGetLastError();
+        if(e!=cudaSuccess){
+            std::cerr<<"  [hoist-fallback] CUDA error at "<<where<<": "<<cudaGetErrorString(e)
+                      <<" -- falling back to the trusted path for this unit of work\n";
+            return false;
+        }
+        return true; };
+    auto hoistedStageBegin=[&](HoistedStageCtx& R,const std::vector<uint64_t>& c0,
+                               const std::vector<uint64_t>& c1,uint32_t towers)->bool{
+        R=HoistedStageCtx{}; R.towers=towers;
+        size_t B=(size_t)towers*n*8;
+        R.Cshape=gpufhe::ks_context_create(atLevel(KREL,towers));
+        if(!cudaOK("ks_context_create(shape)")) return false;
+        R.D=gpufhe::hoist_digits_create(R.Cshape);
+        if(!cudaOK("hoist_digits_create")){ gpufhe::ks_context_destroy(R.Cshape); return false; }
+        cudaMalloc(&R.d_c0,B); cudaMalloc(&R.d_c1,B);
+        cudaMalloc(&R.d_scratch,(size_t)(towers+sizeP)*n*8);
+        if(!cudaOK("cudaMalloc(hoisted stage buffers)")){
+            gpufhe::hoist_digits_destroy(R.D); gpufhe::ks_context_destroy(R.Cshape); return false; }
+        cudaMemcpy(R.d_c0,c0.data(),B,cudaMemcpyHostToDevice);
+        cudaMemcpy(R.d_c1,c1.data(),B,cudaMemcpyHostToDevice);
+        gpufhe::ks_decompose_only(R.d_c1,R.Cshape,R.D,0);
+        cudaDeviceSynchronize();
+        if(!cudaOK("ks_decompose_only")){
+            cudaFree(R.d_c0); cudaFree(R.d_c1); cudaFree(R.d_scratch);
+            gpufhe::hoist_digits_destroy(R.D); gpufhe::ks_context_destroy(R.Cshape); return false; }
+        R.valid=true; return true; };
+    auto hoistedStageDiag=[&](HoistedStageCtx& R,std::vector<uint64_t>& out0,std::vector<uint64_t>& out1,
+                              uint32_t k,const gpufhe::KeySwitchConstants& Khoist,
+                              const std::vector<uint64_t>& PModqLevel,const std::vector<uint64_t>& ml)->bool{
+        if(!R.valid) return false;
+        uint32_t towers=R.towers; size_t B=(size_t)towers*n*8;
+        auto Ck=gpufhe::ks_context_create(Khoist);
+        if(!cudaOK("ks_context_create(diag key)")){ return false; }
+        auto Wk=gpufhe::ks_work_create(Ck);
+        if(!cudaOK("ks_work_create")){ gpufhe::ks_context_destroy(Ck); return false; }
+        gpufhe::ks_accumulate_from_digits(R.d_c1,R.D,Ck,Wk,0);
+        for(uint32_t t=0;t<towers;++t)
+            LaunchScaledAddInto(Wk.d_res0+(size_t)t*n, R.d_c0+(size_t)t*n, PModqLevel[t], ml[t], n, 0);
+        gpufhe::automorphism_eval_fast_device(Wk.d_res0,towers+sizeP,n,k,R.d_scratch,0);
+        gpufhe::automorphism_eval_fast_device(Wk.d_res1,towers+sizeP,n,k,R.d_scratch,0);
+        uint64_t *d_ba0,*d_ba1; cudaMalloc(&d_ba0,B); cudaMalloc(&d_ba1,B);
+        if(!cudaOK("cudaMalloc(ba0/ba1)")){
+            gpufhe::ks_work_destroy(Wk); gpufhe::ks_context_destroy(Ck); return false; }
+        gpufhe::ks_moddown(Ck,Wk,Wk.d_res0,d_ba0,0);
+        gpufhe::ks_moddown(Ck,Wk,Wk.d_res1,d_ba1,0);
+        cudaDeviceSynchronize();
+        if(!cudaOK("ks_moddown")){
+            cudaFree(d_ba0); cudaFree(d_ba1); gpufhe::ks_work_destroy(Wk); gpufhe::ks_context_destroy(Ck); return false; }
+        out0.resize((size_t)towers*n); out1.resize((size_t)towers*n);
+        cudaMemcpy(out0.data(),d_ba0,B,cudaMemcpyDeviceToHost);
+        cudaMemcpy(out1.data(),d_ba1,B,cudaMemcpyDeviceToHost);
+        cudaFree(d_ba0); cudaFree(d_ba1);
+        gpufhe::ks_work_destroy(Wk); gpufhe::ks_context_destroy(Ck);
+        return true; };
+    auto hoistedStageEnd=[&](HoistedStageCtx& R){
+        if(!R.valid) return;
+        cudaFree(R.d_c0); cudaFree(R.d_c1); cudaFree(R.d_scratch);
+        gpufhe::hoist_digits_destroy(R.D); gpufhe::ks_context_destroy(R.Cshape);
+        R.valid=false; };
+    // ==================== END HOISTED ROTATION PATH ====================
     auto rescaleAt=[&](std::vector<uint64_t>& a0,std::vector<uint64_t>& a1,uint32_t tw){
         std::vector<uint64_t> ml(mod.begin(),mod.begin()+tw),rl(root.begin(),root.begin()+tw);
         gpufhe::KeySwitchConstants Kd; Kd.n=n;
@@ -408,7 +550,19 @@ int main(){
         // scale FLAT through the intermediate stages by encoding at the modulus
         // being dropped; only the last stage does the 2^60 -> 2^50 step.
         const double dpt = (g+1<LST) ? (double)mod[ctw-1] : Delta_pt;
-        StageRotCtx R; stageRotBegin(R,cs0,cs1,ctw,keyAt(offs[0],ctw));
+        // Feature-flagged dispatch: stage-level decompose setup. If
+        // HOIST_ROTATION_ENABLED and decompose succeeds, this stage uses
+        // the hoisted path (decompose once, cheap per-diagonal accumulate);
+        // otherwise (flag off, or decompose itself failed) the trusted
+        // StageRotCtx path runs completely unmodified, exactly as before
+        // this integration existed.
+        StageRotCtx R; HoistedStageCtx Rh; bool stageUsesHoist=false;
+        if(HOIST_ROTATION_ENABLED){
+            stageUsesHoist = hoistedStageBegin(Rh,cs0,cs1,ctw);
+            if(!stageUsesHoist)
+                std::cerr<<"  [hoist-fallback] stage "<<g<<" decompose setup failed -- using the trusted path for this whole stage\n";
+        }
+        if(!stageUsesHoist) stageRotBegin(R,cs0,cs1,ctw,keyAt(offs[0],ctw));
         for(size_t x=0;x<offs.size();++x){
             auto _tp=NOW();
             std::vector<int64_t> md; gpufhe::encode_host(md,dg[x],n,dpt);
@@ -416,17 +570,40 @@ int main(){
             g_tPtEval+=EL(_tp);
             std::vector<uint64_t> t0,t1;
             auto _tr=NOW();
-            if(offs[x]) stageRotDiag(R,t0,t1,rotAmt(offs[x]),keyAt(offs[x],ctw),ctw,ml,rl);
+            if(offs[x]){
+                bool ok=false;
+                if(stageUsesHoist){
+                    auto Khoist=keyAtHoist(offs[x],ctw);
+                    std::vector<uint64_t> PModqLevel(PModq.begin(),PModq.begin()+ctw);
+                    ok=hoistedStageDiag(Rh,t0,t1,rotAmt(offs[x]),Khoist,PModqLevel,ml);
+                    if(!ok) std::cerr<<"  [hoist-fallback] stage "<<g<<" diag "<<x<<" hoisted compute failed -- falling back to the trusted path for this diagonal\n";
+                }
+                if(!ok){
+                    if(stageUsesHoist){
+                        // Rare-path fallback: the main stage context is
+                        // hoisted-mode, so build a throwaway trusted
+                        // context just for this one diagonal. Correctness
+                        // over efficiency here -- this path is not meant
+                        // to be hot.
+                        StageRotCtx Rfb; stageRotBegin(Rfb,cs0,cs1,ctw,keyAt(offs[x],ctw));
+                        stageRotDiag(Rfb,t0,t1,rotAmt(offs[x]),keyAt(offs[x],ctw),ctw,ml,rl);
+                        stageRotEnd(Rfb);
+                    } else {
+                        stageRotDiag(R,t0,t1,rotAmt(offs[x]),keyAt(offs[x],ctw),ctw,ml,rl);
+                    }
+                }
+            }
             else { t0=cs0; t1=cs1; }
             g_tRot+=EL(_tr);
             auto _ta=NOW();
             gpufhe::ct_mul_pt_host(t0,t1,dE,ctw,n,ml);
             if(fst){a0=t0;a1=t1;fst=false;} else gpufhe::ct_add_ct_host(a0,a1,t0,t1,ctw,n,ml);
             g_tCpuAcc+=EL(_ta); }
-        stageRotEnd(R);
+        if(stageUsesHoist) hoistedStageEnd(Rh); else stageRotEnd(R);
         rescaleAt(a0,a1,ctw);
         std::cerr<<"    C2S stage "<<g<<" tw="<<ctw<<" parts="<<npFor(ctw)
-                 <<" diags="<<offs.size()<<" keys="<<KSC.size()<<" t="<<EL(_t)<<"s\n";
+                 <<" diags="<<offs.size()<<" keys="<<KSC.size()
+                 <<(stageUsesHoist?" [hoisted]":"")<<" t="<<EL(_t)<<"s\n";
         csc=csc*dpt/(double)mod[ctw-1]; --ctw; cs0=a0; cs1=a1; }
       tC2S=EL(_t); }
     std::cout<<"C2S: "<<LST<<" FFT stages (radix 2^"<<RST<<"), "<<ndiagTot
@@ -698,7 +875,13 @@ int main(){
                                 srcs1={{&oR.c1,cd{1,0}},{&oI.c1,cd{0,1}}}; }
         else { srcs0={{&sa0,cd{1,0}}}; srcs1={{&sa1,cd{1,0}}}; }
         for(size_t q2=0;q2<srcs0.size();++q2){
-          StageRotCtx R; stageRotBegin(R,*srcs0[q2].first,*srcs1[q2].first,stw,keyAt(offs[0],stw));
+          StageRotCtx R; HoistedStageCtx Rh; bool stageUsesHoist=false;
+          if(HOIST_ROTATION_ENABLED){
+              stageUsesHoist = hoistedStageBegin(Rh,*srcs0[q2].first,*srcs1[q2].first,stw);
+              if(!stageUsesHoist)
+                  std::cerr<<"  [hoist-fallback] S2C stage "<<g<<" q="<<q2<<" decompose setup failed -- using the trusted path\n";
+          }
+          if(!stageUsesHoist) stageRotBegin(R,*srcs0[q2].first,*srcs1[q2].first,stw,keyAt(offs[0],stw));
           for(size_t x=0;x<offs.size();++x){
             auto _tp=NOW();
             std::vector<cd> dd(S);
@@ -708,14 +891,31 @@ int main(){
             g_tPtEval+=EL(_tp);
             std::vector<uint64_t> t0,t1;
             auto _tr=NOW();
-            if(offs[x]) stageRotDiag(R,t0,t1,rotAmt(offs[x]),keyAt(offs[x],stw),stw,ml,rl);
+            if(offs[x]){
+                bool ok=false;
+                if(stageUsesHoist){
+                    auto Khoist=keyAtHoist(offs[x],stw);
+                    std::vector<uint64_t> PModqLevel(PModq.begin(),PModq.begin()+stw);
+                    ok=hoistedStageDiag(Rh,t0,t1,rotAmt(offs[x]),Khoist,PModqLevel,ml);
+                    if(!ok) std::cerr<<"  [hoist-fallback] S2C stage "<<g<<" q="<<q2<<" diag "<<x<<" hoisted compute failed -- falling back\n";
+                }
+                if(!ok){
+                    if(stageUsesHoist){
+                        StageRotCtx Rfb; stageRotBegin(Rfb,*srcs0[q2].first,*srcs1[q2].first,stw,keyAt(offs[x],stw));
+                        stageRotDiag(Rfb,t0,t1,rotAmt(offs[x]),keyAt(offs[x],stw),stw,ml,rl);
+                        stageRotEnd(Rfb);
+                    } else {
+                        stageRotDiag(R,t0,t1,rotAmt(offs[x]),keyAt(offs[x],stw),stw,ml,rl);
+                    }
+                }
+            }
             else { t0=*srcs0[q2].first; t1=*srcs1[q2].first; }
             g_tRot+=EL(_tr);
             auto _ta=NOW();
             gpufhe::ct_mul_pt_host(t0,t1,dE,stw,n,ml);
             if(fst){a0=t0;a1=t1;fst=false;} else gpufhe::ct_add_ct_host(a0,a1,t0,t1,stw,n,ml);
             g_tCpuAcc+=EL(_ta); }
-          stageRotEnd(R); }
+          if(stageUsesHoist) hoistedStageEnd(Rh); else stageRotEnd(R); }
         rescaleAt(a0,a1,stw);
         std::cerr<<"    S2C stage "<<g<<" tw="<<stw<<" parts="<<npFor(stw)
                  <<" diags="<<offs.size()<<" keys="<<KSC.size()<<" t="<<EL(_t)<<"s\n";
@@ -735,9 +935,15 @@ int main(){
     double eFin=0; for(uint32_t k=0;k<S;++k) eFin=std::max(eFin,std::abs(zF[k]-z[k]));
     double secs=std::chrono::duration<double>(std::chrono::steady_clock::now()-tBoot).count();
     std::cout<<"\n=== BOOTSTRAP RESULT ===\n";
-    std::cout<<"evalkeygen calls total = "<<nKeygen<<" (was ~130 with per-level regeneration)\n";
+    std::cout<<"evalkeygen calls total = "<<nKeygen<<" trusted + "<<nKeygenHoist
+              <<" hoisted (was ~130 with per-level regeneration)\n";
     std::cout<<"bootstrap wall time = "<<secs<<" s\n";
-    std::cout<<"  keygen (48 keys) = "<<tKeygen<<" s\n";
+    std::cout<<"  keygen (trusted, "<<nKeygen<<" keys) = "<<tKeygen<<" s\n";
+    std::cout<<"  keygen (hoisted, "<<nKeygenHoist<<" keys) = "<<tKeygenHoist<<" s\n";
+    if(HOIST_ROTATION_ENABLED)
+        std::cout<<"  KROT_hoist: size="<<KROT_hoist.size()<<" hits="<<nHoistHits
+                  <<" misses="<<nKeygenHoist<<" evictions="<<nHoistEvictions
+                  <<" hit-rate="<<(nHoistHits+nKeygenHoist?100.0*nHoistHits/(nHoistHits+nKeygenHoist):0.0)<<"%\n";
     std::cout<<"  C2S              = "<<tC2S<<" s\n";
     std::cout<<"  EvalMod x2       = "<<tEM<<" s\n";
     std::cout<<"  S2C              = "<<tS2C<<" s\n";

@@ -104,6 +104,16 @@ gpufhe_test(test_modraise tests/test_modraise.cpp)
 gpufhe_test(test_c2s_bsgs tests/test_c2s_bsgs.cpp)
 gpufhe_test(test_boot_a tests/test_boot_a.cpp)
 gpufhe_test(test_boot tests/test_boot.cpp)
+# Exercises the feature-flagged hoisted rotation path end-to-end, now
+# covering BOTH C2S and S2C (shares one KROT_hoist cache across both
+# phases). NOT added to the default ctest run yet -- correctness is
+# proven (byte-identical max slot err to the trusted path across 8
+# interleaved A/B trials) but the measured speedup is small and noisy
+# once run-order bias is corrected for; performance acceptance criteria
+# have not cleanly passed (see research/NEXT_SESSION.md). Buildable
+# explicitly.
+add_executable(test_boot_hoist_enabled tests/test_boot_hoist_enabled.cpp)
+target_link_libraries(test_boot_hoist_enabled PRIVATE gpufhe CUDA::cudart)
 gpufhe_test(test_c2s_stages tests/test_c2s_stages.cpp)
 gpufhe_test(test_alpha10 tests/test_alpha10.cpp)
 gpufhe_test(test_chain tests/test_chain.cpp)

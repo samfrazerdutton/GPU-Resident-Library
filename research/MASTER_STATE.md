@@ -1,7 +1,15 @@
 # Master state
 
-Last updated: this session, third execution-focused cycle. Delivered TWO
-real, validated wins (KSC bound, eval-domain automorphism), one safe
+Last updated: this session, FOURTH execution-focused cycle (production
+integration round, on top of commit `02e84eb`). **Read
+`## This round: production integration, honest A/B, security re-review`
+near the end of this file first** — it supersedes several claims in the
+body below (notably the "classical security is solid" framing and the
+un-corrected-for-order-bias performance numbers). The body below is
+preserved for history and is otherwise still accurate.
+
+Prior summary (third execution-focused cycle): delivered TWO real,
+validated wins (KSC bound, eval-domain automorphism), one safe
 prerequisite refactor (keyswitch_resident split), and attempted a third,
 riskier optimization (correct-order rotation hoisting) that failed twice
 on the key-generation convention specifically -- documented precisely
@@ -278,3 +286,139 @@ with an untested implementation.**
 - Host RAM ceiling (10GB in WSL2): confirmed binding; now partially
   relieved (25% reduction via the KSC fix) but KROT's own scaling at
   n=131072 remains unsolved and is the standing blocker.
+
+## This round: production integration, honest A/B, security re-review
+
+Built directly on `02e84eb` (correct-order rotation hoisting, proven
+across all 3 C2S stages; quantum-adjusted security estimate derived).
+Three pieces of real work, one still-open gap, honestly reported.
+
+### 1. Hoisting wired into the live production bootstrap, behind a flag
+
+`tests/test_boot.cpp` gained a `KROT_hoist` cache (same bounded-LRU
+pattern as `KROT`/`KSC`) plus `HoistedStageCtx`/`hoistedStageBegin/Diag/
+End` lambdas, feature-flagged via `constexpr bool
+HOIST_ROTATION_ENABLED` (false in `test_boot.cpp`; a new parallel file
+`tests/test_boot_hoist_enabled.cpp` sets it true — same CMake target,
+NOT added to the default ctest run). `src/keyswitch_resident.cpp` was
+not touched. Both the C2S loop and the S2C loop were wired to the
+hoisted path, each with per-diagonal AND per-stage CUDA-error fail-safe
+fallback to the trusted `StageRotCtx`/`stageRotDiag` path (`cudaOK()`
+checks `cudaGetLastError()` and logs `[hoist-fallback]` before falling
+back).
+
+**Flag-off behavior is proven byte-identical to the pre-integration
+baseline**: `max slot err = 0.000547871` matched exactly across all 4
+flag-OFF trials in the A/B series below, and peak RSS matched (~8.3GB).
+This is the correctness gate for "the fallback path is untouched," and
+it passed.
+
+**Real bug found and fixed mid-round: cross-phase cache-sharing side
+effect.** The trusted path's `KROT` cache is populated during C2S and
+then REUSED for free by S2C (confirmed: KROT size is flat from C2S's end
+through S2C's end). A first attempt hoisted ONLY C2S, diverting its
+keygen into the separate `KROT_hoist` cache and leaving the original
+`KROT` empty — so S2C (still trusted-path) lost its free cache hits and
+paid full fresh keygen per diagonal, ballooning 29.1s→77.8s and erasing
+C2S's own real gain at the full-bootstrap level (167.8s vs 132.9s
+baseline — SLOWER overall despite C2S alone being faster, 73.7s vs
+86.3s). Fix: extend the identical hoisting pattern to S2C's `q2`-loop so
+C2S and S2C share ONE `KROT_hoist` cache. After the fix, a single
+end-to-end run reached 111.154s vs a 132.937s baseline — a real
+improvement in that one comparison — but see the A/B series below for
+why that single comparison should not be trusted as "the" speedup
+number.
+
+Cache telemetry from that run: `KROT_hoist` size=75, hits=... ,
+hit-rate=58.3%, 0 evictions, ~0.595s/key keygen cost — a working,
+correctly-instrumented cache (hit/miss/eviction counts all behave as
+expected under repeated execution).
+
+### 2. Honest, order-balanced interleaved A/B measurement — small, noisy effect, NOT a clean win
+
+Directive required fair, interleaved, order-controlled A/B measurement
+with reported sample count/median/variability — not a single comparison.
+Ran 8 full-bootstrap trials (`test_boot` = OFF, `test_boot_hoist_enabled`
+= ON), all passing correctness (`max slot err` matched the established
+baseline exactly in every trial):
+
+| # | order pos | flag | wall time |
+|---|-----------|------|-----------|
+| 1 | 1st | OFF | 124.203s |
+| 2 | 2nd | ON  | 112.957s |
+| 3 | 1st | OFF | 113.855s |
+| 4 | 2nd | ON  | 110.372s |
+| 5 | 1st | OFF | 108.375s |
+| 6 | 2nd | ON  | 113.016s |
+| 7 | 1st | ON  | 108.673s |
+| 8 | 2nd | OFF | 108.504s |
+
+First 3 pairs ran OFF-then-ON (paired diffs, OFF−ON: +11.246, +3.483,
+−4.641). This is the SAME order-confound class this session's earlier
+resident-rotation experiment was burned by: the condition that runs
+SECOND within a pair inherits extra GPU warm-up, biasing it to look
+faster. Trial 7-8 reversed the order (ON-first, OFF-second) specifically
+to correct for this, and the diff collapsed to near zero (OFF−ON =
+−0.169s).
+
+**Aggregate, n=4 OFF / n=4 ON**: OFF mean=113.734s (stdev=7.432, range
+108.4–124.2), ON mean=111.255s (stdev=2.117, range 108.7–113.0). Paired
+diff median=+1.657s, mean=+2.480s, **stdev of the paired diff
+(6.722s) exceeds the mean diff** — the apparent ON-is-faster effect is
+NOT clearly distinguishable from run-to-run/order/thermal noise at this
+sample size. The single order-balanced pair (7↔8) that most directly
+isolates the true effect from the warm-up confound shows it near zero.
+
+**Honest verdict: the hoisted path has NOT been shown to deliver a
+clean, reproducible end-to-end speedup once order bias is controlled
+for.** The ~16% win from the single first post-fix comparison
+(111.154s vs 132.937s) was almost certainly inflated by factors this
+8-trial series does not reproduce (likely a cold/warm cache or thermal
+asymmetry in that specific one-off comparison, not a property of the
+mechanism itself). Per the directive's explicit instruction, this is
+reported as-is rather than cited as a win. **Performance acceptance
+criteria have NOT cleanly passed — `HOIST_ROTATION_ENABLED` must stay
+`false` in `test_boot.cpp` and `test_boot_hoist_enabled` must stay
+un-promoted (not in the default `gpufhe_test`/ctest run).** A larger,
+fully-randomized (not block-alternated) trial count, with GPU clocks
+observed via `nvidia-smi` per trial, would be needed to resolve whether
+a small real effect exists under the noise.
+
+### 3. Security re-review: adversarial check found the prior "130-bit conservative" framing overconfident
+
+A delegated adversarial review of `02e84eb`'s quantum-adjusted estimate
+(`research/SECURITY_ASSESSMENT.md`, `## Independent adversarial review`
+section) found two real issues, independently fact-checked via WebFetch
+against the cited papers: (a) the classical 134-bit hybrid-attack
+calibration is ~3-6 years stale against newer attack-family papers
+(eprint 2021/152, eprint 2026/1060 — the latter explicitly FHE-targeted)
+never checked against these exact parameters, plausibly costing 2-18
+more bits; (b) the "130-bit conservative quantum" bound is internally
+inconsistent — it credits QRAM to the sieve phase but declines to credit
+it to MITM, when arXiv 2410.15565 shows the sieve speedup also needs
+QRAM, so 130 bits does not describe a coherent attacker.
+**`SECURITY_ASSESSMENT.md`'s `## Disposition` section has been updated
+to state this as the current operative position: n=131072/h=64 must NOT
+be presented as production-secure; the honest range is 114-134 bits
+depending on unresolved model assumptions ("insufficient evidence either
+way"), and the 114-bit large-QRAM figure remains a live, material
+warning, not a resolved footnote.**
+
+### What's still open
+
+- **n=131072 feasibility/performance test (directive section 6): NOT
+  attempted this round.** The pre-existing, still-unresolved state from
+  before this round (3 failed OOM attempts, an unidentified
+  memory-growth source beyond `KROT`/`KSC`, documented in
+  `MEMORY_FEASIBILITY.md`/`NEXT_SESSION.md`) was read but not acted on —
+  this round's time went to the production-integration/benchmark/
+  security work above instead. **Exact next action**: add per-diagonal
+  `[mem]` instrumentation inside the C2S/S2C stage loops (the existing
+  checkpoints only print at stage boundaries, never reached in any of
+  the three n=131072 attempts) to localize the growth before touching
+  cache-capacity constants again.
+- A larger, truly-randomized A/B trial series (not block-alternated) to
+  settle whether hoisting's end-to-end effect is real-but-small or zero.
+- The SageMath lattice-estimator cross-check and the direct
+  eprint-2021/152 / eprint-2026/1060 parameter check named in
+  `SECURITY_ASSESSMENT.md`'s updated Disposition.

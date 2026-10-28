@@ -331,15 +331,48 @@ modeling the MITM attack at all.
 
 ## Disposition
 
-**n=131072, sparse secret h=64 (unchanged), log2(QP)=1775 (unchanged
+**SUPERSEDED BELOW — do not stop reading at this paragraph.** The
+original version of this section (preserved immediately below for
+history) stated n=131072/h=64/log2(QP)=1775 as a "corrected candidate
+secure profile" with "classical security... solid (134 bits)." The
+independent adversarial review (`## Independent adversarial review`,
+below) found that framing overconfident on two independent grounds: (a)
+the hybrid-attack calibration this repo's classical 134-bit figure rests
+on is itself ~3-6 years stale against newer attack-family papers
+(eprint 2021/152, eprint 2026/1060) that were never checked against
+these exact parameters and could plausibly cost 2-18 bits, and (b) the
+"130-bit conservative quantum" figure is internally inconsistent — it
+credits QRAM to the sieve phase but not to MITM, when published work
+(arXiv 2410.15565) shows the sieve speedup also needs QRAM, so the
+130-bit number does not actually describe a coherent, consistently-built
+attacker.
+
+**Current operative position: n=131072/h=64/log2(QP)=1775 must NOT be
+presented as production-secure. The honest range this repo's own
+evidence supports is 114-134 bits depending on model assumptions neither
+fully validated nor fully refuted — "insufficient evidence either way,"
+not "128-bit secure" and not "known insecure."** The only number safe to
+quote without heavy caveats is the classical, QRAM-free floor (134 bits,
+itself now in question per (a) above). The 114-bit large-QRAM figure is
+a material warning that has NOT been resolved this round, not an
+optional footnote — treat it as live until either refuted or the
+parameters are made more conservative in response to it. A SageMath
+lattice-estimator cross-check and a direct check of this codebase's exact
+(n, log2(QP), h) against eprint 2021/152 and eprint 2026/1060 are the two
+concrete pieces of evidence still missing before any stronger claim can
+be made.
+
+**Original disposition, preserved for history (superseded above):**
+
+n=131072, sparse secret h=64 (unchanged), log2(QP)=1775 (unchanged
 circuit) is the corrected candidate secure profile — not n=65536 uniform
-ternary.** Do not implement the secret-distribution switch that the
+ternary. Do not implement the secret-distribution switch that the
 previous revision of this document recommended; it has been superseded by
 the analysis above. Do not continue treating the current n=8192 instance
 as anything other than an explicitly insecure (~51-bit) demo/research
 configuration.
 
-**Updated, with the quantum derivation above factored in**: classical
+Updated, with the quantum derivation above factored in: classical
 security is solid (134 bits, 6-bit margin over the 128-bit target).
 Quantum security is NOT a single comfortable number — it is 130 bits
 under a conservative, no-large-quantum-memory attacker (2-bit margin,
@@ -365,6 +398,15 @@ above 131072 to find where the 114-bit figure clears 128 — not yet done,
 out of scope for this round since the conservative bound already meets
 the target.
 
+**This "next concrete security task" list is itself now superseded in
+priority order: before (1)-(5) above, resolve the two missing-evidence
+items named in the current operative position (SageMath cross-check;
+eprint 2021/152 and eprint 2026/1060 applied to these exact parameters).
+Running the n=131072 feasibility/performance test (items 1-3 above) is
+still independently useful and was attempted this round — see
+`MASTER_STATE.md`/`NEXT_SESSION.md` for its current blocked status — but
+its result does not by itself resolve the security question.**
+
 ## UPDATE: estimator output independently re-run and preserved (this round)
 
 Re-ran both tools fresh for the exact candidate, output preserved
@@ -387,3 +429,205 @@ bound (does not model the sparse-specific MITM attack) — do not quote
 quantum number exists for this candidate (see the standing caveats
 above, unchanged). Target (128 bits) is met by the tight model with a
 6-bit margin, not a wide one.
+
+## Independent adversarial review (delegated, this round)
+
+Reviewer's role for this section: find holes, not confirm the prior
+analysis is fine. Each point below states what was checked, cites the
+source precisely, and gives an honest verdict — including where the
+prior analysis should NOT currently be trusted as stated.
+
+### 1. Re-derivation of `hybrid()`'s math against the published literature — WEAKER than stated
+
+`hybrid()`'s structure (dual-attack dimension-error tradeoff + MITM
+guessing window + hypergeometric retry-weight) is a faithful
+implementation of the APPROACH in Cheon, Hhan, Hong, Son, *"A Hybrid of
+Dual and Meet-in-the-Middle Attack on Sparse and Ternary Secret LWE"*
+(eprint [2019/1114](https://eprint.iacr.org/2019/1114)) — independently
+confirmed by fetching the abstract directly: for n=2^15, log2(q)=628,
+ternary h=64 (explicitly "a parameter set used for HEAAN bootstrapping"
+— i.e. exactly this codebase's regime), the paper reports **2^112.5
+operations AND 2^70.6 bits of memory**, matching the "published 112.5"
+figure this repo's calibration already uses.
+
+**But the memory figure (70.6 bits) is ~42 bits BELOW the time figure
+(112.5 bits) — a large, deliberate time-memory asymmetry.** A naive
+balanced two-list MITM (what `hybrid_security.py`'s
+`MITM_cost(k,w)=0.5*log2(N)` implicitly models, applied identically to
+both time and memory) would give time≈memory, not a 42-bit gap. This
+means the REAL optimal attack in the calibration paper uses a more
+sophisticated time-memory tradeoff (very plausibly a representation
+technique in the Howgrave-Graham/May tradition) that
+`hybrid_security.py`'s formula does not capture — it is a SIMPLIFIED
+proxy for the calibration paper's result, not a direct implementation
+of its optimal algorithm. (Could not independently confirm the exact
+tradeoff mechanism from the paper's own equations — eprint blocks
+automated PDF fetches with a 403; only the abstract was accessible.
+This specific point should be treated as "found a real discrepancy,
+mechanism not fully confirmed," not as fully resolved.)
+
+**More importantly: a materially more recent, DIRECTLY applicable
+literature line exists and was never consulted.** Web search surfaced:
+- Cheon, Hong, et al., *"Hybrid Dual Attack on LWE with Arbitrary
+  Secrets"* (eprint [2021/152](https://eprint.iacr.org/2021/152)) —
+  abstract confirms (fetched directly): "improve the state-of-the-art
+  cryptanalysis results by **2-14 bits**, under the BKZ-core-SVP model"
+  across NIST PQC round-3 proposals, using **May's meet-in-the-middle
+  technique** — a different, more modern MITM construction than the
+  Odlyzko-style one `hybrid_security.py` is calibrated against.
+- A follow-on, *"Hybrid Dual and Meet-LWE Attack"* (eprint
+  [2022/1330](https://eprint.iacr.org/2022/1330.pdf)).
+- Bi, Liu, Lu, Luo, Wang, *"An Improved Hybrid Dual Attack on LWE with
+  Sparse Secrets and its Application to FHE"* (eprint
+  [2026/1060](https://eprint.iacr.org/2026/1060)) — confirmed via the
+  abstract: explicitly builds on the 2022 May's-MITM line, fixes "two
+  main efficiency bottlenecks: the costly enumeration of error entries
+  and the large number of hash function labels," and **directly
+  targets FHE**: "our results invalidate the accelerated BGV scheme in
+  [EUROCRYPT 2024] by reducing its bit-security below the claimed
+  security level, with the most extreme case being **18 bits lower**."
+
+**Verdict: WEAKER than stated.** `hybrid_security.py` is calibrated
+against a single 2019 paper in an attack family that has since been
+improved multiple times (2021, 2022, 2026), with one directly-FHE-
+targeted 2026 result demonstrating an 18-bit reduction is achievable
+against a comparable (BGV, not CKKS) scheme once a modern May's-MITM-
+based attack is applied, and a general improvement range of 2-14 bits
+reported across other lattice schemes. This codebase's classical margin
+over 128 bits is 6 bits (134-128). **A reduction of this documented
+magnitude, if it transfers to this exact (n=131072, h=64, log2(QP)=1775)
+parameter set — which was NOT checked, because this newer attack family
+was never run against it — would plausibly erase the entire classical
+margin, not just the quantum one.** This is not confirmed (the newer
+papers' PDFs could not be fetched to extract a parameter-matched
+number), but it is a concrete, named, citable gap, not a vague
+disclaimer.
+
+### 2. The 114-bit large-QRAM result — material, and the "conservative" 130-bit bound has an inconsistency problem
+
+The directive required treating 114 bits as a warning, not a footnote.
+Having done so, a further issue was found that affects the 130-bit
+"conservative" figure's own validity, not just the 114-bit one:
+
+`hybrid_quantum()` applies the quantum sieve exponent (0.265 vs
+classical 0.292) to the BKZ/lattice-reduction phase **unconditionally**
+— i.e. even in the `credit_mitm_qracm=False` "conservative" mode — on
+the stated grounds that this substitution is "well-established... not
+new reasoning," because `lwe_security.py` already uses it. Independent
+search found Ghosh, Guo, et al. (or similar — exact author list not
+confirmed from the abstract alone), *"Does quantum lattice sieving
+require quantum RAM?"* (arXiv
+[2410.15565](https://arxiv.org/abs/2410.15565), 2024), whose abstract
+states directly: **"under reasonable assumptions, quantum speedups in
+lattice sieving require the use of QRAM. In particular, no quantum
+speedup is possible without QRAM"** — and further, that "even speedups
+with a SMALL QRAM are already challenging."
+
+**This means the 0.265*beta exponent is not QRAM-free — it rests on
+the SAME category of contested large-quantum-memory assumption that
+`hybrid_quantum()` explicitly declines to credit for the MITM phase.**
+Treating the sieve's QRAM dependency as settled background ("not new
+reasoning") while treating the MITM phase's QRAM dependency as a
+live, must-flag assumption is not evenhanded — both phases' quantum
+speedups rest on the same kind of hardware assumption. A genuinely
+"no large QRAM credited anywhere" conservative bound would need to
+leave the sieve at the CLASSICAL 0.292*beta exponent too, which —
+since the MITM phase is also classical in that mode — would make the
+"conservative quantum" bound numerically **equal to the classical
+134-bit result**, not 130. The true range this model can currently
+defend is closer to **somewhere between 114 bits (both phases
+maximally QRAM-credited) and 134 bits (neither phase QRAM-credited,
+i.e. no realized quantum advantage at all) — the 130-bit figure sits
+at an inconsistent, partially-credited midpoint** (QRAM credited for
+sieve, not for MITM) rather than a principled floor.
+
+This does not mean the sieve speedup is wrong to use at all — the
+arXiv paper also shows an interpolation exists between classical and
+quantum sieving depending on QRAM SIZE, and the field broadly treats
+*some* bounded QRAM as more plausible than the LARGE QRAM BHT's MITM
+speedup needs — but the current code does not model that size-
+dependent interpolation, it applies the full idealized exponent as a
+binary on/off. **Verdict: the 114-bit figure is a real, well-grounded
+material warning, as the directive anticipated — confirmed, do not
+footnote it. The 130-bit "conservative" figure is ALSO weaker than
+its label implies: it is not actually a QRAM-free floor, it is a
+partially-QRAM-credited midpoint, and the real QRAM-free floor is the
+classical 134-bit number.** Could not independently confirm NIST's
+own PQC specification documents taking an explicit position on
+crediting QRAM to MITM-style attack components specifically (search
+did not surface Kyber/Dilithium spec text on this point directly) —
+that specific citation in the existing write-up above should be
+treated as plausible but not independently re-confirmed this round.
+
+### 3. SageMath lattice-estimator cross-check — NOT done, genuinely unresolved
+
+Could not run the SageMath lattice-estimator (no Sage environment
+available to this review; this is a tooling/access gap, not a
+judgment call). This remains exactly the open gap the existing
+document already flags — this review does not resolve it, and no
+number in this document should be read as cross-validated against the
+field's actual standard tool. Given finding #1 above (a materially
+more recent attack-family improvement exists and was never run against
+these parameters), running the lattice-estimator — or, better, the
+actual Sage modules the 2019/1114, 2021/152, and 2026/1060 papers
+reportedly ship alongside themselves — is now a more urgent gap than
+it was before this review, not a routine checkbox.
+
+### 4. Modulus-chain correctness and precision — theoretically sound, EMPIRICALLY UNVERIFIED at n=131072
+
+This is a distinct question from attack cost: does `log2(QP)=1775` at
+n=131072/h=64 deliver adequate CKKS correctness (precision margin,
+decryption failure rate), independent of whether it's secure?
+`tests/test_boot.cpp`'s `Kbud`/`rDbl` formula (read directly, not
+re-derived) is literally n-independent for the sparse branch
+(`HW? 2.5*sqrt(HW) : ...`), and the `Delta_in` encoding scale is
+explicitly scaled by `sqrt(n)` to hold the per-coefficient signal
+magnitude constant as n grows — both are sound, deliberate design
+choices for EXTENDING the n=8192 design to larger n. **But neither has
+ever been empirically exercised at n=131072**: per
+`research/MEMORY_FEASIBILITY.md`'s own "three real attempts, all
+OOM'd" section, n=131072 has NOT completed even one end-to-end
+bootstrap run, so the `max slot err` figure this codebase relies on
+for its correctness claims (`5.47871e-4`, repeatedly reproduced) has
+ONLY ever been measured at n=8192. The theoretical argument for why it
+should transfer is reasonable; it is not yet a measurement. **Verdict:
+genuinely uncertain — the engineering argument is sound but untested,
+not confirmed.**
+
+### 5. Resource feasibility vs. the security requirement — real tension, not yet resolved
+
+Cross-checked against `research/MEMORY_FEASIBILITY.md` directly: n=131072
+is the SECURITY-REQUIRED target (n=65536 falls short at 90-113 bits
+depending on secret distribution), but it has never run successfully —
+three independent attempts, each with progressively tighter `KROT_CAP`/
+`KSC_CAP` bounds, all ended in OOM, with the last attempt's RSS growth
+(up to 4.5GB) exceeding its own theoretical two-cache ceiling (~3.3GB)
+by a wide, unexplained margin ("some other allocation grows with n in
+a way neither KROT_CAP nor KSC_CAP bounds... not yet investigated").
+**Verdict: real, currently unresolved tension.** The security analysis
+and the engineering feasibility analysis currently point in opposite
+directions — security says "must be n=131072," engineering says
+"n=131072 has never finished a single run" — and neither side of this
+document should be read as settled until the other catches up. This is
+already stated plainly in `MEMORY_FEASIBILITY.md` itself; this review
+confirms that framing is accurate and not overstated.
+
+### Direct verdict
+
+**Should this codebase currently claim "n=131072/h=64 is production-
+secure"? No.** Three independent reasons, any one of which alone would
+be sufficient: (a) the classical estimate's calibration is based on a
+single 2019 paper in an attack family with documented post-2021
+improvements of 2-18 bits against comparable FHE parameters, never
+checked against this exact candidate; (b) the "130-bit conservative
+quantum" figure is not actually QRAM-free as labeled — the defensible
+QRAM-free floor is the classical 134-bit number, and the defensible
+QRAM-credited floor is 114 bits, which fails the 128-bit target
+outright; (c) n=131072 has not yet completed a single successful
+end-to-end bootstrap run on this hardware, so even the ENGINEERING
+feasibility of the proposed secure configuration remains unproven,
+separate from its security margin. The honest position is not "n=131072
+is insecure" either — it is **"insufficient evidence either way,"**
+with the specific missing evidence named above (a lattice-estimator or
+modern-attack-family re-check, and a completed n=131072 run) rather
+than left as a vague caveat.
