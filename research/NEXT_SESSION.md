@@ -3,58 +3,73 @@
 ## Current commit
 
 Check `git log -3` on resume. As of this writing, HEAD is a new commit
-on top of `f1978ab` (the n=131072 memory-investigation round — see
-`MEMORY_FEASIBILITY.md`'s final `## UPDATE` section for the full story,
-condensed in `MASTER_STATE.md`'s latest `## This round` section and
-`EXPERIMENT_LEDGER.md` entry #22). Confirm push status — push again if
-`git status` shows ahead of origin.
+on top of `176d847` (the "verify OOM diagnosis and remove the diagonal
+bottleneck" round — see `MEMORY_FEASIBILITY.md`'s final `## UPDATE
+(next round)` section for the full story, condensed in
+`MASTER_STATE.md`'s latest section and `EXPERIMENT_LEDGER.md` entry
+#23). Confirm push status — push again if `git status` shows ahead of
+origin.
 
 ## Read first
 
-`research/MEMORY_FEASIBILITY.md`'s final `## UPDATE (new round): KROT/KSC
-cache mechanism DEFINITIVELY CLEARED...` section — it supersedes the
-"something besides KROT/KSC grows with n, not yet identified" framing
-used everywhere earlier in that file and in this document. Then
-`research/MASTER_STATE.md`'s `## This round: production integration,
-honest A/B, security re-review` section for the PRIOR round's findings
-(still current), and `research/EXPERIMENT_LEDGER.md` entries #21-#22.
+`research/MEMORY_FEASIBILITY.md`'s final `## UPDATE (next round):
+precise kill-mechanism investigation + the diagonal bottleneck fixed +
+a 6th attempt reaches far further than ever before` section — it
+SHARPENS (does not simply repeat) the prior round's "host physical RAM
+is the root cause" framing: the kill is now proven NOT a Linux
+kernel OOM-kill and NOT a process crash/exception (checked via `dmesg`/
+`journalctl`, twice, for two separate kills), and a real,
+independent bottleneck (`stageDiags`'s O(S^2) cost) has been fixed and
+verified, letting a real attempt reach 8x further than ever before
+(diagonal 8 of 16, vs. 1-2 previously) before still being killed. Then
+`research/MASTER_STATE.md`'s two most recent sections, and
+`research/EXPERIMENT_LEDGER.md` entries #21-#23.
 
 ## Immediate next action (the one concrete, executable item left open)
 
-**n=131072 feasibility is now believed to be blocked by this specific
-machine's total physical RAM (~15.4GB), not by an unidentified
-implementation bug.** This round isolated the KROT/KSC bounded-LRU
-cache mechanism in a standalone experiment (`tests/
-test_n131072_cache_churn.cpp`) and proved it plateaus at a bounded
-~3.2GB through 22+11 real evictions — it is NOT the runaway cause.
-Enhanced instrumentation on a 5th real attempt showed RSS was only
-1436MB (safely low) immediately before the crash, which happened
-inside the very first `keyAt()`/`stageRotBegin()` call of stage 0 —
-code-reading ruled out that call's own allocations (device-side,
-~350MB-1.35GB, all previously-established patterns) as the explanation.
-Checking the Windows host directly found the real likely cause: this
-machine has only ~15.42GB total physical RAM, `.wslconfig` caps WSL2 at
-11GB, but Windows itself already uses ~11.8GB at near-idle (only ~3.6GB
-free) — WSL2's internal `free -h` ("10Gi free") reflects a *promised*
-allocation, not memory the host can actually back under real
-contention. **Next concrete steps, in order**: (1) close other
-Windows-side memory consumers and retry the exact same
-`./test_boot_n131072` command to see if it survives further with
-maximum real host headroom — the cheapest, most direct test of this
-diagnosis, not yet done; (2) if it still fails with minimal other
-load, treat ~15.4GB total physical RAM as a hard blocker for n=131072
+**The diagonal bottleneck is fixed and verified (268s -> 0.11s per
+stage, wired into `tests/test_boot_n131072.cpp`). The KROT/KSC cache
+mechanism is now TWICE confirmed bounded** (an isolated experiment,
+`tests/test_n131072_cache_churn.cpp`, from the prior round; and now 8
+real diagonals in situ this round, RSS flat at exactly 4561.35MB for 7
+consecutive diagonals). **The one genuinely open technical thread**:
+GPU memory showed a small, unexplained climb (+0.5-1MB/diagonal) over
+diagonals 5-8 of the 6th attempt — observed over far too few of the
+128 total diagonals (16/stage x 8 stages) a complete run needs to tell
+whether it plateaus (harmless) or keeps climbing (a real, if slow,
+contributor). **Next concrete step**: extend
+`tests/test_n131072_cache_churn.cpp` (or a similar small, isolated
+harness) to also exercise `ks_context_create`/`ks_work_create`/
+`stageRotBegin`'s device allocations repeatedly — the one allocation
+path the existing isolated test still does not touch, and the most
+likely source of a GPU-side (not host-side) slow climb — over MANY
+more iterations than 8, to determine whether it plateaus. Do this
+BEFORE attempting another full n=131072 bootstrap run (per the
+governing directive: do not repeatedly retry the full workload).
+Separately, the kill mechanism itself remains only partially
+characterized: proven NOT a Linux OOM-kill or process crash, but the
+exact external trigger (most likely this session's own tool harness
+watching Windows host memory) cannot be confirmed with more certainty
+from inside this environment — if a future session has access to the
+harness's own monitoring logic or can run outside it, that would close
+this last gap. If neither of these is pursued and host-RAM pressure
+remains the working hypothesis instead: (1) close other Windows-side
+memory consumers and retry the exact same `./test_boot_n131072` command
+to see if it survives further with maximum real host headroom, now
+MUCH cheaper to test since the diagonal fix means a dead run is known
+within seconds instead of 268s/stage; (2) if it still fails with
+minimal other load, treat ~15.4GB total physical RAM as a hard blocker
+for n=131072
 on this specific machine and stop retrying cache-constant tweaks — the
 realistic paths forward are more physical RAM or a streaming
 (non-cached) key-material architecture, both out of scope for a single
 session. **Do NOT further lower `KROT_CAP`/`KSC_CAP` expecting a
 different result** — `test_n131072_cache_churn.cpp` already proved the
 cache mechanism itself is not the limiting factor at the caps already
-in use. Also note: `stageDiags`/`stageDiagsFwd` (O(S²), now measured at
-268s/call at n=131072, ~35 CPU-minutes for all 8 C2S+S2C stages) is a
-severe, separate, real performance cost independent of whether the
-memory question resolves — worth fixing (precompute diagonal structure
-analytically) before any future large-n attempt regardless. Full detail:
-`MEMORY_FEASIBILITY.md`.
+in use. **`stageDiags`/`stageDiagsFwd`'s O(S²) cost is now FIXED** (was
+268s/call, now 0.11s/call, verified in production — see the round
+described above) — do not re-flag this as still-open in any future
+session. Full detail: `MEMORY_FEASIBILITY.md`.
 
 Secondary open items from this round (lower priority than the above):
 - A larger, truly-randomized (not block-alternated) A/B trial series to

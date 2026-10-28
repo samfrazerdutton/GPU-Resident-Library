@@ -562,3 +562,174 @@ runs earlier in this same session under normal host conditions,
 including as recently as the immediately prior commit (`f1978ab`) — the
 two OOM kills here are classified as environmental/resource-related,
 not a regression from this round's changes, on that basis.
+
+## UPDATE (next round): precise kill-mechanism investigation + the diagonal bottleneck fixed + a 6th attempt reaches far further than ever before
+
+Per a follow-up directive ("VERIFY OOM DIAGNOSIS AND REMOVE THE
+LARGE-N DIAGONAL BOTTLENECK"), this round did NOT repeat the prior
+investigation blindly — it (1) checked the actual kill mechanism
+directly rather than inferring it from Windows-side free-memory numbers
+alone, (2) fixed the independently-flagged `stageDiags`/`stageDiagsFwd`
+O(S²) bottleneck with a proven-equivalent analytic replacement, and (3)
+used that fix to re-attempt n=131072 under favorable host conditions,
+getting dramatically further than any of the five prior attempts.
+
+### Priority 2 result: what is PROVEN, what is HYPOTHESIS, what remains UNKNOWN about the kill mechanism
+
+**Proven** (direct evidence, not inference):
+- `dmesg` (covering this WSL2 VM's entire uptime, Oct 24 boot through
+  the present, 1809+ lines) contains **zero** occurrences of `oom`,
+  `out of memory`, or `killed process` — the standard Linux kernel
+  OOM-killer's own log strings. `journalctl -k` returns no entries at
+  all (kernel ring buffer is not persisted via systemd-journald in this
+  setup; `dmesg` is the authoritative source and was checked directly).
+  **The Linux kernel inside the WSL2 VM never invoked its own
+  OOM-killer for any of these terminations.**
+- WSL's own crash-capture mechanism (`WSL_ENABLE_CRASH_DUMP=1` in the
+  kernel boot command line, confirmed via `dmesg`) DOES actively log
+  genuine process crashes: a real example exists in this exact `dmesg`
+  buffer — `bench_evalmult_resident`'s known, pre-existing,
+  unrelated `std::runtime_error`/SIGABRT (signal 6) was captured with
+  an explicit `WSL (... - CaptureCrash): Capturing crash for pid: ...,
+  executable: ...bench_evalmult_resident, signal: 6` line. **No
+  equivalent crash-capture entry exists for any `test_boot` or
+  `test_boot_n131072` termination** — ruling out an uncaught C++
+  exception (e.g. `std::bad_alloc` from a failed host allocation) or a
+  signal-raising crash (e.g. `SIGSEGV`) as the mechanism for THOSE
+  kills specifically; such an event would have produced a log entry
+  exactly like the one that exists for the unrelated benchmark.
+- `ru_maxrss` (used throughout this file's RSS figures) is documented
+  (`man 2 getrusage`) as "the maximum resident set size used" — a
+  monotonic high-water mark since process start, not the instantaneous
+  RSS at the moment of the call. This means every printed RSS figure in
+  this document is a valid upper bound on memory in use at that print
+  point, never an understatement — the mystery growth this file
+  describes is not an artifact of `ru_maxrss` hiding a larger transient
+  spike that had already subsided; if anything, a transient spike
+  elsewhere would make the printed number LARGER than the true
+  instantaneous value, not smaller.
+
+**Well-supported hypothesis, not directly provable from inside the WSL2
+VM**: the terminations are most plausibly an external kill (most likely
+SIGKILL, which cannot be caught or logged by the dying process, and is
+not expected to appear in the crash-capture mechanism either, which
+only captures catchable signals/exceptions) issued from OUTSIDE the
+Linux VM — almost certainly the Claude Code tool harness's own
+system-memory safety monitor on the Windows host (every kill this
+session, across multiple distinct commands, produced the identical
+notification wording "stopped because the system is running low on
+memory," consistent with one centralized, Windows-side monitor rather
+than varying organic in-VM events, which — per the dmesg evidence above
+— did not occur). This is NOT something this session can verify with
+certainty from inside WSL: the harness's exact trigger logic (whether
+it watches Windows host free RAM, the WSL2 VM's own memory footprint,
+or some combination) is not observable from here.
+
+**Unknown**: the precise instant-by-instant memory trajectory between
+the last successful `[mem]` print and the actual kill (the probes are
+per-diagonal, not continuous) — so a genuine, very brief, large
+transient spike in that specific window cannot be fully ruled out as a
+contributing factor, even though the evidence above weighs against the
+process's own steady-state memory need being the direct cause (see the
+6th attempt below, where RSS was observed PLATEAUED, not climbing, for
+seven consecutive diagonals before the kill).
+
+### Priority 3 result: the `stageDiags`/`stageDiagsFwd` O(S²) bottleneck is FIXED, proven equivalent, and measured in production
+
+Full detail, methodology, and the complete equivalence-proof data are in
+`EXPERIMENT_LEDGER.md` entry #23; summary here. A new, independent,
+self-contained test (`tests/test_c2s_diag_fast.cpp`) reproduces the
+EXACT brute-force `applyMerged`/`stageDiags` (and `applyMergedFwd`/
+`stageDiagsFwd`) algorithm as an oracle, implements an analytic
+replacement (a symbolic dynamic-programming pass through the RST
+butterfly stages — tracking, for every output index, the small list of
+`(source_index, coefficient)` pairs it depends on, instead of probing
+with `S` full unit basis vectors), and proves them **exactly equivalent
+(within 1e-9) across 18 (n, LST, g, direction) combinations spanning
+RST=1 through RST=13**, including RST=4 explicitly — the exact value
+this file's own `LST=4` configuration uses at n=131072. Benchmarked at
+n=2048/4096/8192/16384: speedups from 2.5x to **332x** depending on
+RST (the production-relevant RST=4 case at n=8192 shows the 332x
+figure). The old brute-force oracle is kept permanently in that
+standalone test file (not duplicated inside any production test), per
+the governing directive's "preserve the old implementation as a test
+oracle" instruction.
+
+**Wired directly into `tests/test_boot_n131072.cpp`** (same function
+names/signatures for `stageDiags`/`stageDiagsFwd`, so no other code in
+that file needed to change) — `tests/test_boot.cpp` (the n=8192 default
+test) was deliberately left untouched, since O(S²) is never a
+bottleneck at that scale. **Measured in the real production file on a
+real run**: `stageDiags` for C2S stage 0 now takes **0.110205 seconds**
+(was 268.047 seconds) — a ~2433x reduction for that single call, and by
+extension an estimated ~35-CPU-minute total cost across all 8 C2S+S2C
+stages reduced to well under one second.
+
+### Priority 4 result: a 6th attempt, with favorable host memory, reaches diagonal 8 of 16 — far further than any of the five prior attempts, then is killed anyway with zero kernel trace
+
+Checked real Windows host memory before launching (7.43GB free — a
+materially better window than the ~2.8-3.9GB seen during the prior
+round's attempts) and proceeded, consistent with the directive's
+go/no-go gate. Result:
+
+```
+ModRaise: congruence mismatches = 0 (want 0), max|I| = 11
+analytic inverse self-check: diag err=0 offdiag=2.45581e-17
+    [mem] C2S stage 0 stageDiags done: t=0.110205s diags=16 RSS=1462.99MB GPU=1254.69MB
+      [mem] stage 0 diag 0/16 RSS=3533.24MB GPU=1604.69MB KROT=1 KSC=1
+      [mem] stage 0 diag 1/16 RSS=4523.34MB GPU=1732.69MB KROT=2 KSC=1
+      [mem] stage 0 diag 2/16 RSS=4561.34MB GPU=1732.69MB KROT=2 KSC=1
+      [mem] stage 0 diag 3/16 RSS=4561.35MB GPU=1732.69MB KROT=2 KSC=1
+      [mem] stage 0 diag 4/16 RSS=4561.35MB GPU=1734.69MB KROT=2 KSC=1
+      [mem] stage 0 diag 5/16 RSS=4561.35MB GPU=1734.69MB KROT=2 KSC=1
+      [mem] stage 0 diag 6/16 RSS=4561.35MB GPU=1734.69MB KROT=2 KSC=1
+      [mem] stage 0 diag 7/16 RSS=4561.35MB GPU=1734.69MB KROT=2 KSC=1
+      [mem] stage 0 diag 8/16 RSS=4561.35MB GPU=1736.69MB KROT=2 KSC=1
+(killed -- no further output)
+```
+
+Three real findings:
+1. **The diagonal fix works in production, exactly as benchmarked
+   standalone** — `stageDiags` cost collapsed from the previously
+   measured 268s to 0.11s, confirmed on this live run, not just in the
+   isolated test.
+2. **The KROT/KSC cache mechanism is confirmed bounded in the REAL
+   bootstrap context, not just the isolated synthetic experiment**:
+   host RSS reached a steady 4561.35MB by diagonal 2 and stayed EXACTLY
+   there (not even a KB of drift reported) through diagonal 8 — seven
+   consecutive diagonals with zero RSS growth. This directly extends
+   the prior round's isolated `test_n131072_cache_churn` finding into
+   the actual bootstrap.
+3. **A small, not-yet-explained residual GPU-memory climb exists and is
+   NOT yet proven to plateau**: GPU used memory crept from 1732.69MB to
+   1736.69MB over diagonals 5 through 8 (roughly +0.5-1MB/diagonal) --
+   small in absolute terms, but observed over only 4 of the 128 total
+   diagonals (16/stage x 8 stages) a complete run would need, so
+   whether it continues, accelerates, or itself plateaus past diagonal
+   8 is genuinely unknown, not just unmeasured.
+
+Checked `dmesg` immediately after this kill too (current VM time vs.
+dmesg's last entry, both confirmed): **again zero kernel-logged
+events of any kind for this termination**, identical to the first
+`test_boot` kill this round — the same external-kill signature,
+reinforcing (not newly proving) the Priority 2 hypothesis above rather
+than providing independent confirmation of a different mechanism.
+
+**Honest verdict**: Objective C (n=131072 end-to-end) is still not
+complete. But the diagnosis is now substantially sharper than before
+this round: the diagonal bottleneck that was an independent, severe
+problem is FIXED and verified; the KROT/KSC cache mechanism is now
+TWICE confirmed bounded (isolated experiment, and now 8 real
+diagonals in situ) rather than merely argued from code-reading; and the
+termination itself still shows zero in-VM kernel evidence, consistent
+with an external, host-level trigger rather than this specific
+process's own memory need. The one genuinely open technical thread is
+the small residual GPU-memory climb, observed over too few diagonals to
+classify. Do not re-attempt the full n=131072 run repeatedly hoping for
+a different result under similar host conditions (per the governing
+directive); the next concrete, lower-cost step is to extend the
+per-diagonal GPU-memory probe across MORE diagonals within a
+cheaper, isolated harness (extending `tests/test_n131072_cache_churn.cpp`
+to also exercise `ks_context_create`/`ks_work_create`/`stageRotBegin`'s
+device allocations repeatedly, the one allocation path that isolated
+test still does not touch) before attempting another full bootstrap run.

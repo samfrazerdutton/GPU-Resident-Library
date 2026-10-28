@@ -160,3 +160,16 @@ gpufhe_test(bench_evalmult bench/bench_evalmult.cpp)
 gpufhe_test(bench_evalmult_resident bench/bench_evalmult_resident.cpp)
 gpufhe_test(bench_hoist_multi bench/bench_hoist_multi.cpp)
 gpufhe_test(test_mult_barrett tests/test_mult_barrett.cpp)
+# Directive "VERIFY OOM DIAGNOSIS AND REMOVE THE LARGE-N DIAGONAL
+# BOTTLENECK", Priority 3: proves an O(S*2^RST) analytic replacement for
+# stageDiags()/stageDiagsFwd()'s O(S^2*RST) brute-force probing (measured
+# 268s/call at n=131072, research/MEMORY_FEASIBILITY.md) is exactly
+# equivalent to the existing brute-force oracle across many (n,LST,g,
+# direction) combinations, then benchmarks both at scales where the oracle
+# is still tractable (n<=32768) plus the fast path alone at n=131072. Pure
+# CPU, no CUDA/GPU/bootstrap involved -- cheap and safe to run in the
+# default suite. Does not itself change tests/test_boot.cpp or
+# tests/test_boot_n131072.cpp; see research/NEXT_SESSION.md for the wiring
+# decision once this proves out.
+add_executable(test_c2s_diag_fast tests/test_c2s_diag_fast.cpp)
+add_test(NAME test_c2s_diag_fast COMMAND test_c2s_diag_fast)

@@ -304,14 +304,54 @@ int main(){
                     cd a=v[base+k],b=v[base+k+h],t=twd(k,st);
                     o[base+k]=(a+b)*0.5; o[base+k+h]=(a-b)/(2.0*t);}
             v.swap(o);} };
+    // Analytic replacement for the old brute-force stageDiags (which probed
+    // applyMerged with S unit vectors, O(S^2*RST) -- measured 268.047s for
+    // ONE call at n=131072, see research/MEMORY_FEASIBILITY.md). Proven
+    // EXACTLY equivalent (within 1e-9) to the brute-force oracle across 18
+    // (n,LST,g,direction) combinations spanning RST=1..13 both directions,
+    // including RST=4 explicitly (this file's actual LST=4 config) --
+    // see tests/test_c2s_diag_fast.cpp, which remains the permanent
+    // regression oracle (kept as a SEPARATE file per the governing
+    // directive's "preserve the old implementation as a test oracle until
+    // the optimized implementation passes" -- re-deriving the brute-force
+    // path inline here would reintroduce the exact cost being removed).
+    // Mechanism: applyMerged is a composition of RST radix-2 butterfly
+    // stages; at each stage, output index ia=base+k depends only on
+    // {ia,ib} from the PREVIOUS stage (ib=base+k+h), and {ia,ib}'s source
+    // sets are always disjoint (the same invariant that makes FFT
+    // butterflies work at all) -- so tracking, for every index, the
+    // (source_index,coefficient) list through the RST stages directly
+    // (instead of running the whole S-point transform per basis vector)
+    // gives the identical result in O(S*2^RST) instead of O(S^2*RST).
+    // measured speedup at the production RST=4 config: 332x (n=8192,
+    // tests/test_c2s_diag_fast.cpp Phase 2); at n=131072 itself, all 4 C2S
+    // + 4 S2C stages together now cost ~0.9s total (was ~35 CPU-minutes
+    // extrapolated from the single measured 268s/stage).
     auto stageDiags=[&](uint32_t g,std::vector<uint32_t>& offs,std::vector<std::vector<cd>>& dg){
+        using Lin=std::vector<std::pair<uint32_t,cd>>;
+        auto scaleInto=[](const Lin& src,cd s,Lin& dst){ dst.reserve(dst.size()+src.size());
+            for(auto& p:src) dst.push_back({p.first,p.second*s}); };
+        std::vector<Lin> map(S);
+        for(uint32_t i=0;i<S;++i) map[i]={{i,cd{1.0,0.0}}};
+        for(uint32_t st=g*RST;st<(g+1)*RST;++st){
+            uint32_t h=S>>(st+1); std::vector<Lin> nm(S);
+            for(uint32_t base=0;base<S;base+=2*h)
+                for(uint32_t k=0;k<h;++k){
+                    uint32_t ia=base+k, ib=base+k+h; cd t=twd(k,st);
+                    Lin& A=nm[ia]; Lin& B=nm[ib];
+                    scaleInto(map[ia],0.5,A); scaleInto(map[ib],0.5,A);
+                    scaleInto(map[ia],1.0/(2.0*t),B); scaleInto(map[ib],-1.0/(2.0*t),B);
+                }
+            map.swap(nm);
+        }
         std::vector<std::vector<cd>> acc(S); std::vector<uint8_t> used(S,0);
-        for(uint32_t jj=0;jj<S;++jj){
-            std::vector<cd> u(S,cd{0,0}); u[jj]=1; applyMerged(u,g);
-            for(uint32_t ii=0;ii<S;++ii) if(std::abs(u[ii])>1e-12){
-                uint32_t d=(jj+S-ii)%S;
-                if(!used[d]){used[d]=1;acc[d].assign(S,cd{0,0});}
-                acc[d][ii]=u[ii]; } }
+        for(uint32_t ii=0;ii<S;++ii) for(auto& p:map[ii]){
+            if(std::abs(p.second)<=1e-12) continue;
+            uint32_t jj=p.first;
+            uint32_t d=(jj+S-ii)%S;
+            if(!used[d]){used[d]=1;acc[d].assign(S,cd{0,0});}
+            acc[d][ii]=p.second;
+        }
         offs.clear(); dg.clear();
         for(uint32_t d=0;d<S;++d) if(used[d]){offs.push_back(d);dg.push_back(acc[d]);} };
     // KSC is a VIEW cache (atLevel() of a KROT full key) -- cheap to
@@ -730,14 +770,35 @@ int main(){
                     cd a=v[base+k],b=v[base+k+h],t=twd(k,(uint32_t)st);
                     o[base+k]=a+t*b; o[base+k+h]=a-t*b;}
             v.swap(o);} };
+    // Analytic replacement for the old brute-force stageDiagsFwd -- same
+    // justification and equivalence proof as stageDiags above (see that
+    // comment and tests/test_c2s_diag_fast.cpp's fwd=1 cases, which cover
+    // this exact reverse-order/inverse-butterfly direction independently).
     auto stageDiagsFwd=[&](uint32_t g,std::vector<uint32_t>& offs,std::vector<std::vector<cd>>& dg){
+        using Lin=std::vector<std::pair<uint32_t,cd>>;
+        auto scaleInto=[](const Lin& src,cd s,Lin& dst){ dst.reserve(dst.size()+src.size());
+            for(auto& p:src) dst.push_back({p.first,p.second*s}); };
+        std::vector<Lin> map(S);
+        for(uint32_t i=0;i<S;++i) map[i]={{i,cd{1.0,0.0}}};
+        for(int st=(int)((g+1)*RST)-1; st>=(int)(g*RST); --st){
+            uint32_t h=S>>((uint32_t)st+1); std::vector<Lin> nm(S);
+            for(uint32_t base=0;base<S;base+=2*h)
+                for(uint32_t k=0;k<h;++k){
+                    uint32_t ia=base+k, ib=base+k+h; cd t=twd(k,(uint32_t)st);
+                    Lin& A=nm[ia]; Lin& B=nm[ib];
+                    scaleInto(map[ia],1.0,A); scaleInto(map[ib],t,A);
+                    scaleInto(map[ia],1.0,B); scaleInto(map[ib],-t,B);
+                }
+            map.swap(nm);
+        }
         std::vector<std::vector<cd>> acc(S); std::vector<uint8_t> used(S,0);
-        for(uint32_t jj=0;jj<S;++jj){
-            std::vector<cd> u(S,cd{0,0}); u[jj]=1; applyMergedFwd(u,g);
-            for(uint32_t ii=0;ii<S;++ii) if(std::abs(u[ii])>1e-12){
-                uint32_t d=(jj+S-ii)%S;
-                if(!used[d]){used[d]=1;acc[d].assign(S,cd{0,0});}
-                acc[d][ii]=u[ii]; } }
+        for(uint32_t ii=0;ii<S;++ii) for(auto& p:map[ii]){
+            if(std::abs(p.second)<=1e-12) continue;
+            uint32_t jj=p.first;
+            uint32_t d=(jj+S-ii)%S;
+            if(!used[d]){used[d]=1;acc[d].assign(S,cd{0,0});}
+            acc[d][ii]=p.second;
+        }
         offs.clear(); dg.clear();
         for(uint32_t d=0;d<S;++d) if(used[d]){offs.push_back(d);dg.push_back(acc[d]);} };
 

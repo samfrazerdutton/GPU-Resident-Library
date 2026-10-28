@@ -483,3 +483,38 @@ condensed: `EXPERIMENT_LEDGER.md` entry #22). Three results:
    implementation bug: next step is retrying with other Windows
    processes closed to test this diagnosis directly, not further
    cache-constant tuning (already proven not the limiting factor).
+
+## Later round still: kill mechanism precisely characterized; diagonal bottleneck fixed; 6th attempt reaches 8x further than ever before
+
+Full detail: `MEMORY_FEASIBILITY.md`'s "UPDATE (next round)" section;
+condensed: `EXPERIMENT_LEDGER.md` entry #23. Three results:
+
+1. **Kill mechanism investigated directly** (`dmesg`/`journalctl`, twice,
+   for two separate kills): PROVEN not a Linux kernel OOM-kill (zero
+   matching log lines across the whole VM uptime) and PROVEN not an
+   uncaught C++ exception/signal (WSL's crash-capture mechanism, shown
+   to work via an unrelated real example, logged nothing for either
+   kill). Well-supported but not directly provable: an external kill
+   from the Windows host side (most likely this session's own tool
+   harness). `ru_maxrss` confirmed (man page) to be a monotonic
+   high-water mark, so it cannot be hiding a larger true memory use.
+2. **The independently-flagged `stageDiags`/`stageDiagsFwd` O(S^2)
+   bottleneck is fixed**: a new standalone test
+   (`tests/test_c2s_diag_fast.cpp`) proves an O(S*2^RST) analytic
+   replacement exactly equivalent to the old brute-force algorithm
+   across 18 (n,LST,g,direction) combinations (RST=1..13, both
+   directions), with measured speedups 2.5x-332x. Wired into
+   `tests/test_boot_n131072.cpp` only (same signatures, `tests/
+   test_boot.cpp` untouched). On a real run, `stageDiags` for one stage
+   dropped from the previously-measured 268.047s to 0.110205s.
+3. **A 6th real n=131072 attempt reached diagonal 8 of 16** (every
+   prior attempt died within 1-2 diagonals) with host RSS plateaued at
+   EXACTLY 4561.35MB for 7 consecutive diagonals — directly confirming,
+   inside the real bootstrap, what the prior round's isolated
+   cache-churn experiment showed synthetically. A small, unresolved
+   GPU-memory climb (+0.5-1MB/diagonal over diagonals 5-8) is the one
+   remaining open thread; it was observed over too few of the 128 total
+   diagonals a full run needs to classify as growing or plateauing. The
+   process was still killed, again with zero kernel trace. **n=131072
+   end-to-end remains incomplete, but the diagnosis is now
+   substantially sharper on every front this round touched.**
