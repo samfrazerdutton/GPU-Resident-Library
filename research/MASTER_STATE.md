@@ -518,3 +518,52 @@ condensed: `EXPERIMENT_LEDGER.md` entry #23. Three results:
    process was still killed, again with zero kernel trace. **n=131072
    end-to-end remains incomplete, but the diagnosis is now
    substantially sharper on every front this round touched.**
+
+## Later round still: GPU-memory lifecycle isolated with real production APIs; external-kill correlation directly demonstrated; NO-GO decision for the next full attempt under current host conditions
+
+Full detail: `MEMORY_FEASIBILITY.md`'s "UPDATE (next round)" section;
+condensed: `EXPERIMENT_LEDGER.md` entry #24. Built
+`tests/test_n131072_gpu_lifecycle.cpp`, driving the real
+`ks_context_create`/`keyswitch_resident`/`ks_context_destroy` per
+diagonal and `ks_work_create`/`ks_work_destroy` per stage lifecycle
+(the same bounded-LRU KROT cache as production), isolated from the rest
+of the bootstrap. Three results:
+
+1. **Host RSS proven flat across 68 diagonals and 3 stage transitions**
+   (exactly 4193MB, zero drift) — the most robust confirmation yet that
+   KROT/KSC and the host side of this lifecycle are bounded.
+2. **GPU memory shows two separable patterns**: a tiny, linear
+   ~0.53MB/diagonal within-stage drift (matching the real run's earlier
+   observation), and a much larger ~200MB NET growth per STAGE
+   TRANSITION that is NOT explained by `ks_work_create`/`destroy`
+   (pairs cleanly) or any identified host-side cache. Best-supported
+   hypothesis: CUDA device-allocator pool retention across
+   differently-sized per-stage allocations — not independently
+   confirmed, since `compute-sanitizer` and per-process `nvidia-smi`
+   tracking are both unavailable in this WSL2 CUDA-passthrough setup
+   (checked directly). Extrapolating linearly across a full 8-stage run
+   projects to ~3-3.5GB GPU usage — comfortably under the 6GB VRAM
+   card, meaning this growth is unlikely to be the binding constraint
+   by itself.
+3. **External-kill correlation directly demonstrated, not just
+   inferred**: a second, cheaper run (8 stages, 3 diagonals each) was
+   killed after only 2 diagonals — but those 2 diagonals' RSS/GPU
+   values were bit-for-bit identical to the first run's first 2.
+   Checked real host memory: 5.41GB free after the first run's kill vs.
+   only 3.66GB free before the second run's launch. The identical
+   internal process state survived wildly different lengths purely as
+   a function of external host memory at launch time.
+
+Also fixed one real, confirmed, tiny (~128 bytes/call) leak found via
+direct code reading: `ks_context_destroy` never freed `C.d_keyRow`.
+Three to four orders of magnitude too small to explain the
+~200MB/transition growth, but genuine — fixed and verified via
+`test_ks_resident`/`test_rot_resident`/`test_hoist_single` (bit-exact)
+plus `test_c2s_diag_fast` (unaffected).
+
+**Decision: NO-GO for a 7th full n=131072 attempt right now** — real
+host free memory was only 2.49GB at the time of this writeup, well
+below the ~6-7GB window that let this workload get furthest in every
+attempt that succeeded partially. Explicit criterion recorded for a
+future attempt: real Windows host free memory >=6GB, checked via
+`Get-CimInstance Win32_OperatingSystem` immediately before launch.

@@ -733,3 +733,188 @@ cheaper, isolated harness (extending `tests/test_n131072_cache_churn.cpp`
 to also exercise `ks_context_create`/`ks_work_create`/`stageRotBegin`'s
 device allocations repeatedly, the one allocation path that isolated
 test still does not touch) before attempting another full bootstrap run.
+
+## UPDATE (next round): GPU-memory lifecycle isolated with real production APIs — a real, reproducible transition-correlated growth found; external-kill correlation directly demonstrated; one confirmed (tiny) leak fixed
+
+Per the follow-up directive "ISOLATE GPU MEMORY GROWTH AND PROVE
+LARGE-N FEASIBILITY." Built `tests/test_n131072_gpu_lifecycle.cpp`,
+which drives the REAL production lifecycle — `ks_context_create`,
+`keyswitch_resident`, `ks_context_destroy` per diagonal, `ks_work_create`/
+`ks_work_destroy` per stage, the same bounded-LRU `KROT` rotation-key
+cache as production, `stageRotBegin`/`stageRotDiag`/`stageRotEnd` with
+identical shape — with none of the rest of the bootstrap (no ModRaise,
+no ciphertext encode/decode, no `stageDiags`), to isolate exactly this
+device-memory lifecycle from everything else.
+
+### Run 1: 4 stages (tw=30,29,28,27) x 20 diagonals — 68 diagonals completed (far more than the 6th real attempt's 8) before an external kill
+
+```
+baseline: RSS=228MB GPU_used=1038.69MB
+stage0 diag0:  RSS=3105MB GPU_used=1732.69MB
+stage0 diag19: RSS=4193MB GPU_used=1742.69MB   (+10MB over 19 steps)
+[stage0 end, after ks_work_destroy]:     GPU_used=1612.69MB   (-130MB)
+stage1 diag0:  RSS=4193MB GPU_used=1952.69MB   (+340MB jump from stage0's end)
+stage1 diag19: RSS=4193MB GPU_used=1962.69MB   (+10MB over 19 steps)
+[stage1 end]:                            GPU_used=1832.69MB   (-130MB)
+stage2 diag0:  RSS=4193MB GPU_used=2150.69MB   (+318MB jump)
+stage2 diag19: RSS=4193MB GPU_used=2160.69MB   (+10MB)
+[stage2 end]:                            GPU_used=2038.69MB   (-122MB)
+stage3 diag0:  RSS=4193MB GPU_used=2356.69MB   (+318MB jump)
+stage3 diag7:  RSS=4193MB GPU_used=2360.69MB   (killed shortly after)
+```
+
+Three distinct, precisely separable findings:
+
+1. **Host RSS is PROVEN flat — more robustly than ever before.** Exactly
+   4193MB from stage 0 diagonal 2 onward, through all 68 diagonals and 3
+   full stage transitions, zero drift. This extends the prior round's
+   8-diagonal in-situ observation and the isolated cache-churn
+   experiment's 22-eviction observation to a much longer, harder test
+   (68 diagonals, 4 distinct tower counts) with the identical result:
+   the KROT/KSC mechanism and the host side of this lifecycle are
+   genuinely bounded, not a contributing factor.
+2. **A small, consistent, LINEAR within-stage GPU-memory drift: exactly
+   +10MB over 19 diagonal-to-diagonal steps, identical in all three
+   fully-observed stages** (≈0.53MB/diagonal). This reproduces, in a
+   controlled setting, the +0.5-1MB/diagonal climb seen over only 4
+   data points in the real 6th attempt — confirmed real, confirmed
+   small, confirmed consistent in magnitude across stages.
+3. **A much larger, NOT yet explained, consistent ~200MB NET growth per
+   STAGE TRANSITION** (computed two ways, cross-checking: directly from
+   consecutive stage-start values, 220MB/198MB/206MB; and as [jump into
+   new stage] minus [[[drop at previous stage's end]], 340-130=210MB /
+   318-130=188MB / 318-122=196MB — consistent to within measurement
+   noise). This is NOT explained by:
+   - `ks_work_create`/`ks_work_destroy`: these pair cleanly — the
+     ~122-130MB drop at every stage's end matches `ks_work_create`'s own
+     computed footprint (`maxPart*n*8 + 3*sizeQlP*n*8 + sizeP*n*8 +
+     sizeQl*n*8` ≈ 134MB at this scale) almost exactly, confirming this
+     specific create/destroy pair is NOT leaking.
+   - Any of the per-stage-keyed host-side caches read directly in
+     `src/keyswitch_resident.cpp` (`g_rtab`, keyed by `(n,q)` — moduli
+     are stage-invariant, so this should not even grow after stage 0;
+     `upc`, keyed by `(n,sizeQl,numPart,part,field)` — DOES get new
+     entries each stage, but each entry is at most a few hundred bytes
+     (`sizePart`/`sizeCompl`-sized, not `n`-sized), summing to roughly
+     20KB of new entries per stage — three orders of magnitude too
+     small).
+   - `evalkeygen_host_sold`'s own per-part transient device buffers
+     (`d_u`/`d_e0`/`d_e1`, `src/evalkeygen.cpp`): these are IDENTICALLY
+     sized every single call (always built at full `sizeQlP=32`,
+     regardless of the level the key will later be viewed at) and
+     called on EVERY diagonal, not just at transitions — if they were
+     the cause, growth would track diagonal count linearly throughout,
+     not concentrate at transitions the way it actually does.
+
+   **Best-supported hypothesis** (not independently confirmed — see
+   tooling limitation below): CUDA's device memory allocator retains
+   freed blocks in an internal pool rather than returning them to the
+   device-wide free count `cudaMemGetInfo` reports, and because
+   `ks_work_create`'s buffer sizes are tied to `sizeQl`/`sizeQlP`, which
+   SHRINK every stage (30→29→28→27, never returning to a previously-seen
+   size), freed blocks from an earlier, larger-sized stage may never be
+   reused by a later, smaller-sized stage's allocation request —
+   accumulating a permanently-retained (from this process's perspective)
+   pool, one stage-sized increment at a time, without any single
+   "missing cudaFree" in the application code. This is consistent with
+   the magnitude (roughly `ks_work_create`'s own footprint, ~130-200MB)
+   and the fact that it fires exactly at transitions, not per-diagonal.
+   **Tooling limitation, checked directly**: `compute-sanitizer` is not
+   installed in this WSL2 environment, and `nvidia-smi
+   --query-compute-apps=pid,used_memory` returns no process rows at all
+   (a known WSL2 CUDA-passthrough limitation on this setup) — there is
+   no available tool in this environment to directly inspect CUDA's
+   internal allocator state or attribute GPU memory to this process
+   specifically beyond `cudaMemGetInfo`'s device-wide figure (which, with
+   no other GPU workload running concurrently during these tests, is
+   equivalent to this process's own usage by elimination, not by direct
+   per-process measurement). **This hypothesis is well-supported, not
+   proven.**
+
+### Run 2: 8 stages (tw=30..23) x 3 diagonals — killed after only 2 diagonals, with an IDENTICAL internal trajectory to Run 1's first 2 diagonals
+
+```
+baseline: RSS=228MB GPU_used=1038.69MB
+stage0 diag0: RSS=3105MB GPU_used=1732.69MB    <- bit-for-bit identical to Run 1
+stage0 diag1: RSS=4065MB GPU_used=1732.69MB    <- bit-for-bit identical to Run 1
+(killed)
+```
+
+Checked real Windows host free memory immediately before each run:
+**5.41GB free after Run 1's kill; only 3.66GB free immediately before
+launching Run 2** (unrelated to anything this test does — the gap
+reflects other activity on this machine between the two launches). **The
+SAME deterministic internal process state produced wildly different
+survival times (68 diagonals vs. 2) purely as a function of EXTERNAL
+host memory conditions at launch time, not this process's own
+behavior.** This is direct, clean evidence — not inference from absence
+of kernel log entries, as in the prior round, but a controlled
+comparison of the same program run twice — supporting the
+characterization that external host-level memory pressure, not this
+specific workload's resource needs, determines when these kills happen.
+
+### A real, tiny, confirmed leak found and fixed (not the explanation for the MB-scale growth above)
+
+Direct reading of `ks_context_create`/`ks_context_destroy`
+(`src/keyswitch_resident.cpp`) while building the harness above found:
+`C.d_keyRow` is allocated fresh every call
+(`cudaMalloc(&C.d_keyRow,C.sizeQlP*4)`, ~128 bytes at n=131072's
+`sizeQlP=32`) but was never freed in `ks_context_destroy` — unlike
+`d_av`/`d_bv`, which are correctly freed, and unlike the `g_rtab`/`upc`
+caches, which are deliberately process-lifetime and correctly NOT freed
+per-context. This is a genuine, confirmed per-call device-memory leak,
+but at ~128 bytes/call it is three to four orders of magnitude too
+small to explain the ~200MB/transition growth measured above — it would
+take roughly 1.5 million calls to leak 200MB this way. **Fixed**
+(`cudaFree(C.d_keyRow); C.d_keyRow=nullptr;` added to
+`ks_context_destroy`) since it is real, in-scope, and zero-risk to
+correctness (a pure resource-cleanup addition, no computation changed).
+**Verified via the existing regression suite after the fix**:
+`test_ks_resident` (bit-exact), `test_rot_resident` (bit-exact,
+2.3x speedup intact), `test_hoist_single` (27/27) all pass identically;
+`tests/test_c2s_diag_fast.cpp` (the diagonal-algorithm oracle, unrelated
+to this fix) still passes. This is the only source-code change to
+`src/keyswitch_resident.cpp` this round, made only after the leak was
+directly confirmed by reading the code, not guessed.
+
+### Go/no-go decision for the next full n=131072 attempt
+
+Extrapolating the measured ~200MB/transition growth across a full
+8-stage C2S+S2C run (7 transitions total after the first stage) would
+add roughly 1.4GB beyond the ~1.7-2.4GB GPU usage already observed
+within 4 stages, projecting to perhaps ~3-3.5GB GPU_used by the end of a
+complete run — comfortably within the 6144MB VRAM card even under this
+pessimistic linear extrapolation (not verified beyond 4 fully-observed
+stages; the 8-stage/3-diagonal run that would have tested this directly
+was itself killed too early by external pressure). Combined with host
+RSS now proven flat at ~4.2GB across 68 diagonals, **GPU/host memory
+growth intrinsic to this workload does not appear, on current evidence,
+to be the binding constraint for a full run** — the binding constraint
+remains external host memory availability at attempt time, exactly as
+the prior round concluded, now with direct (not just inferential)
+supporting evidence from the Run 1 vs. Run 2 comparison above.
+
+**Decision: NO-GO for a 7th full bootstrap attempt right now.** Checked
+real Windows host free memory immediately before writing this
+section: **2.49GB free** — well below the ~7GB window that let the 6th
+real attempt reach diagonal 8 and Run 1 above reach 68 diagonals.
+**Explicit criteria for a justified future attempt**: real Windows host
+free memory >= 6GB measured immediately before launch (matching the
+two conditions under which this workload got furthest), via
+`Get-CimInstance Win32_OperatingSystem | Select
+FreePhysicalMemory` from PowerShell — not WSL2's internal `free -h`,
+which has been shown repeatedly this session to misreport availability
+under real contention. Do not launch a full attempt below that
+threshold; do not retry repeatedly hoping conditions improve on their
+own — check, and only proceed if they do.
+
+**Honest summary of options if this machine's real host-memory headroom
+remains the limiting factor going forward** (not implemented, stated
+for completeness per the governing directive): (1) more physical RAM on
+this machine — the direct fix; (2) a streaming, non-cached key-material
+architecture that never holds more than one rotation key's worth of
+host memory resident at a time (a substantial architectural change, not
+attempted); (3) a smaller supported parameter set than n=131072 (would
+need a fresh security re-derivation, not simply reusing n=131072's
+existing 134-bit classical estimate). None of these are implemented;
+stating them is not a claim that any has been built.

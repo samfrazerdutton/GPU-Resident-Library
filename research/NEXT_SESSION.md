@@ -3,73 +3,86 @@
 ## Current commit
 
 Check `git log -3` on resume. As of this writing, HEAD is a new commit
-on top of `176d847` (the "verify OOM diagnosis and remove the diagonal
-bottleneck" round — see `MEMORY_FEASIBILITY.md`'s final `## UPDATE
+on top of `4bef4ca` (the "isolate GPU memory growth and prove large-n
+feasibility" round — see `MEMORY_FEASIBILITY.md`'s final `## UPDATE
 (next round)` section for the full story, condensed in
 `MASTER_STATE.md`'s latest section and `EXPERIMENT_LEDGER.md` entry
-#23). Confirm push status — push again if `git status` shows ahead of
+#24). Confirm push status — push again if `git status` shows ahead of
 origin.
 
 ## Read first
 
-`research/MEMORY_FEASIBILITY.md`'s final `## UPDATE (next round):
-precise kill-mechanism investigation + the diagonal bottleneck fixed +
-a 6th attempt reaches far further than ever before` section — it
-SHARPENS (does not simply repeat) the prior round's "host physical RAM
-is the root cause" framing: the kill is now proven NOT a Linux
-kernel OOM-kill and NOT a process crash/exception (checked via `dmesg`/
-`journalctl`, twice, for two separate kills), and a real,
-independent bottleneck (`stageDiags`'s O(S^2) cost) has been fixed and
-verified, letting a real attempt reach 8x further than ever before
-(diagonal 8 of 16, vs. 1-2 previously) before still being killed. Then
-`research/MASTER_STATE.md`'s two most recent sections, and
-`research/EXPERIMENT_LEDGER.md` entries #21-#23.
+`research/MEMORY_FEASIBILITY.md`'s final `## UPDATE (next round): GPU-
+memory lifecycle isolated with real production APIs...` section. It
+does three new things beyond the prior round: (1) isolates the real
+`ks_context_create`/`keyswitch_resident`/`ks_context_destroy` +
+`ks_work_create`/`destroy` lifecycle using production APIs (not a
+synthetic loop), finding host RSS flat across 68 diagonals (far more
+robust than before) and a real, still-not-root-caused ~200MB/stage-
+transition GPU-memory growth (separate from a tiny, linear, already-
+understood ~0.5MB/diagonal drift); (2) DIRECTLY demonstrates (not just
+infers from absent kernel logs) that external host memory, not this
+process's own behavior, determines survival time — the same
+deterministic internal trajectory survived 68 diagonals in one run and
+only 2 in another, purely as a function of host free memory at launch;
+(3) fixes one real, confirmed, but numerically tiny leak
+(`ks_context_destroy` never freed `C.d_keyRow`). Then
+`research/MASTER_STATE.md`'s most recent section, and
+`research/EXPERIMENT_LEDGER.md` entries #22-#24.
 
 ## Immediate next action (the one concrete, executable item left open)
 
-**The diagonal bottleneck is fixed and verified (268s -> 0.11s per
-stage, wired into `tests/test_boot_n131072.cpp`). The KROT/KSC cache
-mechanism is now TWICE confirmed bounded** (an isolated experiment,
-`tests/test_n131072_cache_churn.cpp`, from the prior round; and now 8
-real diagonals in situ this round, RSS flat at exactly 4561.35MB for 7
-consecutive diagonals). **The one genuinely open technical thread**:
-GPU memory showed a small, unexplained climb (+0.5-1MB/diagonal) over
-diagonals 5-8 of the 6th attempt — observed over far too few of the
-128 total diagonals (16/stage x 8 stages) a complete run needs to tell
-whether it plateaus (harmless) or keeps climbing (a real, if slow,
-contributor). **Next concrete step**: extend
-`tests/test_n131072_cache_churn.cpp` (or a similar small, isolated
-harness) to also exercise `ks_context_create`/`ks_work_create`/
-`stageRotBegin`'s device allocations repeatedly — the one allocation
-path the existing isolated test still does not touch, and the most
-likely source of a GPU-side (not host-side) slow climb — over MANY
-more iterations than 8, to determine whether it plateaus. Do this
-BEFORE attempting another full n=131072 bootstrap run (per the
-governing directive: do not repeatedly retry the full workload).
-Separately, the kill mechanism itself remains only partially
-characterized: proven NOT a Linux OOM-kill or process crash, but the
-exact external trigger (most likely this session's own tool harness
-watching Windows host memory) cannot be confirmed with more certainty
-from inside this environment — if a future session has access to the
-harness's own monitoring logic or can run outside it, that would close
-this last gap. If neither of these is pursued and host-RAM pressure
-remains the working hypothesis instead: (1) close other Windows-side
-memory consumers and retry the exact same `./test_boot_n131072` command
-to see if it survives further with maximum real host headroom, now
-MUCH cheaper to test since the diagonal fix means a dead run is known
-within seconds instead of 268s/stage; (2) if it still fails with
-minimal other load, treat ~15.4GB total physical RAM as a hard blocker
-for n=131072
-on this specific machine and stop retrying cache-constant tweaks — the
-realistic paths forward are more physical RAM or a streaming
-(non-cached) key-material architecture, both out of scope for a single
-session. **Do NOT further lower `KROT_CAP`/`KSC_CAP` expecting a
-different result** — `test_n131072_cache_churn.cpp` already proved the
-cache mechanism itself is not the limiting factor at the caps already
-in use. **`stageDiags`/`stageDiagsFwd`'s O(S²) cost is now FIXED** (was
-268s/call, now 0.11s/call, verified in production — see the round
-described above) — do not re-flag this as still-open in any future
-session. Full detail: `MEMORY_FEASIBILITY.md`.
+**Current decision: NO-GO for a 7th full n=131072 attempt** — real
+Windows host free memory was only 2.49GB when this was last checked
+(`Get-CimInstance Win32_OperatingSystem`), well below the ~6-7GB window
+that let this workload get furthest in every attempt that made real
+progress (the 6th real bootstrap attempt reached diagonal 8 at 7.43GB
+free; this round's isolated Run 1 reached 68 diagonals at a favorable
+moment too). **Before attempting a 7th full run, check real host free
+memory first and require >=6GB** — do not launch below that threshold,
+and do not retry repeatedly hoping conditions improve on their own.
+
+**The two genuinely open technical threads, in priority order**:
+
+1. **The ~200MB/stage-transition GPU-memory growth is real, reproduced
+   twice, but not root-caused to a specific line.** Ruled out:
+   `ks_work_create`/`destroy` (pairs cleanly), every per-stage-keyed
+   host-side cache (`g_rtab`, `upc` — all KB-scale), and
+   `evalkeygen_host_sold`'s per-part transients (identically sized
+   every call, not transition-specific). Best-supported hypothesis:
+   CUDA device-allocator pool retention across differently-sized
+   per-stage allocations (sizeQl shrinks 30→29→...→23, never returning
+   to a previously-seen size) — NOT independently confirmed, since
+   `compute-sanitizer` is not installed and `nvidia-smi
+   --query-compute-apps` returns no process rows in this WSL2
+   CUDA-passthrough setup (both checked directly, no path forward with
+   currently-available tooling). **If a future session has access to
+   deeper CUDA profiling tools (a native Linux machine with
+   `compute-sanitizer`/`cuda-memcheck`, or Nsight Systems) outside this
+   WSL2 passthrough limitation, that would be the direct way to close
+   this.** Extrapolating linearly across a full 8-stage run projects to
+   only ~3-3.5GB GPU usage (well under the 6GB card), so this is a
+   secondary concern, not the primary blocker.
+2. **The exact external kill trigger remains only partially
+   characterized**: proven NOT a Linux OOM-kill or process crash
+   (checked twice via `dmesg`/`journalctl`), and now directly
+   demonstrated to correlate with fluctuating real host memory rather
+   than this process's own (bounded, well-characterized) behavior — but
+   the PRECISE mechanism (most likely this session's own tool harness)
+   cannot be confirmed with more certainty from inside this
+   environment. A future session with visibility into the harness's
+   own monitoring logic, or one running outside it entirely, could
+   close this gap; this session's tooling cannot.
+
+**Do NOT further lower `KROT_CAP`/`KSC_CAP` expecting a different
+result** — proven (twice now, including 68 diagonals and 22+ evictions
+in isolation) not the limiting factor at the caps already in use.
+**`stageDiags`/`stageDiagsFwd`'s O(S²) cost is FIXED** (268s/call ->
+0.11s/call, verified in production) — do not re-flag as open. **The
+`d_keyRow` leak is FIXED** (tiny, ~128 bytes/call, verified via
+regression) — do not re-flag as open, and do not expect it to explain
+the ~200MB/transition growth (it is 3-4 orders of magnitude too small).
+Full detail: `MEMORY_FEASIBILITY.md`.
 
 Secondary open items from this round (lower priority than the above):
 - A larger, truly-randomized (not block-alternated) A/B trial series to

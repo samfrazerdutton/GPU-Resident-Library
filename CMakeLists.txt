@@ -173,3 +173,15 @@ gpufhe_test(test_mult_barrett tests/test_mult_barrett.cpp)
 # decision once this proves out.
 add_executable(test_c2s_diag_fast tests/test_c2s_diag_fast.cpp)
 add_test(NAME test_c2s_diag_fast COMMAND test_c2s_diag_fast)
+# Directive "ISOLATE GPU MEMORY GROWTH AND PROVE LARGE-N FEASIBILITY":
+# isolates the real ks_context_create/keyswitch_resident/ks_context_destroy
+# per-diagonal device-memory lifecycle (plus ks_work_create/destroy per
+# stage) from the rest of the n=131072 bootstrap, using the REAL production
+# APIs and the same bounded-LRU KROT cache, across more diagonals and stage
+# boundaries than the 6th real attempt survived to reach. See
+# research/MEMORY_FEASIBILITY.md / NEXT_SESSION.md for why. Registered via
+# gpufhe_test like every other test here, but HEAVY (~80 real n=131072
+# keygens, several minutes) -- exclude explicitly with
+# `ctest -E test_n131072_gpu_lifecycle` in any full-suite run, same
+# convention already used for test_boot_n131072.
+gpufhe_test(test_n131072_gpu_lifecycle tests/test_n131072_gpu_lifecycle.cpp)

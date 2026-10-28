@@ -125,13 +125,15 @@ void ks_context_destroy(DeviceKSContext& C){
     // NOTE: d_fr/d_fp/d_ir/d_ip point into the process-lifetime root-table
     // cache and are SHARED across contexts -- freeing them here would corrupt
     // every context created later. Only the per-context arrays are freed.
-    
-    
-    
+    // d_keyRow IS per-context (fresh cudaMalloc in ks_context_create, not
+    // routed through the upc()/g_rtab shared caches) -- found via direct
+    // code reading while investigating per-diagonal GPU-memory growth at
+    // n=131072 (research/MEMORY_FEASIBILITY.md); confirmed too small
+    // (sizeQlP*4 bytes, ~128 bytes at n=131072) to explain that growth by
+    // itself, but a real, genuine per-call leak regardless -- fixed here.
     for(auto p:C.d_av)cudaFree(p);
     for(auto p:C.d_bv)cudaFree(p);
-    
-    
+    cudaFree(C.d_keyRow); C.d_keyRow=nullptr;
 }
 void ks_work_destroy(DeviceKSWork& W){
     cudaFree(W.d_part);cudaFree(W.d_compl);cudaFree(W.d_res0);cudaFree(W.d_res1);
