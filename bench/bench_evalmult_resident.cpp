@@ -9,6 +9,7 @@
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <iostream>
 #include <random>
 #include <vector>
@@ -33,6 +34,29 @@ static std::pair<double,double> boot(const std::vector<double>&d,int it=4000){
 static uint64_t mm(uint64_t a,uint64_t b,uint64_t q){return(uint64_t)(((unsigned __int128)a*b)%q);}
 
 int main(int argc,char**argv){
+    // Root cause of the "ShadowRegistry cudaMalloc failed (VRAM exhausted?)"
+    // abort investigated and fixed this round: the locally-installed OpenFHE
+    // build this repo links as its "CPU-only ground-truth oracle"
+    // (/usr/local/lib/libOPENFHEcore.so) is actually linked against a
+    // separate, external GPU-acceleration fork
+    // (~/openfheNVDIA-GPU/build/libopenfhe_cuda_hal.so, confirmed via `ldd`
+    // and by finding this exact error string hardcoded in that .so via
+    // `strings`) that transparently shadows CPU-side OpenFHE math onto the
+    // GPU through a singleton `ShadowRegistry` cache -- NOT a bug in this
+    // repository's own code. Running this benchmark's OpenFHE EvalMult/
+    // Rescale calls (cc->EvalMult/cc->RescaleInPlace, intended as a pure CPU
+    // comparison baseline) concurrently with this program's OWN direct CUDA
+    // usage (the resident tensor/keyswitch/rescale kernels + graph capture,
+    // all happening in the SAME process) causes that external library's
+    // ShadowRegistry to fail a real cudaMalloc call. The library exposes an
+    // env-var switch (found via `strings` on the .so: OPENFHE_GPU) that
+    // disables its GPU shadowing -- setting it makes the OpenFHE comparison
+    // genuinely CPU-only, matching this file's own stated intent ("OpenFHE
+    // EvalMult x N" as the CPU baseline), and resolves the abort with zero
+    // change to any cryptographic parameter or correctness-relevant code in
+    // either project. Verified: without this, aborts every time (N=1 and
+    // N=16 both); with it, completes and reports real, sane numbers.
+    setenv("OPENFHE_GPU","0",1);
     uint32_t N=(argc>1)?(uint32_t)std::stoul(argv[1]):16;
     uint32_t reps=(argc>2)?(uint32_t)std::stoul(argv[2]):9;
     CCParams<CryptoContextCKKSRNS> params;

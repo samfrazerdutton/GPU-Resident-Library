@@ -3,12 +3,33 @@
 ## Current commit
 
 Check `git log -3` on resume. As of this writing, HEAD is a new commit
-on top of `4bef4ca` (the "isolate GPU memory growth and prove large-n
-feasibility" round — see `MEMORY_FEASIBILITY.md`'s final `## UPDATE
-(next round)` section for the full story, condensed in
-`MASTER_STATE.md`'s latest section and `EXPERIMENT_LEDGER.md` entry
-#24). Confirm push status — push again if `git status` shows ahead of
-origin.
+on top of `9428bfb` (the GOD PROMPT round: large-n gate re-checked
+still NO-GO, `bench_evalmult_resident` root-caused and fixed,
+`test_polyeval` investigated but not fixed — see `MASTER_STATE.md`'s
+latest section and `EXPERIMENT_LEDGER.md` entry #25). Confirm push
+status — push again if `git status` shows ahead of origin.
+
+## `test_polyeval`: specific next hypothesis to test (not yet tried)
+
+The scale-equalization fix attempted this round was reverted (introduced
+its own overflow bug — see entry #25). The REFUTED hypothesis (prime-
+rounding drift) and the attempted fix's mechanism are both documented
+precisely in `EXPERIMENT_LEDGER.md` — do not re-attempt either without
+reading that first. **Specific next hypothesis, not yet tested**: this
+test's `mulCt` rebuilds a `KeySwitchConstants` with `numPart=2` FIXED
+regardless of the current tower count `tw`, and the test's deep
+Chebyshev chain drives `tw` down to 1-2 towers by the end (`acc.tw=1`
+in the failing output) — check whether `compute_keyswitch_constants`/
+the keyswitch machinery produces a degenerate or incorrect digit
+decomposition when `numPart` is fixed at 2 but `tw` shrinks to 1-2
+(i.e. `alpha` ends up larger than `tw` itself, or `sizePart`/`sizeCompl`
+hit a boundary case never exercised by this codebase's OTHER tests,
+which all use level-appropriate `numPart`/`npFor(tw)` logic rather than
+a fixed constant). A quick, cheap way to test this: add a temporary
+print of `decode_host` on EACH `Tk[k]`/intermediate (not just the
+final `acc`) to see at WHICH tower count the decrypted value first
+diverges significantly from the expected Chebyshev value — if it's
+exactly when `tw` drops to 1-2, that confirms this hypothesis directly.
 
 ## Read first
 

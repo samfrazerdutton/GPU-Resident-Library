@@ -567,3 +567,39 @@ below the ~6-7GB window that let this workload get furthest in every
 attempt that succeeded partially. Explicit criterion recorded for a
 future attempt: real Windows host free memory >=6GB, checked via
 `Get-CimInstance Win32_OperatingSystem` immediately before launch.
+
+## GOD PROMPT round: large-n gate re-checked (still NO-GO), bench_evalmult_resident root-caused and fixed, test_polyeval investigated (inconclusive, reverted)
+
+Full detail: `EXPERIMENT_LEDGER.md` entry #25. Re-checked the host
+memory gate first (3.12-3.6GB free throughout this round, below the
+6GB threshold) — no full bootstrap attempted, consistent with the
+standing decision.
+
+**`bench_evalmult_resident` fixed.** Binary-search instrumentation
+localized its `ShadowRegistry cudaMalloc failed` abort to inside pure
+OpenFHE CPU calls (`cc->EvalMult`/`cc->RescaleInPlace`), with every one
+of this repo's own CUDA checkpoints clean up to that point. `ldd`+
+`strings` traced it to an EXTERNAL dependency: this repo's "CPU-only
+ground-truth oracle" OpenFHE build secretly links a separate GPU-
+acceleration fork (`~/openfheNVDIA-GPU`) whose `ShadowRegistry`
+singleton transparently mirrors CPU math onto the GPU — colliding with
+this program's own concurrent direct CUDA usage. Fixed with a one-line
+`setenv("OPENFHE_GPU","0",1)` (an env-var switch found in that same
+external library) that makes the OpenFHE comparison genuinely CPU-only
+— zero change to any cryptographic parameter, verified working at both
+N=1 and the default N=16.
+
+**`test_polyeval` investigated, not fixed.** The natural hypothesis
+(RNS-prime rounding drift in this test's hand-rolled Chebyshev scale
+bookkeeping) was directly measured and REFUTED — real primes deviate
+from 2^50 by only ~1e-10 relative, far too small to explain the
+observed 2377x error. An explicit scale-equalization fix was
+implemented, reduced the error 2377→0.55, but hand-tracing found it
+introduces its own overflow bug (a correction ratio compounds to
+exactly the fix's encoding constant by the 3rd Chebyshev level,
+overflowing the RNS moduli when encoded again) — the improvement was
+likely coincidental, not genuine. **Reverted** rather than keep an
+unverified fix. True root cause remains open; a specific next
+hypothesis (keyswitch breakdown at the very low tower counts this
+test's deep chain reaches) is recorded in `NEXT_SESSION.md`, not yet
+tested.
