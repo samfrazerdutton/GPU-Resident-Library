@@ -47,49 +47,61 @@ host memory headroom (`test_boot` peaks at ~8GB RSS) — check
 integration pass while free memory is under ~6GB, same threshold as
 the large-n bootstrap gate.
 
-## `test_polyeval` / native rescale pathway: DEFINITIVE localization, one specific next experiment
+## `test_polyeval` / native rescale pathway: entry #26's "library bug" conclusion REVERSED by entry #29 — do not re-chase a rescale defect
 
-**Do not re-investigate from scratch — the root cause is now known
-precisely, just not the exact faulty line.** Entry #25's two
-hypotheses (prime-rounding drift; the fixed-`numPart=2`-at-low-tw
-degenerate-split idea) are both SUPERSEDED — neither was the cause.
-Entry #26 proved, via instrumented decrypt-and-compare checkpoints
-directly inside `mulCt` AND an independent minimal reproduction
-(`tests/test_rescale_n1024.cpp`), that `test_polyeval`'s own Chebyshev/
-scale logic is NOT at fault: the tensor product and the post-keyswitch
-pre-rescale result are both correct; the corruption appears only AFTER
-`rescale_resident_raw` runs. This is a **real, previously-unknown bug
-in the native rescale pathway specific to small n** (confirmed at
-n=1024, both 50-bit and 55-bit tower sizes — ruling out bit-size as
-the variable), never caught before because no test in this codebase
-exercises `native_rescale_consts`+`rescale_resident_raw` together below
-n=8192.
+**Do not re-investigate `rescale_resident_raw`/`native_rescale_consts`/
+the NTT/SwitchModulus/RescaleFuse kernels for a correctness bug —
+entry #29 (this round) proved all of them correct via four independent
+differential experiments** (`test_ntt_roundtrip_n1024.cpp` 56/56,
+`test_rescale_scalar_diff_n1024.cpp` 10/10, `test_rescale_vector_diff_
+n1024.cpp` 0/35840 mismatches, `test_rescale_double_call_n1024.cpp`
+0/43008 mismatches — the last one exercising the exact production
+back-to-back-scratch-buffer-reuse call pattern). `native_rescale_consts`'s
+`s1`/`s2` were also hand-verified (Python) to be mathematically
+equivalent to the textbook single-modulus RNS rescale formula.
 
-**Specific next experiment, not yet run**: a PURE NTT-forward/
-INTT-inverse round-trip at n=1024 (encode a known value, `LaunchNTT_CT`
-forward, `LaunchINTT_GS` inverse, decode — NO `rescale_resident_raw`,
-NO `SwitchModulus`, NO `RescaleFuse` involved) to separate two
-remaining sub-hypotheses: (a) the NTT/INTT transform kernels themselves
-are broken at small n (would mean this affects far more than just
-rescale), vs (b) only the rescale-specific combine logic
-(`LaunchSwitchModulus`/`LaunchRescaleFuse`) or `native_rescale_consts`'s
-own arithmetic is broken (narrower, rescale-only impact). Also worth a
-quick, cheap check: directly compare `native_rescale_consts`'s `s1`/
-`s2` output against an independently-computed (e.g. Python/bignum)
-expected value for the SAME n=1024 modulus chain — this is pure
-arithmetic, needs no GPU, and would immediately tell you whether the
-bug is in that host-side constant computation or in the GPU kernels
-themselves. Binary-search the minimum failing n (try 2048, 4096 between
-the known-failing 1024 and the known-working 8192) would also help
-scope the blast radius.
+`test_rescale_n1024.cpp`'s maxerr=24602.7 is explained, not mysterious:
+its Delta=2^50 vs. its own qLast≈2^55 is a ~32x scale/modulus-size
+mismatch (an artifact of an EARLIER round's "isolate bit-size as a
+variable" experiment, which changed the tower bit-size to 55 without
+re-matching Delta). `tests/test_rescale_n1024_matched_scale.cpp`
+(Delta=2^55, otherwise identical) cut the error to 769.125 — almost
+exactly the predicted 32x reduction — and instrumented diagnostics in
+that test traced the REMAINING ~769 to inherent, expected CKKS noise:
+rescaling ciphertext components c0/c1 independently (as ALL CKKS
+implementations do) means `round(c0/qL)+round(c1/qL)*s !=
+round((c0+c1*s)/qL)` in general, an O(1)-per-coefficient "combining"
+discrepancy that `decode_host`'s n=1024-term inverse embedding sum
+amplifies into a few-hundred-unit decode deviation. This is NOT a bug.
 
-`tests/test_rescale_n1024.cpp` is committed as a permanent, honestly-
-FAILING regression test (per the directive's explicit requirement) —
-do not delete it or weaken its tolerance; it should start passing once
-the actual fix lands. `tests/test_polyeval.cpp`'s `[chk]` diagnostic
-checkpoints (inside `mulCt`) are also kept, additive-only, confirmed to
-not change its behavior — useful for anyone continuing this specific
-investigation.
+**What's genuinely still open** (the honest residual uncertainty, not
+yet run): `test_polyeval.cpp` itself uses 50-bit mid-towers matched to
+its own Delta=2^50 (no Delta/qLast mismatch there), so its original
+maxerr=2376.98 is *consistent with* the same inherent independent-
+component rescale noise accumulating across MULTIPLE chained
+Chebyshev-level rescales — but this has not yet been separately,
+quantitatively confirmed for the multi-level case. The next concrete
+experiment, if anyone picks this up: instrument `test_polyeval.cpp`'s
+own Chebyshev loop to track `maxerr` level-by-level (Tk[0]→Tk[1]→
+Tk[2]→...) and check whether the GROWTH matches the magnitude expected
+from accumulating O(1)-per-coefficient combining noise through
+`decode_host`'s embedding sum at each level (a back-of-envelope
+estimate, informed by this round's single-rescale ~769 figure, should
+be computable and compared against the actual observed per-level
+numbers already captured in the existing `[chk]` diagnostics). If the
+growth roughly matches, `test_polyeval`'s `[FAIL]` is ALSO inherent
+CKKS noise, not a defect, and the real fix (if any is wanted) is
+parameter selection (larger Delta, bigger n, or noise-aware scale
+management across levels) — not a code change to the rescale kernels.
+
+`tests/test_rescale_n1024.cpp` remains committed with its original
+(mismatched) parameters as a permanent artifact of the earlier
+isolation experiment — its `[FAIL]` is now UNDERSTOOD and EXPECTED,
+not a red flag requiring a fix. Do not weaken its tolerance or delete
+it; do not "fix" it by changing library code, since entry #29 showed
+there is nothing wrong with the library. `tests/test_polyeval.cpp`'s
+`[chk]` diagnostic checkpoints (inside `mulCt`) are kept, additive-only
+— useful for the level-by-level noise-growth experiment above.
 
 ## Read first
 

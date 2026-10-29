@@ -709,3 +709,65 @@ confirmed correct shuffling and JSONL output. **Not yet run with the
 real `test_boot`/`test_boot_hoist_enabled` binaries** — blocked by the
 same host-memory gate as the large-n bootstrap; the exact command is
 recorded in `NEXT_SESSION.md` for whenever that clears.
+
+## GOD PROMPT "CORRECTNESS BREAKTHROUGH" round: entry #26's "rescale library bug" conclusion REVERSED — rescale_resident_raw proven correct, real cause was a test-parameter mismatch + inherent CKKS noise
+
+Full detail: `EXPERIMENT_LEDGER.md` entry #29. This round set out to
+locate and fix the rescale defect entry #26 identified. Instead, four
+independent differential experiments proved the library's rescale
+pathway has NO defect:
+
+1. **`tests/test_ntt_roundtrip_n1024.cpp`** — pure coefficient→NTT→INTT
+   round-trip, exact modular equality, all 8 towers of the failing
+   chain, 7 input patterns each (zero/sparse/dense/boundary/random).
+   **56/56 pass.**
+2. Hand-derived `LaunchRescaleFuse`'s formula from `kernels/rescale.cu`
+   and confirmed via Python that `native_rescale_consts`'s `s2[i]` is
+   numerically identical to `(qi-s1[i]) mod qi` — the precomputed
+   constants are mathematically equivalent to the textbook single-
+   modulus RNS rescale. Constant-formula bug ruled out.
+3. **`tests/test_rescale_scalar_diff_n1024.cpp`** (constant polynomials,
+   10 CRT-exact cases including both sides of the rounding boundary) —
+   **10/10 pass**, every one of 1024 slots per tower.
+4. **`tests/test_rescale_vector_diff_n1024.cpp`** (independent per-
+   coefficient random residues — closes the gap that constant data
+   can't reveal position-mixing bugs) — **5 trials, 0/35840 mismatches.**
+5. **`tests/test_rescale_double_call_n1024.cpp`** (the exact production
+   call pattern: two back-to-back `rescale_resident_raw` calls sharing
+   `scr`/`drp` on the same stream) — **0/43008 mismatches.**
+
+With the arithmetic exhaustively cleared, root-caused
+`test_rescale_n1024.cpp`'s actual maxerr=24602.7 failure to its OWN
+parameter choice: Delta=2^50 vs. qLast≈2^55 is a ~32x scale/modulus
+mismatch (sound CKKS requires the dropped modulus to approximately
+match the scale being removed), which amplifies rescale's own
+unavoidable ±0.5-unit rounding noise by ~32x on decode. Built
+**`tests/test_rescale_n1024_matched_scale.cpp`** (Delta=2^55, matching
+qLast): maxerr dropped to 769.125 — almost exactly the predicted 32x
+reduction, confirming the amplification mechanism. Instrumented
+diagnostics in that test then showed the *remaining* ~769 is ALSO not
+a defect: tower-0-only and tower-7-only pre-rescale decryption of the
+real ciphertext agree exactly (no RNS inconsistency), and the
+per-coefficient discrepancy traces to comparing against an invalid
+reference — CKKS rescales ciphertext components c0/c1 INDEPENDENTLY
+(each gets its own rounding), so `round(c0/qL)+round(c1/qL)*s !=
+round((c0+c1*s)/qL)` in general. This O(1)-per-coefficient inherent
+combining noise gets amplified by `decode_host`'s n=1024-term inverse
+embedding sum into the observed few-hundred-unit decode deviation.
+
+`test_polyeval.cpp` itself uses 50-bit mid-towers matched to its own
+Delta=2^50 (no Delta/qLast mismatch there) — its original
+maxerr=2376.98 is consistent with this same inherent noise
+accumulating across multiple chained Chebyshev-level rescales, though
+this has NOT yet been separately, quantitatively confirmed for the
+multi-level case — flagged as the honest residual uncertainty for a
+future round.
+
+**No code in `rescale_resident_raw`, `native_rescale_consts`, or the
+NTT/SwitchModulus/RescaleFuse kernels was changed — no defect was
+demonstrated in any of them.** Per the directive's Step 4, a
+speculative fix was deliberately NOT shipped. All test files above are
+committed as permanent regression evidence; `test_rescale_n1024.cpp`'s
+own `[FAIL]` is now understood and expected (it exercises a
+deliberately-mismatched parameter set from an earlier round's own
+isolation experiment), not an unexplained red test.

@@ -196,6 +196,51 @@ gpufhe_test(test_n131072_gpu_lifecycle tests/test_n131072_gpu_lifecycle.cpp)
 add_executable(test_rescale_n1024 tests/test_rescale_n1024.cpp)
 target_link_libraries(test_rescale_n1024 PRIVATE gpufhe CUDA::cudart)
 add_test(NAME test_rescale_n1024 COMMAND test_rescale_n1024)
+# GOD PROMPT "CKKS CORRECTNESS BREAKTHROUGH" round, Priority 1 Step 2: pure
+# NTT/INTT round-trip at n=1024 across test_rescale_n1024's exact modulus
+# chain, independent of rescale/keyswitch/SwitchModulus entirely -- isolates
+# whether the transform kernels themselves are correct at this n.
+add_executable(test_ntt_roundtrip_n1024 tests/test_ntt_roundtrip_n1024.cpp)
+target_link_libraries(test_ntt_roundtrip_n1024 PRIVATE gpufhe CUDA::cudart)
+add_test(NAME test_ntt_roundtrip_n1024 COMMAND test_ntt_roundtrip_n1024)
+# GOD PROMPT "CKKS CORRECTNESS BREAKTHROUGH" round, Priority 1 Step 3:
+# scalar differential test driving rescale_resident_raw's REAL orchestration
+# (SwitchModulus + NTT + RescaleFuse, real row_of/root-table indexing) with
+# constant-polynomial inputs against an independent Python/arbitrary-
+# precision CRT reference, after Step 2 cleared the NTT kernels and a
+# by-hand check cleared the s1/s2 precomputed-constant formula.
+add_executable(test_rescale_scalar_diff_n1024 tests/test_rescale_scalar_diff_n1024.cpp)
+target_link_libraries(test_rescale_scalar_diff_n1024 PRIVATE gpufhe CUDA::cudart)
+add_test(NAME test_rescale_scalar_diff_n1024 COMMAND test_rescale_scalar_diff_n1024)
+# GOD PROMPT "CKKS CORRECTNESS BREAKTHROUGH" round, Priority 1 Step 3
+# (continued): the scalar-diff test above used CONSTANT polynomials, a
+# degenerate case where coefficient-domain and eval-domain data coincide
+# (NTT(constant)=constant). This vector-diff test uses INDEPENDENT
+# per-coefficient random residues, forward-NTT'ing both the real input and
+# an RNS-only reference output, to check rescale_resident_raw end-to-end on
+# genuinely non-constant data.
+add_executable(test_rescale_vector_diff_n1024 tests/test_rescale_vector_diff_n1024.cpp)
+target_link_libraries(test_rescale_vector_diff_n1024 PRIVATE gpufhe CUDA::cudart)
+add_test(NAME test_rescale_vector_diff_n1024 COMMAND test_rescale_vector_diff_n1024)
+# GOD PROMPT "CKKS CORRECTNESS BREAKTHROUGH" round, Priority 1 Step 3
+# (targeted hypothesis): the vector-diff test above calls
+# rescale_resident_raw exactly ONCE per trial, but test_rescale_n1024.cpp
+# (the original failing reproduction) calls it TWICE back-to-back sharing
+# the same scr/drp scratch buffers on the same stream (once for c0, once
+# for c1). This test isolates exactly that call pattern.
+add_executable(test_rescale_double_call_n1024 tests/test_rescale_double_call_n1024.cpp)
+target_link_libraries(test_rescale_double_call_n1024 PRIVATE gpufhe CUDA::cudart)
+add_test(NAME test_rescale_double_call_n1024 COMMAND test_rescale_double_call_n1024)
+# GOD PROMPT "CKKS CORRECTNESS BREAKTHROUGH" round, Priority 1 Step 3
+# (confirming experiment): byte-for-byte copy of test_rescale_n1024.cpp
+# except Delta=2^55 instead of 2^50, matching qLast's bit-size as sound
+# CKKS parameter selection requires. Tests the hypothesis that
+# test_rescale_n1024's maxerr=24602 failure is a scale/modulus-size
+# parameter mismatch in that test's OWN design, not a rescale_resident_raw
+# defect (which the three differential tests above already cleared).
+add_executable(test_rescale_n1024_matched_scale tests/test_rescale_n1024_matched_scale.cpp)
+target_link_libraries(test_rescale_n1024_matched_scale PRIVATE gpufhe CUDA::cudart)
+add_test(NAME test_rescale_n1024_matched_scale COMMAND test_rescale_n1024_matched_scale)
 # Directive "GOD PROMPT -- CKKS ENGINE": Priority 2 (RAII refactor), Phase C.
 # Validates include/ks_raii.h's ScopedKSContext/ScopedKSWork wrappers in
 # ISOLATION (construction/destruction, repeated cycles with stable GPU
