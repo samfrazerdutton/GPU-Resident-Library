@@ -76,6 +76,36 @@ int main(){
                 t0[x]=mm(A.c0[x],B.c0[x],q);
                 t1[x]=am(mm(A.c0[x],B.c1[x],q),mm(A.c1[x],B.c0[x],q),q);
                 t2[x]=mm(A.c1[x],B.c1[x],q);}}
+        static int mulCtCallCount=0;
+        if(mulCtCallCount++==0){   // only the very first mulCt call ever, to avoid flooding output
+            // Diagnostic: decrypt the RAW tensor (t0+t1*s+t2*s^2, no keyswitch)
+            // under a freshly-derived secret at this level, to see whether the
+            // tensor-product step itself (before any relin/keyswitch) is
+            // already correct. Uses the SAME "slice modulus list, same seed"
+            // re-derivation pattern the ORIGINAL (unmodified) code already
+            // uses for its own final decrypt of `acc` -- confirmed consistent
+            // by direct reading of src/keygen.cpp (ternary secret + Gaussian
+            // error are sampled ONCE before the per-tower loop, independent of
+            // how many towers are requested; each tower's "a" draws exactly n
+            // RNG values in a fixed per-tower-index sequence -- so re-deriving
+            // with a shorter, same-prefix modulus list and the same seed
+            // reproduces the IDENTICAL secret for the shared tower indices).
+            std::vector<uint64_t> modlX(mod.begin(),mod.begin()+tw),rootlX(root.begin(),root.begin()+tw);
+            auto KPt=gpufhe::keygen_host(n,modlX,rootlX,ns,3.19,101);
+            std::vector<uint64_t> s2t(T);
+            for(uint32_t t=0;t<tw;++t){uint64_t q=mod[t];
+                for(uint32_t k=0;k<n;++k){size_t x=(size_t)t*n+k;
+                    s2t[x]=mm(KPt.s[x],KPt.s[x],q);}}
+            std::vector<uint64_t> raw0(T);
+            for(uint32_t t=0;t<tw;++t){uint64_t q=mod[t];
+                for(uint32_t k=0;k<n;++k){size_t x=(size_t)t*n+k;
+                    raw0[x]=am(am(t0[x],mm(t1[x],KPt.s[x],q),q),mm(t2[x],s2t[x],q),q);}}
+            std::vector<uint64_t> zero(T,0);
+            std::vector<int64_t> dect; gpufhe::decrypt_host(dect,raw0,zero,KPt.s,n,modlX,rootlX);
+            std::vector<cd> yt; gpufhe::decode_host(yt,dect,n,A.scale*B.scale);
+            std::cerr<<"[chk] RAW TENSOR (pre-keyswitch) tw="<<tw<<": y[0]="<<yt[0].real()
+                      <<" (expect A.msg[0]*B.msg[0])\n";
+        }
         // relin uses the full-QP key; keyswitch_core_resident works at full tw? It
         // assumes sizeQl=K.sizeQl. For leveled we keyswitch at tw: rebuild a K at tw.
         // Simpler: keyswitch operates on the CURRENT towers -> need K sized to tw.
@@ -105,6 +135,22 @@ int main(){
         std::vector<uint64_t> r0(T),r1(T);
         for(uint32_t t=0;t<tw;++t){uint64_t q=mod[t];
             for(uint32_t k=0;k<n;++k){size_t x=(size_t)t*n+k; r0[x]=am(t0[x],R.ba0[x],q); r1[x]=am(t1[x],R.ba1[x],q);}}
+        if(mulCtCallCount==1){
+            // Isolate the keyswitch step: decrypt (r0+r1*s) = t0+t1*s+ba0+ba1*s
+            // under the first-degree secret and compare against the raw-tensor
+            // check above (t0+t1*s+t2*s^2, already proven ~0/correct). If this
+            // ALSO comes out ~0, keyswitch_core_resident's output correctly
+            // re-expresses the t2*s^2 term as a linear-in-s term and the bug is
+            // elsewhere (the rescale step, or something after it). If this
+            // diverges, the bug is isolated to keyswitch_core_resident's
+            // consumption of Kl at this reduced tw+sizeP basis.
+            std::vector<uint64_t> modlX2(mod.begin(),mod.begin()+tw),rootlX2(root.begin(),root.begin()+tw);
+            auto KPt2=gpufhe::keygen_host(n,modlX2,rootlX2,ns,3.19,101);
+            std::vector<int64_t> decR; gpufhe::decrypt_host(decR,r0,r1,KPt2.s,n,modlX2,rootlX2);
+            std::vector<cd> yR; gpufhe::decode_host(yR,decR,n,A.scale*B.scale);
+            std::cerr<<"[chk] POST-KEYSWITCH r0+r1*s (pre-rescale) tw="<<tw<<": y[0]="<<yR[0].real()
+                      <<" (expect ~0, same as the raw-tensor check two steps above)\n";
+        }
         // rescale via resident path with a context at these towers
         auto Cl=gpufhe::ks_context_create(Kl);
         std::vector<uint64_t> s1,s2; rescaleConsts(tw,s1,s2);
@@ -169,9 +215,28 @@ int main(){
     // For the gate we sum c_k T_k by: scale each T_k by plaintext c_k (mul_pt+rescale)
     // then add all at the common lowest level.
     // Build T_0..T_deg as cts, tracking level. T_{k} lives at tw = sizeQ - (depth to make it).
+    // Diagnostic: decrypt+decode Tk[k] right after construction and compare
+    // against the independently-computed Chebyshev value, to localize EXACTLY
+    // where (which k, which tower count) the divergence begins.
+    auto checkTk=[&](uint32_t k, const Ct& t){
+        std::vector<uint64_t> modl(mod.begin(),mod.begin()+t.tw),rootl(root.begin(),root.begin()+t.tw);
+        auto KPchk=gpufhe::keygen_host(n,modl,rootl,ns,3.19,101);
+        std::vector<int64_t> dec; gpufhe::decrypt_host(dec,t.c0,t.c1,KPchk.s,n,modl,rootl);
+        std::vector<cd> yy; gpufhe::decode_host(yy,dec,n,t.scale);
+        double maxe=0;
+        for(uint32_t i=0;i<S;++i){
+            double x=xin[i].real(); double Tprev=1,Tcur=x,Tval;
+            if(k==0) Tval=1; else if(k==1) Tval=x;
+            else { for(uint32_t j=2;j<=k;++j){ double Tn=2*x*Tcur-Tprev; Tprev=Tcur; Tcur=Tn; } Tval=Tcur; }
+            maxe=std::max(maxe,std::abs(yy[i].real()-Tval));
+        }
+        std::cerr<<"[chk] Tk["<<k<<"] tw="<<t.tw<<" scale=2^"<<std::log2(t.scale)
+                  <<" maxerr_vs_T_"<<k<<"(x)="<<maxe<<" y[0]="<<yy[0].real()<<"\n";
+    };
     std::vector<Ct> Tk(deg+1);
     Tk[0]=encAt(std::vector<cd>(S,cd{1.0,0}), sizeQ, Delta, 600);
     Tk[1]=encAt(xin, sizeQ, Delta, 601);
+    checkTk(0,Tk[0]); checkTk(1,Tk[1]);
     for(uint32_t k=2;k<=deg;++k){
         // 2*x*T_{k-1}: need x and T_{k-1} at same level = Tk[k-1].tw
         Ct xl=encAt(xin, Tk[k-1].tw, Delta, 700+k);
@@ -187,6 +252,14 @@ int main(){
         while(tkm2.tw>twoxT.tw){
             Ct one=encAt(std::vector<cd>(S,cd{1.0,0}), tkm2.tw, Delta, 800+k*10+tkm2.tw);
             tkm2=mulCt(tkm2,one); }   // each drops a level, scale stays ~Delta
+        if(k==2) checkTk(2,twoxT);   // expect 2*x*T_1(x) = 2x^2 (not T_2 itself -- just a label for the print)
+        if(k==2){
+            std::vector<uint64_t> modl2(mod.begin(),mod.begin()+tkm2.tw),rootl2(root.begin(),root.begin()+tkm2.tw);
+            auto KPchk2=gpufhe::keygen_host(n,modl2,rootl2,ns,3.19,101);
+            std::vector<int64_t> dec2; gpufhe::decrypt_host(dec2,tkm2.c0,tkm2.c1,KPchk2.s,n,modl2,rootl2);
+            std::vector<cd> yy2; gpufhe::decode_host(yy2,dec2,n,tkm2.scale);
+            std::cerr<<"[chk] k=2 tkm2 (should be ~1.0 everywhere): tw="<<tkm2.tw<<" scale=2^"<<std::log2(tkm2.scale)<<" y[0]="<<yy2[0].real()<<" y[1]="<<yy2[1].real()<<"\n";
+        }
         // now subtract
         Ct res; res.tw=twoxT.tw; res.scale=Delta; size_t T=(size_t)res.tw*n;
         res.c0.resize(T);res.c1.resize(T);
@@ -194,6 +267,7 @@ int main(){
             for(uint32_t kk=0;kk<n;++kk){size_t x=(size_t)t*n+kk;
                 res.c0[x]=sm(twoxT.c0[x],tkm2.c0[x],q); res.c1[x]=sm(twoxT.c1[x],tkm2.c1[x],q);}}
         Tk[k]=res;
+        checkTk(k,Tk[k]);
     }
     // find common lowest level
     uint32_t low=sizeQ; for(uint32_t k=0;k<=deg;++k) low=std::min(low,Tk[k].tw);

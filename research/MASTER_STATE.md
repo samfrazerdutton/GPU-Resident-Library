@@ -630,3 +630,41 @@ thin RAII types (constructor calls `ks_context_create`/
 `ks_work_create`, destructor calls the matching `_destroy`) as a
 dedicated, carefully-scoped follow-up task with its own full
 regression pass once host memory conditions allow it.
+
+## GOD PROMPT round: test_polyeval's real root cause found — a genuine library bug in the native rescale pathway at small n, never a test-logic issue
+
+Full detail: `EXPERIMENT_LEDGER.md` entry #26. This supersedes entry
+#25's "root cause unidentified" status with a DEFINITIVE localization.
+Instrumented decrypt-and-compare checkpoints added directly inside
+`test_polyeval.cpp`'s `mulCt` (kept, additive-only, confirmed
+byte-identical `maxerr=2376.98` before/after) proved: the tensor
+product and the post-keyswitch-pre-rescale result are BOTH correct at
+the exact point of first failure — the corruption appears ONLY after
+`rescale_resident_raw` runs. A new minimal, independent reproduction
+(`tests/test_rescale_n1024.cpp`, zero Chebyshev/relin complexity)
+confirms this directly: encrypting a known constant and rescaling ONCE
+at n=1024 fails (maxerr 807-24602) regardless of modulus bit-size
+(tested both 50-bit and 55-bit mid-towers — both fail, ruling out
+bit-size as the variable).
+
+**This is a real, previously-unknown bug in `rescale_resident_raw`/
+`native_rescale_consts`/their dependent NTT kernels, specific to small
+n — not a bug in test_polyeval's own hand-rolled scale bookkeeping as
+the prior round suspected.** Confirmed via code search that no test in
+this 50+ test codebase exercises this exact native pathway below
+n=8192 (`test_boot.cpp`) or n=32768 with OpenFHE-sourced constants
+(`test_rescale_resident.cpp`, a different code path) — this bug has
+simply never been caught before. `test_rescale_n1024.cpp` is committed
+as a permanent, honestly-failing regression test, per the governing
+directive's explicit requirement, rather than shipping any unverified
+fix. The exact faulty kernel (NTT, INTT, SwitchModulus, RescaleFuse, or
+`native_rescale_consts`'s own arithmetic) is not yet identified; a
+specific next experiment (pure NTT round-trip at n=1024, no rescale)
+is recorded in `NEXT_SESSION.md`.
+
+Note: the first attempt at the isolated reproduction itself segfaulted
+inside `ks_context_create` — traced via `gdb` to a bug in the NEW TEST
+(missing `evalkeygen_host` call before `ks_context_create`, which
+unconditionally reads `K.av`/`K.bv` — the exact "empty av/bv"
+anti-pattern already documented from the `02e84eb` segfault fix).
+Fixed in the test; not a second library bug.

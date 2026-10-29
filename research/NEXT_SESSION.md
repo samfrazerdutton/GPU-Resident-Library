@@ -3,33 +3,54 @@
 ## Current commit
 
 Check `git log -3` on resume. As of this writing, HEAD is a new commit
-on top of `9428bfb` (the GOD PROMPT round: large-n gate re-checked
-still NO-GO, `bench_evalmult_resident` root-caused and fixed,
-`test_polyeval` investigated but not fixed — see `MASTER_STATE.md`'s
-latest section and `EXPERIMENT_LEDGER.md` entry #25). Confirm push
-status — push again if `git status` shows ahead of origin.
+on top of `cf0b395` (the GOD PROMPT round that found `test_polyeval`'s
+REAL root cause — see `MASTER_STATE.md`'s latest section and
+`EXPERIMENT_LEDGER.md` entry #26). Confirm push status — push again if
+`git status` shows ahead of origin.
 
-## `test_polyeval`: specific next hypothesis to test (not yet tried)
+## `test_polyeval` / native rescale pathway: DEFINITIVE localization, one specific next experiment
 
-The scale-equalization fix attempted this round was reverted (introduced
-its own overflow bug — see entry #25). The REFUTED hypothesis (prime-
-rounding drift) and the attempted fix's mechanism are both documented
-precisely in `EXPERIMENT_LEDGER.md` — do not re-attempt either without
-reading that first. **Specific next hypothesis, not yet tested**: this
-test's `mulCt` rebuilds a `KeySwitchConstants` with `numPart=2` FIXED
-regardless of the current tower count `tw`, and the test's deep
-Chebyshev chain drives `tw` down to 1-2 towers by the end (`acc.tw=1`
-in the failing output) — check whether `compute_keyswitch_constants`/
-the keyswitch machinery produces a degenerate or incorrect digit
-decomposition when `numPart` is fixed at 2 but `tw` shrinks to 1-2
-(i.e. `alpha` ends up larger than `tw` itself, or `sizePart`/`sizeCompl`
-hit a boundary case never exercised by this codebase's OTHER tests,
-which all use level-appropriate `numPart`/`npFor(tw)` logic rather than
-a fixed constant). A quick, cheap way to test this: add a temporary
-print of `decode_host` on EACH `Tk[k]`/intermediate (not just the
-final `acc`) to see at WHICH tower count the decrypted value first
-diverges significantly from the expected Chebyshev value — if it's
-exactly when `tw` drops to 1-2, that confirms this hypothesis directly.
+**Do not re-investigate from scratch — the root cause is now known
+precisely, just not the exact faulty line.** Entry #25's two
+hypotheses (prime-rounding drift; the fixed-`numPart=2`-at-low-tw
+degenerate-split idea) are both SUPERSEDED — neither was the cause.
+Entry #26 proved, via instrumented decrypt-and-compare checkpoints
+directly inside `mulCt` AND an independent minimal reproduction
+(`tests/test_rescale_n1024.cpp`), that `test_polyeval`'s own Chebyshev/
+scale logic is NOT at fault: the tensor product and the post-keyswitch
+pre-rescale result are both correct; the corruption appears only AFTER
+`rescale_resident_raw` runs. This is a **real, previously-unknown bug
+in the native rescale pathway specific to small n** (confirmed at
+n=1024, both 50-bit and 55-bit tower sizes — ruling out bit-size as
+the variable), never caught before because no test in this codebase
+exercises `native_rescale_consts`+`rescale_resident_raw` together below
+n=8192.
+
+**Specific next experiment, not yet run**: a PURE NTT-forward/
+INTT-inverse round-trip at n=1024 (encode a known value, `LaunchNTT_CT`
+forward, `LaunchINTT_GS` inverse, decode — NO `rescale_resident_raw`,
+NO `SwitchModulus`, NO `RescaleFuse` involved) to separate two
+remaining sub-hypotheses: (a) the NTT/INTT transform kernels themselves
+are broken at small n (would mean this affects far more than just
+rescale), vs (b) only the rescale-specific combine logic
+(`LaunchSwitchModulus`/`LaunchRescaleFuse`) or `native_rescale_consts`'s
+own arithmetic is broken (narrower, rescale-only impact). Also worth a
+quick, cheap check: directly compare `native_rescale_consts`'s `s1`/
+`s2` output against an independently-computed (e.g. Python/bignum)
+expected value for the SAME n=1024 modulus chain — this is pure
+arithmetic, needs no GPU, and would immediately tell you whether the
+bug is in that host-side constant computation or in the GPU kernels
+themselves. Binary-search the minimum failing n (try 2048, 4096 between
+the known-failing 1024 and the known-working 8192) would also help
+scope the blast radius.
+
+`tests/test_rescale_n1024.cpp` is committed as a permanent, honestly-
+FAILING regression test (per the directive's explicit requirement) —
+do not delete it or weaken its tolerance; it should start passing once
+the actual fix lands. `tests/test_polyeval.cpp`'s `[chk]` diagnostic
+checkpoints (inside `mulCt`) are also kept, additive-only, confirmed to
+not change its behavior — useful for anyone continuing this specific
+investigation.
 
 ## Read first
 

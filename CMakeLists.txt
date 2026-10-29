@@ -185,3 +185,14 @@ add_test(NAME test_c2s_diag_fast COMMAND test_c2s_diag_fast)
 # `ctest -E test_n131072_gpu_lifecycle` in any full-suite run, same
 # convention already used for test_boot_n131072.
 gpufhe_test(test_n131072_gpu_lifecycle tests/test_n131072_gpu_lifecycle.cpp)
+# Directive "GOD PROMPT -- CKKS ENGINE": isolates whether
+# rescale_resident_raw + native_rescale_consts work correctly at n=1024
+# (test_polyeval's scale) -- neither has been independently validated at
+# this n anywhere else in the repo (test_rescale_resident.cpp uses n=32768
+# sourced from OpenFHE's own constants; test_boot.cpp uses n=8192 with
+# native_rescale_consts). See research/EXPERIMENT_LEDGER.md for the
+# instrumented trace that localized test_polyeval's bug to exactly this
+# combination. Fast, no bootstrap, no OpenFHE dependency.
+add_executable(test_rescale_n1024 tests/test_rescale_n1024.cpp)
+target_link_libraries(test_rescale_n1024 PRIVATE gpufhe CUDA::cudart)
+add_test(NAME test_rescale_n1024 COMMAND test_rescale_n1024)
