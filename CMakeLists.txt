@@ -241,6 +241,14 @@ add_test(NAME test_rescale_double_call_n1024 COMMAND test_rescale_double_call_n1
 add_executable(test_rescale_n1024_matched_scale tests/test_rescale_n1024_matched_scale.cpp)
 target_link_libraries(test_rescale_n1024_matched_scale PRIVATE gpufhe CUDA::cudart)
 add_test(NAME test_rescale_n1024_matched_scale COMMAND test_rescale_n1024_matched_scale)
+# GOD PROMPT "CKKS CORRECTNESS BREAKTHROUGH" round, Priority 6: validates
+# ks_context_create's new K.av/K.bv size check (src/keyswitch_resident.cpp)
+# -- confirms the historical empty-av/bv footgun now throws a clear
+# std::invalid_argument instead of segfaulting, and that a correctly-
+# populated K still succeeds with zero behavior change.
+add_executable(test_ks_context_create_validation tests/test_ks_context_create_validation.cpp)
+target_link_libraries(test_ks_context_create_validation PRIVATE gpufhe CUDA::cudart)
+add_test(NAME test_ks_context_create_validation COMMAND test_ks_context_create_validation)
 # Directive "GOD PROMPT -- CKKS ENGINE": Priority 2 (RAII refactor), Phase C.
 # Validates include/ks_raii.h's ScopedKSContext/ScopedKSWork wrappers in
 # ISOLATION (construction/destruction, repeated cycles with stable GPU

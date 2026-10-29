@@ -32,6 +32,23 @@ uint64_t* upc(uint64_t key, const std::vector<uint64_t>& h){
 } // anon
 
 DeviceKSContext ks_context_create(const KeySwitchConstants& K, cudaStream_t s){
+    // K.av/K.bv must hold K.numPart entries each -- this function
+    // unconditionally reads K.av[p]/K.bv[p] for every p below. Populating
+    // K.rootModList/rootValList and calling compute_keyswitch_constants
+    // alone does NOT fill av/bv; only evalkeygen_host (or
+    // evalkeygen_host_sold) does. Passing a K built without one of those
+    // calls previously segfaulted with no diagnostic (confirmed via gdb
+    // across multiple occurrences this project) -- this check turns that
+    // into a clear, immediate error instead.
+    if(K.av.size()!=K.numPart || K.bv.size()!=K.numPart){
+        throw std::invalid_argument(
+            "ks_context_create: K.av.size()="+std::to_string(K.av.size())+
+            " K.bv.size()="+std::to_string(K.bv.size())+
+            " but K.numPart="+std::to_string(K.numPart)+
+            " -- call evalkeygen_host (or evalkeygen_host_sold) to populate "
+            "K.av/K.bv before ks_context_create; compute_keyswitch_constants "
+            "alone does not set them.");
+    }
     DeviceKSContext C;
     C.n=K.n; C.sizeQl=K.sizeQl; C.sizeP=K.sizeP; C.sizeQlP=K.sizeQl+K.sizeP;
     C.numPart=K.numPart; C.fullQ=K.fullQ;
