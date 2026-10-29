@@ -603,3 +603,30 @@ unverified fix. True root cause remains open; a specific next
 hypothesis (keyswitch breakdown at the very low tower counts this
 test's deep chain reaches) is recorded in `NEXT_SESSION.md`, not yet
 tested.
+
+**Library-usability finding (Priority 6, code-reading only, no
+refactor attempted this round).** `include/device_ciphertext.h`'s
+`DeviceCiphertext` class is a genuinely well-designed RAII primitive
+(constructor/destructor pair, move-only, deleted copy, clear
+ownership) — but it is used ONLY in simpler, early single-op tests and
+benchmarks (`test_mult_resident`, `test_ntt_resident`,
+`bench_resident_chain`, `bench_batch`, `ckks_ops.cpp`). The actual
+production bootstrap/keyswitch/hoisting code this entire session's
+work has focused on (`tests/test_boot.cpp`, `tests/
+test_boot_n131072.cpp`, `src/keyswitch_resident.cpp`'s
+`DeviceKSContext`/`DeviceKSWork`) uses manual `cudaMalloc`/`cudaFree`
+pairs with raw pointers instead — the LESS safe idiom used for the
+MORE complex, higher-stakes code. This is exactly the architectural
+gap that produced the real, confirmed `d_keyRow` leak fixed earlier
+this session (`ks_context_destroy` forgetting one of several raw
+pointers it owns) — a class of bug RAII wrapping would make
+structurally impossible rather than something that has to be gotten
+right by hand at every call site. **Recommended smallest safe
+improvement (not implemented this round, given the correctness risk of
+touching the carefully-preserved, heavily-tested bootstrap path under
+the current tight host-memory conditions that make full re-
+verification difficult)**: wrap `DeviceKSContext`/`DeviceKSWork` in
+thin RAII types (constructor calls `ks_context_create`/
+`ks_work_create`, destructor calls the matching `_destroy`) as a
+dedicated, carefully-scoped follow-up task with its own full
+regression pass once host memory conditions allow it.
