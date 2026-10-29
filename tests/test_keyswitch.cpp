@@ -14,6 +14,21 @@ using namespace lbcrypto;
 using gpufhe::KeySwitchConstants;
 
 int main() {
+    // GOD PROMPT "CKKS ENGINE: RESOLVE POLYEVAL CORRECTNESS" round: this
+    // OpenFHE build secretly links an external GPU-accelerated fork
+    // (~/openfheNVDIA-GPU) whose libopenfhe_cuda_hal.so exports
+    // gpu_ks_enabled()/gpu_keyswitch_inner_product, gated by env vars
+    // OPENFHE_GPU and OPENFHE_GPU_KS (found via `strings` on that .so).
+    // keyswitch-hybrid.cpp's EvalFastKeySwitchCoreExt branches to this GPU
+    // path BEFORE the textbook per-digit CPU loop whenever gpu_ks_enabled()
+    // is true -- meaning this test's "OpenFHE reference" call may have been
+    // silently running through an UNDOCUMENTED, externally-patched GPU
+    // implementation this whole time, not vanilla OpenFHE CPU code. Force
+    // both off, mirroring bench_evalmult_resident.cpp's existing
+    // OPENFHE_GPU=0 fix for the SAME external-GPU-shadowing issue (found an
+    // earlier round) applied to the general ShadowRegistry path.
+    setenv("OPENFHE_GPU","0",1);
+    setenv("OPENFHE_GPU_KS","0",1);
     CCParams<CryptoContextCKKSRNS> params;
     params.SetMultiplicativeDepth(3); params.SetScalingModSize(50);
     params.SetRingDim(32768); params.SetBatchSize(16384);
@@ -135,6 +150,68 @@ int main() {
     std::cout<<"sizeQl="<<sizeQl<<" sizeP="<<sizeP<<" numPart="<<numPart<<" evalKeyTowers="<<K.evalKeyTowers<<"\n";
     std::cout<<"  ba0: "<<(bad0==0?"ok":"BAD"); if(bad0)std::cout<<" "<<bad0<<" first tower "<<f0; std::cout<<"\n";
     std::cout<<"  ba1: "<<(bad1==0?"ok":"BAD"); if(bad1)std::cout<<" "<<bad1<<" first tower "<<f1; std::cout<<"\n";
+
+    // GOD PROMPT "CKKS ENGINE: RESOLVE POLYEVAL CORRECTNESS" round -- extra
+    // algebraic sanity check (INFORMATIONAL ONLY, formula NOT confirmed
+    // correct -- see result below). The naive expectation was ba0+ba1*s ~
+    // a*s^2 (mod q, the textbook single-eval-key relin identity). This
+    // check consistently measures ~50% of q here -- i.e. pure noise --
+    // EVEN on ba0/ba1 already proven bit-exact against OpenFHE two lines
+    // above, with the external GPU-keyswitch-shadow path independently
+    // ruled out (OPENFHE_GPU/OPENFHE_GPU_KS=0 set at the top of main, found
+    // via `strings` on libopenfhe_cuda_hal.so: it exports gpu_ks_enabled()/
+    // gpu_keyswitch_inner_product, gated by exactly those two env vars,
+    // and keyswitch-hybrid.cpp's EvalFastKeySwitchCoreExt branches to it
+    // before the textbook per-digit CPU loop whenever enabled -- disabling
+    // it changed the measured secret key value, confirming the env vars do
+    // something, but did NOT change the ~50%-of-q result). Tracing through
+    // OpenFHE's own keyswitch-hybrid.cpp source (digit decomposition +
+    // per-part av/bv accumulation, EvalFastKeySwitchCoreExt's final loop)
+    // did not resolve the exact per-digit scaling convention in the time
+    // available. CONCLUSION: this specific "ba0+ba1*s ~ a*s^2" formula is
+    // NOT validated and must not be used to allege a defect anywhere --
+    // ba0/ba1's bit-exact match against OpenFHE's own reference (the check
+    // directly above) remains the trusted, working correctness evidence
+    // for keyswitch_core_resident. This block is kept only as a documented,
+    // honestly-unresolved research note for whoever next wants to pin down
+    // the exact per-digit algebraic contract.
+    {
+        auto sElem = kp.secretKey->GetPrivateElement();
+        std::cout<<"  [algebraic check] secret key format: "<<(sElem.GetFormat()==Format::EVALUATION?"EVALUATION":"COEFFICIENT (converting)")<<"\n";
+        if(sElem.GetFormat()!=Format::EVALUATION) sElem.SetFormat(Format::EVALUATION);
+        std::cout<<"  [algebraic check] secret key tower count="<<sElem.GetAllElements().size()<<" vs sizeQl="<<sizeQl
+                  <<"; secret tower0 modulus="<<sElem.GetAllElements()[0].GetModulus().ConvertToInt()
+                  <<" vs ep tower0 modulus="<<ep->GetParams()[0]->GetModulus().ConvertToInt()<<"\n";
+        {
+            uint64_t q=ep->GetParams()[0]->GetModulus().ConvertToInt();
+            uint64_t sv=sElem.GetAllElements()[0][0].ConvertToInt();
+            uint64_t av=aTowers[0];
+            uint64_t b0=R.ba0[0], b1=R.ba1[0];
+            std::cout<<"  [raw dump] tower=0 k=0: q="<<q<<" a="<<av<<" s="<<sv<<" ba0="<<b0<<" ba1="<<b1<<"\n";
+        }
+        auto mulmodL=[](uint64_t a,uint64_t b,uint64_t q){return (uint64_t)(((unsigned __int128)a*b)%q);};
+        auto addmodL=[](uint64_t a,uint64_t b,uint64_t q){uint64_t s=a+b;return s>=q?s-q:s;};
+        double worst_frac=0;
+        for(uint32_t i=0;i<sizeQl;++i){
+            uint64_t q=ep->GetParams()[i]->GetModulus().ConvertToInt();
+            uint64_t worst=0;
+            for(uint32_t k=0;k<n;++k){
+                uint64_t sv=sElem.GetAllElements()[i][k].ConvertToInt();
+                uint64_t s2=mulmodL(sv,sv,q);
+                uint64_t av=aTowers[(size_t)i*n+k];
+                uint64_t rhs=mulmodL(av,s2,q);
+                uint64_t lhs=addmodL(R.ba0[(size_t)i*n+k], mulmodL(R.ba1[(size_t)i*n+k],sv,q), q);
+                uint64_t diff=(lhs>=rhs)?(lhs-rhs):(rhs-lhs);
+                uint64_t cdiff=(diff>q-diff)?(q-diff):diff;
+                if(cdiff>worst) worst=cdiff;
+            }
+            double frac=(double)worst/(double)q;
+            if(frac>worst_frac) worst_frac=frac;
+            std::cout<<"  [algebraic check] tower="<<i<<" worst|ba0+ba1*s - a*s^2| = "<<(frac*100.0)<<"% of q\n";
+        }
+        std::cout<<"  [algebraic check] worst fraction of q across all towers: "<<(worst_frac*100.0)<<"%\n";
+    }
+
     if(bad0==0&&bad1==0){ std::cout<<"[PASS] full resident KeySwitchCore bit-exact vs OpenFHE\n"; return 0; }
     std::cout<<"[FAIL]\n"; return 1;
 }

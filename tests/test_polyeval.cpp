@@ -77,7 +77,8 @@ int main(){
                 t1[x]=am(mm(A.c0[x],B.c1[x],q),mm(A.c1[x],B.c0[x],q),q);
                 t2[x]=mm(A.c1[x],B.c1[x],q);}}
         static int mulCtCallCount=0;
-        if(mulCtCallCount++==0){   // only the very first mulCt call ever, to avoid flooding output
+        int callIdx=mulCtCallCount++;   // 0-indexed BEFORE increment: call 0 = twoxT=mulCt(xl,Tk[1]) (x*x, trivially 0 at slot 0); call 1 = tkm2=mulCt(Tk[0],one) (1.0*1.0, NOT trivially 0 anywhere -- a much more informative known-answer case). Extended this round from "callIdx==0 only" to cover both, with full-array max|err| instead of slot-0-only printouts, since slot 0's x=0.6*sin(0)=0 made the original call-0 check uninformative for distinguishing "correct" from "silently wrong".
+        if(callIdx<=1){
             // Diagnostic: decrypt the RAW tensor (t0+t1*s+t2*s^2, no keyswitch)
             // under a freshly-derived secret at this level, to see whether the
             // tensor-product step itself (before any relin/keyswitch) is
@@ -103,8 +104,29 @@ int main(){
             std::vector<uint64_t> zero(T,0);
             std::vector<int64_t> dect; gpufhe::decrypt_host(dect,raw0,zero,KPt.s,n,modlX,rootlX);
             std::vector<cd> yt; gpufhe::decode_host(yt,dect,n,A.scale*B.scale);
-            std::cerr<<"[chk] RAW TENSOR (pre-keyswitch) tw="<<tw<<": y[0]="<<yt[0].real()
-                      <<" (expect A.msg[0]*B.msg[0])\n";
+            double maxabs=0; for(uint32_t i=0;i<S;++i) maxabs=std::max(maxabs,std::abs(yt[i].real()));
+            std::cerr<<"[chk] RAW TENSOR (pre-keyswitch) call="<<callIdx<<" tw="<<tw<<": y[0]="<<yt[0].real()
+                      <<" y[1]="<<yt[1].real()<<" max|y| over all "<<S<<" slots="<<maxabs
+                      <<" (expect A.msg*B.msg per-slot; call 0 is x*x [0 at slot0], call 1 is 1.0*1.0 [1.0 everywhere])\n";
+            // IMPORTANT CAVEAT just discovered: decrypt_host's "tower 0 only"
+            // recovery is valid ONLY when the true coefficient's magnitude
+            // fits within q0 (centered, |v|<=q0/2). The raw tensor product's
+            // true magnitude is ~A.scale*B.scale (~Delta^2 ~ 2^100 for
+            // call=1), vastly exceeding q0 (~2^60) -- so dect[]'s "centered"
+            // value above is an ALIASED residue mod q0, NOT the true value;
+            // the y[0]/y[1]/max|y| printed above are NOT valid evidence of a
+            // tensor-product defect by themselves. Print the raw, uncentered
+            // residue mod q0 (dect[0] after undoing the centering) and q0
+            // itself so this can be checked against an independent
+            // Delta^2 mod q0 computation instead of trusting the (invalid)
+            // centered interpretation.
+            {
+                uint64_t q0=mod[0];
+                int64_t v=dect[0];
+                uint64_t resid0 = (v<0) ? (uint64_t)(v+(int64_t)q0) : (uint64_t)v;
+                std::cerr<<"[chk]   raw residue check: q0="<<q0<<" dect[0](centered)="<<dect[0]
+                          <<" dect[0] mod q0 (uncentered)="<<resid0<<" A.scale*B.scale="<<(A.scale*B.scale)<<"\n";
+            }
         }
         // relin uses the full-QP key; keyswitch_core_resident works at full tw? It
         // assumes sizeQl=K.sizeQl. For leveled we keyswitch at tw: rebuild a K at tw.
@@ -135,21 +157,46 @@ int main(){
         std::vector<uint64_t> r0(T),r1(T);
         for(uint32_t t=0;t<tw;++t){uint64_t q=mod[t];
             for(uint32_t k=0;k<n;++k){size_t x=(size_t)t*n+k; r0[x]=am(t0[x],R.ba0[x],q); r1[x]=am(t1[x],R.ba1[x],q);}}
-        if(mulCtCallCount==1){
+        if(callIdx<=1){
             // Isolate the keyswitch step: decrypt (r0+r1*s) = t0+t1*s+ba0+ba1*s
             // under the first-degree secret and compare against the raw-tensor
             // check above (t0+t1*s+t2*s^2, already proven ~0/correct). If this
-            // ALSO comes out ~0, keyswitch_core_resident's output correctly
-            // re-expresses the t2*s^2 term as a linear-in-s term and the bug is
-            // elsewhere (the rescale step, or something after it). If this
-            // diverges, the bug is isolated to keyswitch_core_resident's
-            // consumption of Kl at this reduced tw+sizeP basis.
+            // ALSO comes out ~0 (full-array, not just slot 0), keyswitch_core_
+            // resident's output correctly re-expresses the t2*s^2 term as a
+            // linear-in-s term and the bug is elsewhere (the rescale step, or
+            // something after it). If this diverges, the bug is isolated to
+            // keyswitch_core_resident's consumption of Kl at this reduced
+            // tw+sizeP basis. callIdx==1 (Tk[0]*one, both constant 1.0) is the
+            // first mulCt call that later shows large post-rescale error
+            // (6629.5/1437.4 at slots 0/1) -- checking it HERE, pre-rescale,
+            // decides whether that error originates in tensor/keyswitch or is
+            // introduced specifically by the rescale step.
             std::vector<uint64_t> modlX2(mod.begin(),mod.begin()+tw),rootlX2(root.begin(),root.begin()+tw);
             auto KPt2=gpufhe::keygen_host(n,modlX2,rootlX2,ns,3.19,101);
             std::vector<int64_t> decR; gpufhe::decrypt_host(decR,r0,r1,KPt2.s,n,modlX2,rootlX2);
             std::vector<cd> yR; gpufhe::decode_host(yR,decR,n,A.scale*B.scale);
-            std::cerr<<"[chk] POST-KEYSWITCH r0+r1*s (pre-rescale) tw="<<tw<<": y[0]="<<yR[0].real()
-                      <<" (expect ~0, same as the raw-tensor check two steps above)\n";
+            double maxabs=0; for(uint32_t i=0;i<S;++i) maxabs=std::max(maxabs,std::abs(yR[i].real()));
+            std::cerr<<"[chk] POST-KEYSWITCH r0+r1*s (pre-rescale) call="<<callIdx<<" tw="<<tw<<": y[0]="<<yR[0].real()
+                      <<" y[1]="<<yR[1].real()<<" max|y| over all "<<S<<" slots="<<maxabs
+                      <<" (expect same as the RAW TENSOR check above for this same call)\n";
+            // Same caveat as the RAW TENSOR check: decR here is ALSO a
+            // "centered mod q0" value of a quantity whose true magnitude is
+            // ~A.scale*B.scale (~Delta^2), so the centered/decoded numbers
+            // above are similarly unreliable. Print the raw uncentered
+            // residue mod q0 so it can be diffed directly against the RAW
+            // TENSOR check's own residue (printed just above, same callIdx)
+            // -- if keyswitch_core_resident correctly preserves the
+            // decrypted value, these two residues should match almost
+            // exactly (differing only by keyswitch's own small noise
+            // contribution), the same way the tensor's residue matched its
+            // independently-computed expectation.
+            {
+                uint64_t q0=mod[0];
+                int64_t v=decR[0];
+                uint64_t resid0=(v<0)?(uint64_t)(v+(int64_t)q0):(uint64_t)v;
+                std::cerr<<"[chk]   raw residue check: decR[0](centered)="<<decR[0]
+                          <<" decR[0] mod q0 (uncentered)="<<resid0<<"\n";
+            }
         }
         // rescale via resident path with a context at these towers
         auto Cl=gpufhe::ks_context_create(Kl);
@@ -251,6 +298,29 @@ int main(){
         Ct tkm2=Tk[k-2];
         while(tkm2.tw>twoxT.tw){
             Ct one=encAt(std::vector<cd>(S,cd{1.0,0}), tkm2.tw, Delta, 800+k*10+tkm2.tw);
+            if(k==2){
+                // Both operands of the upcoming mulCt(tkm2,one) call, checked
+                // INDEPENDENTLY before the multiply -- tkm2 is Tk[0], already
+                // proven correct by checkTk(0,...) above; "one" is a FRESH
+                // encAt call with the same structure. If both check out here
+                // but the product (checked inside mulCt as call=1) is still
+                // wrong, the defect is specifically in the multiply/tensor
+                // step for this operand pair, not in either input.
+                std::vector<uint64_t> moX(mod.begin(),mod.begin()+tkm2.tw),roX(root.begin(),root.begin()+tkm2.tw);
+                auto KPX=gpufhe::keygen_host(n,moX,roX,ns,3.19,101);
+                std::vector<int64_t> decTkm2; gpufhe::decrypt_host(decTkm2,tkm2.c0,tkm2.c1,KPX.s,n,moX,roX);
+                std::vector<cd> yTkm2; gpufhe::decode_host(yTkm2,decTkm2,n,tkm2.scale);
+                double eTkm2=0; for(uint32_t i=0;i<S;++i) eTkm2=std::max(eTkm2,std::abs(yTkm2[i].real()-1.0));
+                std::vector<int64_t> decOne; gpufhe::decrypt_host(decOne,one.c0,one.c1,KPX.s,n,moX,roX);
+                std::vector<cd> yOne; gpufhe::decode_host(yOne,decOne,n,one.scale);
+                double eOne=0; for(uint32_t i=0;i<S;++i) eOne=std::max(eOne,std::abs(yOne[i].real()-1.0));
+                std::cerr<<"[chk] pre-mulCt operands for call=1: tkm2(=Tk[0]) maxerr_vs_1.0="<<eTkm2
+                          <<" one maxerr_vs_1.0="<<eOne<<" (both should be ~0 if both operands are valid 1.0-encryptions)\n";
+                std::cerr<<"[chk]   raw coefficient[0] (integer, before decode): decTkm2[0]="<<decTkm2[0]
+                          <<" decOne[0]="<<decOne[0]<<" (Delta="<<(int64_t)tkm2.scale
+                          <<"; noise_A[0]=decTkm2[0]-Delta="<<(decTkm2[0]-(int64_t)tkm2.scale)
+                          <<" noise_B[0]=decOne[0]-Delta="<<(decOne[0]-(int64_t)one.scale)<<")\n";
+            }
             tkm2=mulCt(tkm2,one); }   // each drops a level, scale stays ~Delta
         if(k==2) checkTk(2,twoxT);   // expect 2*x*T_1(x) = 2x^2 (not T_2 itself -- just a label for the print)
         if(k==2){
@@ -258,7 +328,8 @@ int main(){
             auto KPchk2=gpufhe::keygen_host(n,modl2,rootl2,ns,3.19,101);
             std::vector<int64_t> dec2; gpufhe::decrypt_host(dec2,tkm2.c0,tkm2.c1,KPchk2.s,n,modl2,rootl2);
             std::vector<cd> yy2; gpufhe::decode_host(yy2,dec2,n,tkm2.scale);
-            std::cerr<<"[chk] k=2 tkm2 (should be ~1.0 everywhere): tw="<<tkm2.tw<<" scale=2^"<<std::log2(tkm2.scale)<<" y[0]="<<yy2[0].real()<<" y[1]="<<yy2[1].real()<<"\n";
+            double maxerr2=0; for(uint32_t i=0;i<S;++i) maxerr2=std::max(maxerr2,std::abs(yy2[i].real()-1.0));
+            std::cerr<<"[chk] k=2 tkm2 (should be ~1.0 everywhere): tw="<<tkm2.tw<<" scale=2^"<<std::log2(tkm2.scale)<<" y[0]="<<yy2[0].real()<<" y[1]="<<yy2[1].real()<<" maxerr_vs_1.0 over all "<<S<<" slots="<<maxerr2<<"\n";
         }
         // now subtract
         Ct res; res.tw=twoxT.tw; res.scale=Delta; size_t T=(size_t)res.tw*n;

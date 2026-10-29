@@ -249,6 +249,45 @@ add_test(NAME test_rescale_n1024_matched_scale COMMAND test_rescale_n1024_matche
 add_executable(test_ks_context_create_validation tests/test_ks_context_create_validation.cpp)
 target_link_libraries(test_ks_context_create_validation PRIVATE gpufhe CUDA::cudart)
 add_test(NAME test_ks_context_create_validation COMMAND test_ks_context_create_validation)
+# GOD PROMPT "CKKS ENGINE: RESOLVE POLYEVAL CORRECTNESS" round -- scratch
+# diagnostic verifying encode_host's actual output for a constant input,
+# used to build an independent reference for test_polyeval's raw
+# tensor-product residue. Not wired into ctest (diagnostic only).
+add_executable(test_encode_impulse_check tests/test_encode_impulse_check.cpp)
+target_link_libraries(test_encode_impulse_check PRIVATE gpufhe CUDA::cudart)
+# GOD PROMPT "CKKS ENGINE: RESOLVE POLYEVAL CORRECTNESS" round: direct,
+# unambiguous eval-domain differential check of keyswitch_core_resident's
+# core algebraic property (ba0+ba1*s =?= a*s mod q, per tower, per
+# coefficient) using NATIVELY-generated KeySwitchConstants exactly as
+# test_polyeval builds them (compute_keyswitch_constants+evalkeygen_host,
+# numPart=2, n=1024) -- a combination test_keyswitch.cpp never covers
+# (it only validates against OpenFHE-sourced constants at n=32768).
+add_executable(test_keyswitch_core_native_diff tests/test_keyswitch_core_native_diff.cpp)
+target_link_libraries(test_keyswitch_core_native_diff PRIVATE gpufhe CUDA::cudart)
+# NOT registered with add_test: this checks an algebraic formula
+# (ba0+ba1*s =?= a*s^2) that FAILED even when applied to OpenFHE's own
+# bit-exact-proven-correct output (see test_keyswitch.cpp's own appended
+# check) -- the formula itself is unconfirmed, so this failing is expected
+# and NOT a regression signal. Kept as a documented, reproducible research
+# artifact only.
+# GOD PROMPT "CKKS ENGINE: RESOLVE POLYEVAL CORRECTNESS" round: same
+# eval-domain algebraic check as test_keyswitch_core_native_diff, but with
+# a=t2 from a REAL tensor product of two fresh valid encryptions (exactly
+# what test_polyeval's mulCt feeds keyswitch_core_resident), to test
+# whether the ~50%-of-q failure seen with purely random "a" is specific to
+# out-of-domain random input, or also present for realistic input.
+add_executable(test_keyswitch_core_realct_diff tests/test_keyswitch_core_realct_diff.cpp)
+target_link_libraries(test_keyswitch_core_realct_diff PRIVATE gpufhe CUDA::cudart)
+# NOT registered with add_test, same reason as test_keyswitch_core_native_
+# diff above -- the underlying formula is unconfirmed, not the library.
+# GOD PROMPT "CKKS ENGINE: RESOLVE POLYEVAL CORRECTNESS" round: checks
+# test_polyeval.cpp's per-mulCt-call rebuilt Kl against a top-level K for
+# the FIRST mulCt call (tw=sizeQ, no slicing effect) -- bit-exact ba0/ba1
+# comparison, independent of the still-unresolved algebraic-formula
+# question above.
+add_executable(test_polyeval_kl_rebuild_diff tests/test_polyeval_kl_rebuild_diff.cpp)
+target_link_libraries(test_polyeval_kl_rebuild_diff PRIVATE gpufhe CUDA::cudart)
+add_test(NAME test_polyeval_kl_rebuild_diff COMMAND test_polyeval_kl_rebuild_diff)
 # Directive "GOD PROMPT -- CKKS ENGINE": Priority 2 (RAII refactor), Phase C.
 # Validates include/ks_raii.h's ScopedKSContext/ScopedKSWork wrappers in
 # ISOLATION (construction/destruction, repeated cycles with stable GPU

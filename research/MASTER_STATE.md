@@ -771,3 +771,68 @@ committed as permanent regression evidence; `test_rescale_n1024.cpp`'s
 own `[FAIL]` is now understood and expected (it exercises a
 deliberately-mismatched parameter set from an earlier round's own
 isolation experiment), not an unexplained red test.
+
+## GOD PROMPT "RESOLVE POLYEVAL CORRECTNESS" round: every library-defect hypothesis for test_polyeval refuted by direct evidence; one formula proven wrong, not the library
+
+Full detail: `EXPERIMENT_LEDGER.md` entry #30. Re-verified
+`test_polyeval`'s baseline first (maxerr=2376.98, byte-identical;
+peak RSS 131MB, no memory risk). Extended `mulCt`'s diagnostics to
+cover the SECOND mulCt call (`Tk[0]*one`, both constant 1.0 — not
+trivially zero at any slot, unlike the original slot-0-only check on
+`x*x`) with full-array statistics.
+
+**Chased down what first looked like a severe tensor-product defect
+and found it was an invalid diagnostic, not a bug**: `decrypt_host`'s
+"tower-0-only, centered" recovery is only valid when the true value's
+magnitude fits within q0 (~2^60); the raw tensor product's true
+magnitude is ~Delta² (~2^100), so the centered interpretation was
+reading a meaningless aliased residue — the apparent "~0 instead of
+~1.0" result was noise from an out-of-range comparison. Verified the
+tensor arithmetic IS correct by comparing the raw, uncentered residue
+mod q0 directly against an independently-computed expected value
+(built from the actually-measured per-ciphertext noise, confirmed via
+a new `test_encode_impulse_check` that `encode_host` produces an exact
+impulse for constant input) — matched to 12 significant figures, the
+expected magnitude of a negligible noise cross-term.
+
+**Spent most of this round trying to directly verify
+`keyswitch_core_resident`'s algebraic contract
+(`ba0+ba1*s =?= a*s²`) and could not** — three escalating eval-domain
+differential tests (random input, numPart=1 and 2, and a REAL
+tensor-product input) all show ~50% of q (pure noise). Decisively
+ruled out a native-vs-OpenFHE discrepancy as the cause: the identical
+~50%-of-q failure reproduces even applying the SAME check to OpenFHE's
+own bit-exact-proven-correct `ba0`/`ba1` (appended directly to the
+existing `test_keyswitch.cpp`), with secret-key format and tower
+alignment independently verified correct. Also discovered and ruled
+out an external GPU-patched OpenFHE fork's keyswitch shadow path
+(`gpu_ks_enabled()`/`gpu_keyswitch_inner_product` in
+`libopenfhe_cuda_hal.so`, gated by `OPENFHE_GPU`/`OPENFHE_GPU_KS` —
+same class of issue as the earlier `bench_evalmult_resident` fix, now
+also applied to `test_keyswitch.cpp`): disabling it changed the
+measured secret key value but not the ~50% result. Read OpenFHE's own
+`keyswitch-hybrid.cpp` source directly and confirmed the high-level
+"add ba0/ba1 into c0/c1" convention matches this project's usage, but
+did not resolve the exact per-digit/per-part scaling that would make
+the elementwise identity hold. **This formula is an honestly
+unresolved research question — clearly marked informational-only, not
+used to allege any defect.**
+
+Separately, and independently of the unresolved formula: confirmed
+`test_polyeval`'s per-mulCt-call rebuilt `Kl` (at its first call,
+tw=sizeQ) produces bit-exact identical `ba0`/`ba1` to a top-level `K`
+built the same way (0/8192 mismatches) — ruling out the custom
+Kl-rebuild logic as a defect source for that call.
+
+**No code in `rescale_resident_raw`, `native_rescale_consts`, the
+NTT/SwitchModulus/RescaleFuse kernels, or `keyswitch_core_resident`
+was changed — no defect was demonstrated in any of them.** The two
+new keyswitch-formula tests are built but deliberately NOT registered
+with `add_test` (their failure is expected given the unconfirmed
+formula, not a regression signal). All other new/existing tests
+re-verified passing with zero regressions. **Residual honest
+uncertainty, unchanged from entry #29**: whether test_polyeval's
+maxerr growth across Chebyshev levels is quantitatively consistent
+with inherent independent-component rescale noise compounding across
+multiple chained mulCt calls — not yet confirmed, recorded as the
+next concrete step in `NEXT_SESSION.md`.

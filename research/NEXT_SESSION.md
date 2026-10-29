@@ -3,11 +3,10 @@
 ## Current commit
 
 Check `git log -3` on resume. As of this writing, HEAD is a new commit
-on top of `2e0119e` (the GOD PROMPT round that audited/designed/
-validated-in-isolation the RAII wrappers AND built a genuinely
-randomized A/B trial runner — see `MASTER_STATE.md`'s latest section
-and `EXPERIMENT_LEDGER.md` entries #26-#28). Confirm push status — push
-again if `git status` shows ahead of origin.
+on top of `8ba09bd` (the GOD PROMPT "RESOLVE POLYEVAL CORRECTNESS"
+round — see `MASTER_STATE.md`'s latest section and
+`EXPERIMENT_LEDGER.md` entry #30). Confirm push status — push again if
+`git status` shows ahead of origin.
 
 ## Randomized hoisting A/B: script ready, exact command to run once the memory gate clears
 
@@ -74,34 +73,75 @@ round((c0+c1*s)/qL)` in general, an O(1)-per-coefficient "combining"
 discrepancy that `decode_host`'s n=1024-term inverse embedding sum
 amplifies into a few-hundred-unit decode deviation. This is NOT a bug.
 
-**What's genuinely still open** (the honest residual uncertainty, not
-yet run): `test_polyeval.cpp` itself uses 50-bit mid-towers matched to
-its own Delta=2^50 (no Delta/qLast mismatch there), so its original
-maxerr=2376.98 is *consistent with* the same inherent independent-
-component rescale noise accumulating across MULTIPLE chained
-Chebyshev-level rescales — but this has not yet been separately,
-quantitatively confirmed for the multi-level case. The next concrete
-experiment, if anyone picks this up: instrument `test_polyeval.cpp`'s
-own Chebyshev loop to track `maxerr` level-by-level (Tk[0]→Tk[1]→
-Tk[2]→...) and check whether the GROWTH matches the magnitude expected
-from accumulating O(1)-per-coefficient combining noise through
+**Entry #30 (this round) spent a full round trying to find a library
+defect behind test_polyeval's error and found NONE — do not re-chase
+`rescale_resident_raw`, the NTT kernels, or `keyswitch_core_resident`.**
+Three escalating eval-domain differential tests
+(`test_keyswitch_core_native_diff.cpp`, `test_keyswitch_core_realct_
+diff.cpp`) tried to directly verify keyswitch's algebraic contract
+(`ba0+ba1*s =?= a*s^2`) and all showed ~50% of q (pure noise) — but
+this was PROVEN to be a wrong formula, not a defect: the identical
+~50%-of-q failure reproduces even applying the same check to OpenFHE's
+own bit-exact-proven-correct `ba0`/`ba1` (see the appended check in
+`test_keyswitch.cpp`). An external GPU-patched OpenFHE fork's
+keyswitch shadow path was also found and ruled out as a confound
+(`OPENFHE_GPU`/`OPENFHE_GPU_KS` env vars, now set to `0` in
+`test_keyswitch.cpp`, same class of fix as `bench_evalmult_resident`'s
+pre-existing one) — disabling it changed the secret key value but not
+the 50% result. **If anyone wants to resolve the exact per-digit/
+per-part algebraic contract**: read OpenFHE's
+`src/pke/lib/keyswitch/keyswitch-hybrid.cpp` (`EvalKeySwitchPrecompute
+Core`'s digit decomposition + `ApproxSwitchCRTBasis`, and
+`EvalFastKeySwitchCoreExt`'s final per-digit `cji*bji`/`cji*aji`
+accumulation loop around line 470) — the high-level "add ba0/ba1 into
+c0/c1" convention is confirmed correct, but the per-digit CRT-weighted
+scaling that makes the elementwise identity hold was not derived in
+the time available. This is NOT blocking anything — `test_keyswitch.
+cpp`'s existing bit-exact-vs-OpenFHE comparison remains the trusted
+correctness evidence for `keyswitch_core_resident`, independent of
+this unresolved formula.
+
+**What's genuinely still open, and the single most concrete next
+step**: `test_polyeval.cpp` itself uses 50-bit mid-towers matched to
+its own Delta=2^50 (no Delta/qLast mismatch, confirmed), so its
+original maxerr=2376.98 is *consistent with* the same inherent
+independent-component rescale noise (entry #29) accumulating across
+MULTIPLE chained Chebyshev-level mulCt calls — but this has not yet
+been separately, quantitatively confirmed for the multi-level case.
+Next experiment: instrument `test_polyeval.cpp`'s own Chebyshev loop
+to track `maxerr` level-by-level (already partially visible in the
+existing `[chk] Tk[k]` printouts — this round's run recorded the full
+sequence: Tk[0]=9.97e-12, Tk[1]=9.04e-12, Tk[2]=6640.36, Tk[3]=910.19,
+Tk[4]=13188.1, Tk[5]=1706.43, Tk[6]=13188.1, Tk[7]=2468.38, final=
+2376.98 — note this OSCILLATES rather than growing monotonically,
+which is itself suggestive of noise rather than a systematic bug) and
+check whether the GROWTH/magnitude is quantitatively consistent with
+accumulating O(1)-per-coefficient combining noise through
 `decode_host`'s embedding sum at each level (a back-of-envelope
-estimate, informed by this round's single-rescale ~769 figure, should
-be computable and compared against the actual observed per-level
-numbers already captured in the existing `[chk]` diagnostics). If the
-growth roughly matches, `test_polyeval`'s `[FAIL]` is ALSO inherent
-CKKS noise, not a defect, and the real fix (if any is wanted) is
-parameter selection (larger Delta, bigger n, or noise-aware scale
-management across levels) — not a code change to the rescale kernels.
+estimate, informed by this round's single-rescale ~769 figure from
+entry #29, should be computable and compared against these actual
+numbers). If the magnitude roughly matches, `test_polyeval`'s `[FAIL]`
+is ALSO inherent CKKS noise, not a defect, and the real fix (if any is
+wanted) is parameter selection (larger Delta, bigger n, or noise-aware
+scale management across levels) — not a code change anywhere in the
+rescale/keyswitch/NTT kernels, ALL of which are now independently
+verified correct by entries #29 and #30.
 
 `tests/test_rescale_n1024.cpp` remains committed with its original
-(mismatched) parameters as a permanent artifact of the earlier
-isolation experiment — its `[FAIL]` is now UNDERSTOOD and EXPECTED,
-not a red flag requiring a fix. Do not weaken its tolerance or delete
-it; do not "fix" it by changing library code, since entry #29 showed
-there is nothing wrong with the library. `tests/test_polyeval.cpp`'s
-`[chk]` diagnostic checkpoints (inside `mulCt`) are kept, additive-only
-— useful for the level-by-level noise-growth experiment above.
+(mismatched) parameters as a permanent artifact of an earlier
+isolation experiment — its `[FAIL]` is UNDERSTOOD and EXPECTED, not a
+red flag requiring a fix. Do not weaken its tolerance or delete it;
+do not "fix" it by changing library code. `tests/test_polyeval.cpp`'s
+`[chk]` diagnostic checkpoints (inside `mulCt`, extended this round to
+cover the second mulCt call with full-array stats, not just slot 0)
+are kept, additive-only — directly useful for the level-by-level
+noise-growth experiment above. `tests/test_keyswitch_core_native_diff.
+cpp` and `tests/test_keyswitch_core_realct_diff.cpp` are built but
+deliberately NOT registered with `add_test` (their failure is expected
+given the unconfirmed formula) — do not "fix" them by changing the
+formula without first deriving the correct one from OpenFHE's source,
+and do not re-register them with `add_test` until the formula is
+actually confirmed correct.
 
 ## Read first
 
