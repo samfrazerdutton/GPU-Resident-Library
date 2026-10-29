@@ -56,7 +56,24 @@ int main(int argc,char**argv){
     // change to any cryptographic parameter or correctness-relevant code in
     // either project. Verified: without this, aborts every time (N=1 and
     // N=16 both); with it, completes and reports real, sane numbers.
+    //
+    // A LATER round (GOD PROMPT "RESOLVE POLYEVAL CORRECTNESS") found a
+    // SEPARATE shadow path specific to keyswitching: libopenfhe_cuda_hal.so
+    // also exports gpu_ks_enabled()/gpu_keyswitch_inner_product, gated by
+    // its OWN env var OPENFHE_GPU_KS (found via the same `strings` scan),
+    // which keyswitch-hybrid.cpp's EvalFastKeySwitchCoreExt can route
+    // through INSTEAD of the textbook per-digit CPU loop. This benchmark's
+    // `cc->EvalMult` CPU-baseline call internally relinearizes (a
+    // keyswitch), so it is exactly the kind of call that path could
+    // silently intercept. Setting it off too, for defense in depth, so the
+    // "OpenFHE EvalMult x N" baseline is genuinely CPU-only end-to-end, not
+    // just for the ShadowRegistry cudaMalloc path the first fix covers.
+    // NOT independently re-verified this round (would need rerunning this
+    // benchmark, deferred until host memory allows) -- if EvalMult's own
+    // timings change materially after this, re-check the methodology notes
+    // below against the new numbers before trusting them as unchanged.
     setenv("OPENFHE_GPU","0",1);
+    setenv("OPENFHE_GPU_KS","0",1);
     uint32_t N=(argc>1)?(uint32_t)std::stoul(argv[1]):16;
     uint32_t reps=(argc>2)?(uint32_t)std::stoul(argv[2]):9;
     CCParams<CryptoContextCKKSRNS> params;

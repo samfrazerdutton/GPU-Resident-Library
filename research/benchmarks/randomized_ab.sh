@@ -104,4 +104,22 @@ done <<< "$shuffled"
 
 echo "---"
 echo "Done. $((2*N)) total runs in randomized order, written to $OUTFILE"
-echo "Next step: compute each arm's median + bootstrap 95% CI as two INDEPENDENT samples (see this script's header comment for why NOT to pair them), not a per-position paired difference."
+
+# GOD PROMPT "RESOLVE POLYEVAL CORRECTNESS" round addition: a killed or
+# crashed trial is already recorded above (run_one's own pass=false/err=NA
+# fallback never silently drops a row), but nothing previously surfaced
+# whether failures were SKEWED toward one arm -- which would itself bias
+# any naive timing comparison that includes non-passing rows (a trial
+# killed early finishes "fast" and looks like a speed win if not excluded).
+# Report per-arm pass rates directly from the JSONL so this is visible
+# immediately, not discovered later by a surprised reader of the raw data.
+base_total=$(grep -c '"label":"baseline"' "$OUTFILE")
+base_pass=$(grep '"label":"baseline"' "$OUTFILE" | grep -c '"pass":true')
+exp_total=$(grep -c '"label":"experiment"' "$OUTFILE")
+exp_pass=$(grep '"label":"experiment"' "$OUTFILE" | grep -c '"pass":true')
+echo "baseline pass rate: $base_pass/$base_total"
+echo "experiment pass rate: $exp_pass/$exp_total"
+if [ "$base_pass" != "$base_total" ] || [ "$exp_pass" != "$exp_total" ]; then
+  echo "WARNING: at least one arm had a non-passing trial -- report this pass-rate skew as a finding, do not silently drop those rows or let them bias the timing comparison."
+fi
+echo "Next step: compute each arm's median + bootstrap 95% CI as two INDEPENDENT samples (see this script's header comment for why NOT to pair them), not a per-position paired difference. EXCLUDE pass=false rows from the timing comparison itself -- a killed/crashed trial's wall_s is not a valid sample of that arm's real running time."
