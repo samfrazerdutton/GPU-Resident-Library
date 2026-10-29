@@ -691,3 +691,21 @@ round** — that is a separate, carefully-scoped future task needing its
 own full regression pass, deferred until host memory conditions allow
 repeated `test_boot`-class runs (currently ~3GB free, well under the
 ~8GB that test needs).
+
+## GOD PROMPT round, continued: benchmark methodology — fix scope verified, randomized A/B runner built and dry-run validated
+
+Full detail: `EXPERIMENT_LEDGER.md` entry #28. Re-confirmed the
+`bench_evalmult_resident` fix (`OPENFHE_GPU=0`) does not silence the
+GPU measurement it's meant to take. Found this repo's existing
+`research/benchmarks/interleaved_ab.sh` runs baseline-then-experiment
+in a fixed order every round — the exact order confound this project's
+own prior work was burned by twice. Built
+`research/benchmarks/randomized_ab.sh`: a true random permutation
+(via `shuf`) of baseline/experiment labels, run one at a time, with
+its own header comment documenting why the resulting data must be
+analyzed as two independent samples rather than paired by position.
+Dry-run validated with trivial dummy binaries (zero GPU/memory use) —
+confirmed correct shuffling and JSONL output. **Not yet run with the
+real `test_boot`/`test_boot_hoist_enabled` binaries** — blocked by the
+same host-memory gate as the large-n bootstrap; the exact command is
+recorded in `NEXT_SESSION.md` for whenever that clears.

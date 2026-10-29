@@ -3,11 +3,30 @@
 ## Current commit
 
 Check `git log -3` on resume. As of this writing, HEAD is a new commit
-on top of `1aa8405` (the GOD PROMPT round that also audited, designed,
-and validated-in-isolation RAII wrappers for `DeviceKSContext`/
-`DeviceKSWork` — see `MASTER_STATE.md`'s latest section and
-`EXPERIMENT_LEDGER.md` entries #26-#27). Confirm push status — push
+on top of `2e0119e` (the GOD PROMPT round that audited/designed/
+validated-in-isolation the RAII wrappers AND built a genuinely
+randomized A/B trial runner — see `MASTER_STATE.md`'s latest section
+and `EXPERIMENT_LEDGER.md` entries #26-#28). Confirm push status — push
 again if `git status` shows ahead of origin.
+
+## Randomized hoisting A/B: script ready, exact command to run once the memory gate clears
+
+`research/benchmarks/randomized_ab.sh` is built and dry-run validated
+(trivial dummy binaries, confirmed genuine non-alternating shuffle +
+well-formed JSONL output) but has NOT been run with the real binaries
+yet — blocked by the same host-memory gate as the large-n bootstrap.
+**Exact next command, once `Get-CimInstance Win32_OperatingSystem`
+shows >=6GB real free**:
+```
+cd ~/GPU-Resident-Library && ./research/benchmarks/randomized_ab.sh 10 ./test_boot ./test_boot_hoist_enabled
+```
+(10 trials per arm = 20 total `test_boot`-class runs, ~110s each ≈
+37 minutes total — budget accordingly, and re-check the memory gate
+partway through if the session is long, since host conditions have
+fluctuated significantly within single sessions this whole project).
+Analyze the result as two independent samples (median + bootstrap 95%
+CI per arm, check for CI overlap) — see the script's own header
+comment for why NOT to pair by position.
 
 ## RAII wrappers: isolated validation complete, production integration is the next concrete step (once memory allows)
 
