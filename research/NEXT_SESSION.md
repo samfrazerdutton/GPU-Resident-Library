@@ -3,10 +3,30 @@
 ## Current commit
 
 Check `git log -3` on resume. As of this writing, HEAD is a new commit
-on top of `cf0b395` (the GOD PROMPT round that found `test_polyeval`'s
-REAL root cause — see `MASTER_STATE.md`'s latest section and
-`EXPERIMENT_LEDGER.md` entry #26). Confirm push status — push again if
-`git status` shows ahead of origin.
+on top of `1aa8405` (the GOD PROMPT round that also audited, designed,
+and validated-in-isolation RAII wrappers for `DeviceKSContext`/
+`DeviceKSWork` — see `MASTER_STATE.md`'s latest section and
+`EXPERIMENT_LEDGER.md` entries #26-#27). Confirm push status — push
+again if `git status` shows ahead of origin.
+
+## RAII wrappers: isolated validation complete, production integration is the next concrete step (once memory allows)
+
+`include/ks_raii.h` (`ScopedKSContext`/`ScopedKSWork`) is built and
+fully validated in isolation (`tests/test_ks_raii.cpp`, 7/7 checks
+pass, including 20 create/destroy cycles with zero GPU-memory drift).
+**Do not re-audit or re-design from scratch.** The next concrete step,
+per the directive's own "small, reviewable changes with tests at each
+stage" instruction, is a CAREFUL integration pass into ONE production
+call site at a time (start with `tests/test_boot.cpp`'s simplest
+single-context use, e.g. the relin key's `ks_context_create(K)` at the
+top of `main`, NOT the per-diagonal `stageRotDiag` hot loop first),
+rebuilding and running the FULL existing regression (`test_boot`'s own
+`max slot err` must stay bit-exact at `0.000547871`) after each single
+call site is converted, before moving to the next. This needs real
+host memory headroom (`test_boot` peaks at ~8GB RSS) — check
+`Get-CimInstance Win32_OperatingSystem` first; do not attempt this
+integration pass while free memory is under ~6GB, same threshold as
+the large-n bootstrap gate.
 
 ## `test_polyeval` / native rescale pathway: DEFINITIVE localization, one specific next experiment
 

@@ -668,3 +668,26 @@ inside `ks_context_create` — traced via `gdb` to a bug in the NEW TEST
 unconditionally reads `K.av`/`K.bv` — the exact "empty av/bv"
 anti-pattern already documented from the `02e84eb` segfault fix).
 Fixed in the test; not a second library bug.
+
+## GOD PROMPT round, continued: RAII wrappers for DeviceKSContext/DeviceKSWork — audited, designed, validated in isolation, all passing; production integration deliberately deferred
+
+Full detail: `EXPERIMENT_LEDGER.md` entry #27. Completed all three
+phases the directive specified: audit every resource `DeviceKSContext`/
+`DeviceKSWork` own vs. borrow (now precisely documented in
+`include/ks_raii.h`'s header comment — `DeviceKSWork`'s 12 fields
+confirmed fully owned and correctly freed, no leak; `DeviceKSContext`'s
+`d_av`/`d_bv`/`d_keyRow` owned, 14 other fields correctly borrowed from
+two process-lifetime caches and correctly NOT freed); design thin,
+move-only `ScopedKSContext`/`ScopedKSWork` wrappers delegating entirely
+to the proven C API; validate them in a new ISOLATED test
+(`tests/test_ks_raii.cpp`, n=8192, avoiding any confound with this
+round's separate small-n rescale finding). **All 7 checks pass**,
+including 20 repeated create/destroy cycles with GPU memory delta=0MB
+(perfectly bounded) and clean move-semantics/double-reset safety.
+
+**Per the directive's own explicit caution, these wrappers are NOT
+integrated into `tests/test_boot.cpp`/`test_boot_n131072.cpp` this
+round** — that is a separate, carefully-scoped future task needing its
+own full regression pass, deferred until host memory conditions allow
+repeated `test_boot`-class runs (currently ~3GB free, well under the
+~8GB that test needs).

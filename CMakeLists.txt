@@ -196,3 +196,10 @@ gpufhe_test(test_n131072_gpu_lifecycle tests/test_n131072_gpu_lifecycle.cpp)
 add_executable(test_rescale_n1024 tests/test_rescale_n1024.cpp)
 target_link_libraries(test_rescale_n1024 PRIVATE gpufhe CUDA::cudart)
 add_test(NAME test_rescale_n1024 COMMAND test_rescale_n1024)
+# Directive "GOD PROMPT -- CKKS ENGINE": Priority 2 (RAII refactor), Phase C.
+# Validates include/ks_raii.h's ScopedKSContext/ScopedKSWork wrappers in
+# ISOLATION (construction/destruction, repeated cycles with stable GPU
+# memory, move semantics, double-reset safety, C-API interop) before any
+# production call site is touched. Uses n=8192 (proven scale), deliberately
+# avoiding the unrelated small-n rescale bug found this same round.
+gpufhe_test(test_ks_raii tests/test_ks_raii.cpp)
