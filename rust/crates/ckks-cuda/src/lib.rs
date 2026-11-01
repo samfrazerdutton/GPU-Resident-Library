@@ -14,28 +14,42 @@
 //! - [`rescale`]: the second ported operation -- single-modulus RNS
 //!   rescale, reusing `LaunchSwitchModulus`/`LaunchRescaleFuse` and the
 //!   existing `native_rescale_consts`. See [`rescale::RescaleContext`].
+//! - [`keyswitch`]: the third ported operation -- full Hybrid key
+//!   switching. Unlike `ntt`/`rescale`, its setup-time state (the
+//!   evaluation key) is genuine cryptographic key material, not
+//!   bookkeeping, so it is built end to end by ONE opaque C++ bridge call
+//!   rather than reconstructed field-by-field in Rust. See
+//!   [`keyswitch::KeySwitchContext`] and its module doc comment for why,
+//!   and for the honest limits of this module's correctness evidence.
 //!
-//! Both operation modules follow the SAME pattern established by `ntt`
-//! and extended (not redesigned) by `rescale`: a context struct built
+//! `ntt` and `rescale` follow an IDENTICAL pattern: a context struct built
 //! once via `::new` that owns every reusable, input-independent resource
 //! (device selection, host-computed tables/constants, device allocations,
 //! table uploads), and a hot-path method that does ONLY per-call,
-//! input-dependent work. See `ntt`'s module doc comment for why this
-//! split exists and what went wrong before it did.
+//! input-dependent work. `keyswitch` follows the SAME setup/hot-path split
+//! at the API level (`KeySwitchContext::new` vs. `::keyswitch`), but its
+//! setup step is a single opaque FFI call into the existing native
+//! key-generation pipeline instead of Rust-side reconstruction -- see
+//! `ntt`'s module doc comment for why the split exists at all, and
+//! `keyswitch`'s for why ITS setup step could not be narrowed the same way
+//! `ntt`'s and `rescale`'s were.
 //!
 //! No cryptographic algorithm is reimplemented in Rust here. Where a
 //! computation is genuine, non-trivial number theory (primitive-root
-//! search, the rescale fuse constants' exact-division trick), this crate
-//! calls the EXISTING, unmodified C++ implementation via a narrow FFI
-//! bridge (`cpp_bridge/`) instead of re-deriving it. Where a computation
-//! is plain bookkeeping that the main C++ engine ALSO performs on the
-//! host side to drive these same kernels (NTT root-table construction),
-//! it is reimplemented independently in Rust so the two implementations
-//! cannot share a transcription bug and can be cross-checked.
+//! search, the rescale fuse constants' exact-division trick, the entire
+//! key-switch key-generation pipeline), this crate calls the EXISTING,
+//! unmodified C++ implementation via a narrow FFI bridge (`cpp_bridge/`)
+//! instead of re-deriving it. Where a computation is plain bookkeeping
+//! that the main C++ engine ALSO performs on the host side to drive these
+//! same kernels (NTT root-table construction), it is reimplemented
+//! independently in Rust so the two implementations cannot share a
+//! transcription bug and can be cross-checked.
 
+pub mod keyswitch;
 pub mod ntt;
 pub mod rescale;
 mod util;
 
+pub use keyswitch::KeySwitchContext;
 pub use ntt::{cold_start_cost_probe, native_root, ntt_roundtrip, NttContext};
 pub use rescale::{cold_start_cost_probe as rescale_cold_start_cost_probe, native_rescale_consts, RescaleContext};

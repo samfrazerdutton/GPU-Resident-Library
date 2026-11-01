@@ -1,8 +1,8 @@
 # Master state
 
-Last updated: this session, GOD PROMPT "CKKS RUST + CUDA PHASE 2" round
-(rescale ported to Rust, on top of commit `24ae8d5`). **Read
-`## GOD PROMPT "CKKS RUST + CUDA PHASE 2"` near the end of this file
+Last updated: this session, GOD PROMPT "CKKS RUST + CUDA PHASE 3" round
+(key switching ported to Rust, on top of commit `e3e2142`). **Read
+`## GOD PROMPT "CKKS RUST + CUDA PHASE 3"` near the end of this file
 first**, and `research/MIGRATION_MATRIX.md` for the condensed per-
 operation status table. Everything below that is preserved for history;
 the superseded-claims note this paragraph used to carry (about the
@@ -994,3 +994,75 @@ status: `research/MIGRATION_MATRIX.md` (new this round).
   anything about key-switching/evalmult/bootstrap, or any security
   re-certification. Two operations are now ported and benchmarked out
   of a large engine — see `MIGRATION_MATRIX.md` for exactly which ones.
+
+## GOD PROMPT "CKKS RUST + CUDA PHASE 3": third operation (full Hybrid key switching) ported, bit-exact vs. the established reference, a real latent C++ bug found and guarded against, memory measured not guessed
+
+Full detail: `EXPERIMENT_LEDGER.md` entry #36. Condensed per-operation
+status, including this round's row: `research/MIGRATION_MATRIX.md`.
+
+- Ported `keyswitch_resident` (full Hybrid key switching) as the third
+  operation. Unlike NTT/rescale, its setup-time state is a genuine
+  evaluation key, not bookkeeping — so instead of rebuilding fields in
+  Rust, `KeySwitchContext::new` calls ONE opaque C++ bridge function
+  (`cpp_bridge/keyswitch_bridge.cpp`) that runs the existing native
+  (OpenFHE-free) pipeline end to end: `native_primes`/`native_root` →
+  `keygen_host` → `compute_keyswitch_constants` → `evalkeygen_host` →
+  `ks_context_create`/`ks_work_create`. No cryptographic logic is
+  reimplemented in Rust; `build.rs` compiles five more existing,
+  unmodified C++ host files and three more self-contained kernel files
+  directly, the same way it already did for NTT/rescale.
+- Re-ran an existing, previously-unregistered test
+  (`test_keyswitch_core_native_diff`) BEFORE writing any Rust code, to
+  confirm the native key-generation pipeline at this round's chosen
+  configuration (n=1024, sizeQ=8, sizeP=2, numPart=2) still executes
+  end to end without crashing.
+- **Found a real latent bug while tracing the call graph** (not fixed
+  in the C++ engine, out of scope — guarded against in Rust instead):
+  `compute_keyswitch_constants` divides by `num_part` and does
+  unchecked unsigned subtraction for `num_part` outside `[1, size_q]`.
+  `KeySwitchContext::new` now validates this before ever calling into
+  C++.
+- 6 new Rust tests, all passing: bit-exact `keyswitch_resident` (the
+  GPU path) vs. `keyswitch_core_resident` (the host reference) across
+  random trials, 5 repeated calls on one reused context, zero/max-residue
+  boundary inputs, and invalid-construction/invalid-length rejection.
+  **This correctness evidence is explicitly weaker than rescale's**:
+  both functions implement the same algorithm, so it is not a
+  from-scratch independent reference — stated plainly in the code's own
+  module doc comment, not hidden. The genuinely independent link
+  (`keyswitch_core_resident` proven bit-exact vs. OpenFHE's own
+  `KeySwitchCore`) has only ever been established at an OpenFHE-sourced
+  n=32768 configuration, never at this round's native n=1024 one; the
+  one attempted from-scratch algebraic shortcut for that gap was
+  already proven invalid in an earlier round (entry #30) and is not
+  reattempted. Full suite 17/17 passing, debug and release.
+- **Benchmark, three tiers not four**: unlike NTT/rescale, there is no
+  meaningful host-only "cold-start" sub-tier here — key generation
+  itself launches GPU kernels, confirmed by reading the source. Fixture
+  creation, steady-state keyswitch, and end-to-end are all within
+  normal run-to-run noise between C++ and Rust, reproduced in both run
+  orders — the same conclusion as NTT and rescale, for a third,
+  structurally different operation.
+- **Memory measured, not guessed, before any architecture change**:
+  sampled GPU memory every 50ms across extended runs of all three
+  operations (200,000-500,000 repeated calls each). All three peak at
+  an IDENTICAL 85MiB with zero growth — this is the fixed CUDA
+  runtime/driver context floor, not operation data (NTT's tables are
+  ~40KB, rescale's ~200KB, key switching's full eval key + context +
+  scratch a few hundred KB — all negligible against that floor at
+  n=1024). Conclusion: no cross-context table-sharing work is justified
+  in this crate right now. The C++ engine's own process-lifetime caches
+  (`g_rtab`/`upc` in `src/keyswitch_resident.cpp`) already solve this
+  problem at the one place it has mattered historically, and
+  `KeySwitchContext` inherits that for free. Revisit only if/when a
+  genuine multi-tower or bootstrap-scale Rust workload emerges.
+- GPU memory confirmed fully freed after every run. Host free RAM
+  checked via PowerShell throughout this round (2.37-3.08GB free) —
+  well under the 6GB full-bootstrap gate, correctly not invoked since
+  this round's entire workload stayed at n=1024.
+- **Explicitly NOT claimed**: production integration, anything about
+  EvalMult/bootstrap, resolution of `test_polyeval`'s multi-level noise
+  question (untouched this round), or any security re-certification.
+  Three operations are now ported and benchmarked out of a large engine
+  — see `MIGRATION_MATRIX.md` for exactly which ones and the honest
+  caveat on key switching's weaker correctness evidence.
