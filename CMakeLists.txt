@@ -190,6 +190,16 @@ gpufhe_test(bench_hoist_multi bench/bench_hoist_multi.cpp)
 # result (equivalent within noise) and the build-flag bug found along the
 # way.
 gpufhe_test(bench_ntt_roundtrip_cpp_vs_rust bench/bench_ntt_roundtrip_cpp_vs_rust.cpp)
+# GOD PROMPT "CKKS RUST + CUDA PHASE 2" round: the SECOND ported operation
+# (single-modulus RNS rescale, rust::RescaleContext) gets the SAME fair
+# four-tier C++-vs-Rust-host comparison as the first (NTT). This
+# benchmark's own RescaleContextCpp deliberately does NOT use
+# DeviceKSContext/ks_context_create (the production rescale_resident_raw's
+# own dependency) -- it rebuilds root tables independently, mirroring
+# rust::RescaleContext exactly, so both languages are measured doing the
+# SAME minimal setup work. See that file's header comment and
+# research/EXPERIMENT_LEDGER.md for the full methodology and results.
+gpufhe_test(bench_rescale_cpp_vs_rust bench/bench_rescale_cpp_vs_rust.cpp)
 gpufhe_test(test_mult_barrett tests/test_mult_barrett.cpp)
 # Directive "VERIFY OOM DIAGNOSIS AND REMOVE THE LARGE-N DIAGONAL
 # BOTTLENECK", Priority 3: proves an O(S*2^RST) analytic replacement for

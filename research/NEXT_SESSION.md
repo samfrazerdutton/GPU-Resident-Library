@@ -3,12 +3,14 @@
 ## Current commit
 
 Check `git log -3` on resume. As of this writing, HEAD is a new commit
-on top of entry #34's commit (the GOD PROMPT "CKKS RUST + CUDA
-EVOLUTION"/"FAIR BENCHMARKS" rounds, including the same-session
-before/after follow-up for all four originally-flagged benchmarks —
-see `MASTER_STATE.md`'s latest sections and `EXPERIMENT_LEDGER.md`
-entries #32-#34). Confirm push status — push again if `git status`
-shows ahead of origin.
+on top of entry #34's commit (the GOD PROMPT "CKKS RUST + CUDA PHASE 2"
+round: rescale ported to Rust as the SECOND operation, a real
+domain-mismatch bug caught and fixed in its own fair C++ benchmark
+before any timing was trusted, and Rust/C++ confirmed equivalent within
+noise — see `MASTER_STATE.md`'s latest section, `EXPERIMENT_LEDGER.md`
+entry #35, and `research/MIGRATION_MATRIX.md` for the condensed
+per-operation status table). Confirm push status — push again if
+`git status` shows ahead of origin.
 
 ## `-G` build-flag bug: CLOSED for the four originally-flagged benchmarks; one remaining sweep still open
 
@@ -47,41 +49,53 @@ re-derive which claims are settled vs. still open. Not done this round
 (time budget) — the four benchmarks `NEXT_SESSION.md` explicitly named
 were the priority, and that list is now complete.
 
-## Rust evolution: vertical slice done, next operation to port, or widen the three-way comparison
+## Rust evolution: TWO operations ported now, key-switching is the next concrete target
 
-`rust/` workspace (`ckks-core`, `ckks-cuda`) builds and all 7 tests
-pass — see entry #32. `ckks_cuda::NttContext` is the model to follow
-for any FUTURE ported operation: separate one-time setup from a reused
-per-call hot path, FFI straight into the existing proven kernel/host
-function rather than reimplementing algorithmic logic, and benchmark
-with the SAME tiered (cold-start/init/steady-state/end-to-end)
-structure in both languages before trusting any number.
+`rust/` workspace (`ckks-core`, `ckks-cuda`) builds and all 11 tests
+pass (4 `ckks-core` + 3 NTT + 4 rescale). `ckks_cuda::NttContext`
+(entry #32) and `ckks_cuda::RescaleContext` (entry #35, this round) are
+BOTH the model to follow for any FUTURE ported operation: separate
+one-time setup from a reused per-call hot path, FFI straight into the
+existing proven kernel/host function rather than reimplementing
+algorithmic logic, validate against a FRESH independent reference (not
+the existing C++ test's own formula), and benchmark with the SAME
+tiered (cold-start/init/steady-state/end-to-end) structure in both
+languages, run in BOTH orders, before trusting any number. See
+`research/MIGRATION_MATRIX.md` for the exact per-operation status
+table — do not re-derive which operations are done from narrative text
+alone, read that table.
 
 **Not yet done, in priority order**:
-1. Evaluate whether a native-CUDA-Rust-kernel toolchain (e.g. the
+1. **Port key-switching** (`keyswitch_core_resident` / the full
+   `DeviceKSContext`-dependent path, NOT the narrowed rescale-only
+   dependency this round proved out) as the THIRD operation. Unlike
+   NTT and rescale, this one genuinely needs the eval key (`K.av`/
+   `K.bv`), so it cannot be narrowed the same way — inspect its real
+   call sites, scratch-buffer lifetime, and synchronization needs FIRST
+   (same discipline this round applied to rescale: read the source
+   fresh, do not assume a function can be called independently), and
+   choose the narrowest sub-piece with its own genuine correctness
+   reference (`tests/test_keyswitch.cpp`'s existing bit-exact-vs-OpenFHE
+   check is the natural anchor) before writing any Rust code. Do NOT
+   attempt to port the full bootstrap pipeline in one step.
+2. Evaluate whether a native-CUDA-Rust-kernel toolchain (e.g. the
    `rust-cuda`/`rustc_codegen_nvvm` project) actually supports sm_75 +
    CUDA 13.2 in THIS environment before attempting Path C of the
    three-way comparison — do not assume compatibility; check the
    toolchain's own documented support matrix and attempt a trivial
    build first. If incompatible, document why and stay on Path B
    (already proven to work, and proven performance-equivalent to pure
-   C++ once the `-G` bug was fixed).
-2. Port a SECOND, slightly more complex operation through the SAME
-   pattern (e.g. `LaunchSwitchModulus` + `LaunchRescaleFuse`, i.e. a
-   full rescale step — already has a proven-correct, well-tested
-   reference in `tests/test_rescale_scalar_diff_n1024.cpp`/
-   `test_rescale_vector_diff_n1024.cpp` from an earlier round) before
-   attempting anything bootstrap-scale.
-3. Memory efficiency work (directive Priority 3): `NttContext`
-   currently allocates one scratch buffer per `(n,q)` context, which is
-   already buffer reuse across calls — the next concrete opportunity is
-   extending this pattern to a MULTI-TOWER context (reusing table
-   buffers across towers sharing the same `n`, not just across calls at
-   one tower) once a second operation is ported and there's a real
-   multi-tower workload to measure against.
+   C++ for BOTH ported operations so far).
+3. Memory efficiency work (directive Priority 3): `NttContext` and
+   `RescaleContext` currently each allocate their own scratch/table
+   buffers per context — the next concrete opportunity is a
+   MULTI-TOWER context shared across operations (reusing table buffers
+   across towers/operations sharing the same `n`, not just across calls
+   within one context) once key-switching is ported and there's a real
+   multi-operation workload to measure memory savings against.
 4. `ckks-ffi` (a stable C ABI surface for the Rust layer, so existing
    C++ consumers could call into it) — not yet justified; revisit once
-   there's more than one ported operation.
+   there are more ported operations and a concrete consumer need.
 
 ## test_polyeval multi-level noise quantification: still the open correctness question, unchanged from entry #30
 

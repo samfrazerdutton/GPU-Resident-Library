@@ -1,12 +1,15 @@
 # Master state
 
-Last updated: this session, FOURTH execution-focused cycle (production
-integration round, on top of commit `02e84eb`). **Read
-`## This round: production integration, honest A/B, security re-review`
-near the end of this file first** — it supersedes several claims in the
-body below (notably the "classical security is solid" framing and the
-un-corrected-for-order-bias performance numbers). The body below is
-preserved for history and is otherwise still accurate.
+Last updated: this session, GOD PROMPT "CKKS RUST + CUDA PHASE 2" round
+(rescale ported to Rust, on top of commit `24ae8d5`). **Read
+`## GOD PROMPT "CKKS RUST + CUDA PHASE 2"` near the end of this file
+first**, and `research/MIGRATION_MATRIX.md` for the condensed per-
+operation status table. Everything below that is preserved for history;
+the superseded-claims note this paragraph used to carry (about the
+"production integration round") is itself superseded by the Rust/CUDA
+evolution rounds — the main C++ engine's production/security state
+described in the body below is unaffected by the Rust work, which is a
+separate, not-yet-production-integrated exploration (see the matrix).
 
 Prior summary (third execution-focused cycle): delivered TWO real,
 validated wins (KSC bound, eval-domain automorphism), one safe
@@ -942,3 +945,52 @@ discovery are now re-verified under the corrected build flags. Any
 OTHER standalone performance number in this project not from one of
 these four remains unverified and should still be treated as suspect
 until independently re-run.
+
+## GOD PROMPT "CKKS RUST + CUDA PHASE 2": second operation (rescale) ported, a real benchmark bug caught and fixed, Rust/C++ remain equivalent within noise
+
+Full detail: `EXPERIMENT_LEDGER.md` entry #35. Condensed per-operation
+status: `research/MIGRATION_MATRIX.md` (new this round).
+
+- Ported `rescale_resident_raw`'s algorithm (single-modulus RNS
+  rescale) into `RescaleContext` (`rust/crates/ckks-cuda/src/
+  rescale.rs`), the second operation to follow the setup/hot-path split
+  `NttContext` established. Confirmed by fresh source re-inspection
+  (not by trusting the prior round's notes) that this algorithm's only
+  dependency on `DeviceKSContext` is plain moduli + cached NTT root
+  tables, never the eval key — the same narrowing argument that made
+  `NttContext` possible applies here too.
+- Refactored the crate into `util`/`ntt`/`rescale`/`lib` modules to
+  share `DeviceBuf` and table-building code between the two operations
+  instead of duplicating it.
+- Added one new FFI bridge (`cpp_bridge/rescale_consts_bridge.cpp`)
+  wrapping the existing, unmodified `gpufhe::native_rescale_consts` —
+  no cryptographic arithmetic reimplemented in Rust.
+- 4 new Rust tests, validated against a FRESH independent RNS-only
+  reference (not the C++ test's own formula, to avoid two
+  implementations sharing one bug): 0 mismatches across 3 trials of
+  independent random per-coefficient data, plus reused-context and
+  invalid-input rejection tests. Full suite 11/11 passing, debug and
+  `--release`.
+- **Caught a real bug before trusting any benchmark number**: the first
+  draft of the fair C++ comparison (`bench/bench_rescale_cpp_vs_rust.cpp`)
+  fed synthetic residues into `rescale()` without forward-NTTing them
+  into eval domain first (the algorithm's actual contract), producing a
+  100% mismatch (7168/7168) against the correctness reference. Fixed by
+  mirroring the Rust test's own forward-NTT-before-compare methodology;
+  re-ran and got `0/7168 mismatches` before any timing was printed.
+- **Benchmark result, run twice in reversed order**: cold-start,
+  context-init, steady-state, and end-to-end are all within normal
+  run-to-run noise between C++ and Rust (steady-state reused-context
+  median: C++ 535-573us vs Rust 534-542us) — same conclusion as the NTT
+  operation (entry #32): a thin Rust host layer calling the identical
+  CUDA kernel costs the same as the C++ host layer calling it, no
+  language-level speedup either way.
+- GPU memory confirmed fully freed after both benchmark runs (0MiB
+  used). Host free RAM checked via PowerShell before starting (2.37GB
+  free) — well under the 6GB full-bootstrap gate, but this round's
+  n=1024 workload does not need that gate's caution.
+- **Explicitly NOT claimed**: production integration (nothing in the
+  engine calls `RescaleContext` outside its own tests/benchmarks),
+  anything about key-switching/evalmult/bootstrap, or any security
+  re-certification. Two operations are now ported and benchmarked out
+  of a large engine — see `MIGRATION_MATRIX.md` for exactly which ones.

@@ -3,15 +3,15 @@
 // an oversight: the main `gpufhe` CMake target has
 // `CUDA_SEPARABLE_COMPILATION ON` (needed for OTHER files that call
 // device functions across translation units), which requires an extra
-// `nvcc -dlink` step to link against. kernels/ntt_ct.cu and
-// kernels/intt_ct.cu are each fully self-contained (every `__device__`
-// function they call is defined in the SAME file -- verified by reading
-// both files; see this crate's own doc comment in src/lib.rs), so
-// compiling them WITHOUT separable compilation (the default) produces
-// ordinary, directly-linkable object files and avoids that whole step.
-// Reuses the EXISTING, unmodified .cu/.cpp source files from the main
-// project -- this build script does not duplicate or modify any
-// cryptographic or NTT logic, only the build invocation.
+// `nvcc -dlink` step to link against. Every kernel file compiled below
+// (ntt_ct.cu, intt_ct.cu, switch_modulus.cu, rescale.cu) is fully
+// self-contained -- every `__device__` function it calls is defined in
+// the SAME file, confirmed by reading each one -- so compiling them
+// WITHOUT separable compilation (the default) produces ordinary,
+// directly-linkable object files and avoids that whole step. Reuses the
+// EXISTING, unmodified .cu/.cpp source files from the main project --
+// this build script does not duplicate or modify any cryptographic or
+// NTT/rescale logic, only the build invocation.
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -38,8 +38,47 @@ fn run_or_panic(cmd: &mut Command) {
     }
 }
 
+/// Compiles one `.cu` device-kernel file with nvcc, NO separable
+/// compilation (see module doc), into `out_dir/<stem>.o`.
+fn compile_cuda(src: &Path, out_dir: &Path) -> PathBuf {
+    let stem = src.file_stem().unwrap().to_str().unwrap();
+    let out = out_dir.join(format!("{stem}.o"));
+    run_or_panic(
+        Command::new("nvcc")
+            .args([
+                "-std=c++17",
+                "-arch=sm_75", // matches CMakeLists.txt's CMAKE_CUDA_ARCHITECTURES for this RTX 2060 Max-Q
+                "-Xcompiler",
+                "-fPIC",
+                "-c",
+            ])
+            .arg(src)
+            .arg("-o")
+            .arg(&out),
+    );
+    println!("cargo:rerun-if-changed={}", src.display());
+    out
+}
+
+/// Compiles one host-only `.cpp` file with g++ (no CUDA at all), into
+/// `out_dir/<stem>.o`.
+fn compile_cpp(src: &Path, out_dir: &Path) -> PathBuf {
+    let stem = src.file_stem().unwrap().to_str().unwrap();
+    let out = out_dir.join(format!("{stem}.o"));
+    run_or_panic(
+        Command::new("g++")
+            .args(["-std=c++17", "-fPIC", "-O2", "-c"])
+            .arg(src)
+            .arg("-o")
+            .arg(&out),
+    );
+    println!("cargo:rerun-if-changed={}", src.display());
+    out
+}
+
 fn main() {
     let root = repo_root();
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
     // CUDA toolkit location: trust what nvcc's own install reports via
@@ -51,69 +90,32 @@ fn main() {
         .unwrap_or_else(|_| "/usr/local/cuda".to_string());
     let cuda_lib = Path::new(&cuda_root).join("lib64");
 
-    // --- Device kernels: nvcc, NO separable compilation (see module doc). ---
-    let ntt_o = out_dir.join("ntt_ct.o");
-    let intt_o = out_dir.join("intt_ct.o");
-    run_or_panic(
-        Command::new("nvcc")
-            .args([
-                "-std=c++17",
-                "-arch=sm_75", // matches CMakeLists.txt's CMAKE_CUDA_ARCHITECTURES for this RTX 2060 Max-Q
-                "-Xcompiler",
-                "-fPIC",
-                "-c",
-            ])
-            .arg(root.join("kernels/ntt_ct.cu"))
-            .arg("-o")
-            .arg(&ntt_o),
-    );
-    run_or_panic(
-        Command::new("nvcc")
-            .args(["-std=c++17", "-arch=sm_75", "-Xcompiler", "-fPIC", "-c"])
-            .arg(root.join("kernels/intt_ct.cu"))
-            .arg("-o")
-            .arg(&intt_o),
-    );
+    // --- Device kernels (ntt op, then rescale op). ---
+    let mut objs = vec![
+        compile_cuda(&root.join("kernels/ntt_ct.cu"), &out_dir),
+        compile_cuda(&root.join("kernels/intt_ct.cu"), &out_dir),
+        compile_cuda(&root.join("kernels/switch_modulus.cu"), &out_dir),
+        compile_cuda(&root.join("kernels/rescale.cu"), &out_dir),
+    ];
 
     // --- Host-only helpers: plain g++, no CUDA involved at all. ---
     // src/params.cpp is the EXISTING, unmodified file defining
-    // gpufhe::native_root (and native_primes/native_rescale_consts, not
-    // used by this crate yet). The bridge file forward-declares and wraps
-    // it with extern "C" linkage -- see cpp_bridge/native_root_bridge.cpp.
-    let params_o = out_dir.join("params.o");
-    let bridge_o = out_dir.join("native_root_bridge.o");
-    run_or_panic(
-        Command::new("g++")
-            .args(["-std=c++17", "-fPIC", "-O2", "-c"])
-            .arg(root.join("src/params.cpp"))
-            .arg("-o")
-            .arg(&params_o),
-    );
-    run_or_panic(
-        Command::new("g++")
-            .args(["-std=c++17", "-fPIC", "-O2", "-c"])
-            .arg(
-                PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap())
-                    .join("cpp_bridge/native_root_bridge.cpp"),
-            )
-            .arg("-o")
-            .arg(&bridge_o),
-    );
+    // gpufhe::native_root AND gpufhe::native_rescale_consts (both used by
+    // this crate now, via the two bridge files below).
+    objs.push(compile_cpp(&root.join("src/params.cpp"), &out_dir));
+    objs.push(compile_cpp(
+        &manifest_dir.join("cpp_bridge/native_root_bridge.cpp"),
+        &out_dir,
+    ));
+    objs.push(compile_cpp(
+        &manifest_dir.join("cpp_bridge/rescale_consts_bridge.cpp"),
+        &out_dir,
+    ));
 
-    for obj in [&ntt_o, &intt_o, &params_o, &bridge_o] {
+    for obj in &objs {
         println!("cargo:rustc-link-arg={}", obj.display());
     }
     println!("cargo:rustc-link-search=native={}", cuda_lib.display());
     println!("cargo:rustc-link-lib=dylib=cudart");
     println!("cargo:rustc-link-lib=dylib=stdc++");
-
-    println!("cargo:rerun-if-changed={}", root.join("kernels/ntt_ct.cu").display());
-    println!("cargo:rerun-if-changed={}", root.join("kernels/intt_ct.cu").display());
-    println!("cargo:rerun-if-changed={}", root.join("src/params.cpp").display());
-    println!(
-        "cargo:rerun-if-changed={}",
-        PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap())
-            .join("cpp_bridge/native_root_bridge.cpp")
-            .display()
-    );
 }
