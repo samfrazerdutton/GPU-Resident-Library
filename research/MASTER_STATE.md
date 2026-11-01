@@ -894,5 +894,30 @@ every CUDA kernel performance number this project has recorded
 anywhere (CUDA graph capture benchmarks, `bench_evalmult_resident`,
 `bench_resident_chain`, etc.) was very likely measured with
 device-debug mode silently enabled, and should be treated as suspect
-until re-run under the corrected flags — NOT done this round (full
-scope), recorded as a high-priority follow-up in `NEXT_SESSION.md`.
+until re-run under the corrected flags.
+
+## Immediate follow-up, same session: concrete before/after proof the `-G` bug is real, large, and kernel-dependent
+
+Full detail: `EXPERIMENT_LEDGER.md` entry #33. Re-ran two historical
+benchmarks' EXISTING (pre-fix) binaries for genuine "before" numbers,
+then rebuilt under the corrected flags and re-ran for "after":
+
+- **`bench_resident_chain`** (n=32768, multiply-rescale chain): the fix
+  flipped the benchmark's own verdict. Before: GPU median 7.236ms vs
+  CPU 6.947ms, 95% CI entirely above zero — **"GPU SLOWER"**. After:
+  GPU median 5.313ms (a 27% drop) vs CPU 6.993ms, CI entirely below
+  zero — **"GPU FASTER"**. Not a rounding correction; a reversed
+  conclusion about whether GPU acceleration helps this operation at
+  all.
+- **`bench_evalmult_resident`** (N=16, ring=32768): the CUDA-graph-vs-
+  direct speedup ratio was essentially UNCHANGED (186.7x before,
+  192.4x after) — for this kernel chain, `-G` cost both the graph and
+  direct paths roughly proportionally, so the existing "~190x graph
+  speedup" claim survives.
+
+**Takeaway for anyone touching this project's performance history**:
+neither "every old number is garbage" nor "the bug didn't matter" is
+correct — it is genuinely kernel-dependent, and each specific
+historical claim needs its own re-run before being trusted. `bench_
+batch` and `bench_hoist_multi` were NOT re-run this round (time
+budget) — still open, recorded in `NEXT_SESSION.md`.

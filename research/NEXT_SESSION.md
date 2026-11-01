@@ -3,12 +3,13 @@
 ## Current commit
 
 Check `git log -3` on resume. As of this writing, HEAD is a new commit
-on top of entry #31's commit (the GOD PROMPT "CKKS RUST + CUDA
-EVOLUTION"/"FAIR BENCHMARKS" rounds — see `MASTER_STATE.md`'s latest
-section and `EXPERIMENT_LEDGER.md` entry #32). Confirm push status —
-push again if `git status` shows ahead of origin.
+on top of entry #32's commit (the GOD PROMPT "CKKS RUST + CUDA
+EVOLUTION"/"FAIR BENCHMARKS" rounds, including the immediate same-
+session before/after follow-up — see `MASTER_STATE.md`'s latest two
+sections and `EXPERIMENT_LEDGER.md` entries #32-#33). Confirm push
+status — push again if `git status` shows ahead of origin.
 
-## HIGH PRIORITY, project-wide: every prior CUDA benchmark number in this repo is suspect until re-run
+## HIGH PRIORITY, project-wide: `bench_batch` and `bench_hoist_multi` are STILL unverified; `bench_resident_chain` and `bench_evalmult_resident` are DONE
 
 Entry #32 found `CMakeCache.txt` had cached `CMAKE_CUDA_FLAGS=-g -G`
 since some earlier, unrecorded `cmake` invocation, and that CMake
@@ -16,27 +17,32 @@ always appends this ON TOP OF the build-type flags rather than
 replacing them — so `-G` (CUDA device debug, disables nearly all
 device-code optimization) has been silently active in every build,
 Release included, for this ENTIRE project's history. Fixed in
-`CMakeLists.txt` (`set(CMAKE_CUDA_FLAGS "" CACHE STRING ... FORCE)`),
-rebuilt `gpufhe`, re-verified 4 regression tests still pass
-(correctness-neutral, as expected).
+`CMakeLists.txt` (`set(CMAKE_CUDA_FLAGS "" CACHE STRING ... FORCE)`).
 
-**This means every CUDA kernel performance claim anywhere in
-`MASTER_STATE.md`/`EXPERIMENT_LEDGER.md` prior to this fix (CUDA graph
-capture speedups, `bench_evalmult_resident`'s with-relin throughput
-numbers, `bench_resident_chain`, `bench_batch`, `bench_hoist_multi`,
-anything with a "ms" or "us" number in it from before this round) was
-almost certainly measured with device-debug mode silently enabled.**
-None of those numbers should be cited as this project's true
-performance without re-running them under the corrected flags first.
-**Next concrete step**: re-run the existing benchmark suite (at minimum
-`bench_evalmult_resident`, `bench_resident_chain`, `bench_batch`,
-`bench_hoist_multi`) with the SAME methodology each used originally,
-compare against the OLD recorded numbers, and record both the old
-(suspect) and new (corrected) figures side by side in the ledger so the
-magnitude of the historical measurement error is itself documented, not
-silently erased. Do this BEFORE trusting any existing performance
-narrative in this project (e.g. "CUDA graphs gave a 2x speedup on the
-resident chain") going forward.
+**Entry #33 already re-ran two of the four flagged benchmarks with a
+genuine before/after (old binary, then rebuilt binary, same machine) —
+do NOT re-do these, read the recorded numbers instead:**
+- `bench_resident_chain`: the fix REVERSED the verdict (GPU was
+  measured slower than CPU before, faster after — a 27% GPU-side
+  kernel time drop). This project's prior belief, if any, that this
+  specific operation doesn't benefit from GPU acceleration was an
+  artifact of the bug.
+- `bench_evalmult_resident`: the CUDA-graph-vs-direct speedup ratio
+  was essentially UNCHANGED (186.7x -> 192.4x) — this specific "~190x
+  graph speedup" claim survives the fix and can be cited.
+
+**Still open, next concrete step**: re-run `bench_batch` and
+`bench_hoist_multi` the SAME way (run the EXISTING binary first for a
+genuine "before" number if it's still sitting in `build/` unrebuilt,
+THEN `cmake --build . --target <name>` to pick up the fix, then re-run)
+and record both figures in the ledger, same format as entry #33. Do
+this before citing either benchmark's historical numbers. Also worth
+a final sweep once these two are done: grep `MASTER_STATE.md`/
+`EXPERIMENT_LEDGER.md` for any OTHER standalone "ms"/"us"/"speedup"
+performance claim from before entry #32's commit and mark it
+provisionally suspect in a comment if it hasn't been re-verified by
+then, so a future reader doesn't have to re-derive which claims are
+settled vs. still open.
 
 ## Rust evolution: vertical slice done, next operation to port, or widen the three-way comparison
 
