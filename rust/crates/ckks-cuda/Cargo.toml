@@ -1,0 +1,13 @@
+[package]
+name = "ckks-cuda"
+version = "0.1.0"
+edition = "2021"
+description = "Rust host orchestration over this project's existing, proven CUDA C++ NTT/INTT kernels (Path B of the GOD PROMPT 'CKKS RUST + CUDA EVOLUTION' three-way comparison: Rust host + existing CUDA C++ kernel)."
+build = "build.rs"
+
+[dependencies]
+ckks-core = { path = "../ckks-core" }
+cudarc = { version = "0.19", default-features = false, features = ["cuda-version-from-build-system", "runtime", "std", "dynamic-linking"] }
+
+[dev-dependencies]
+rand = "0.8"

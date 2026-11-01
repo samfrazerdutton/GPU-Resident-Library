@@ -10,6 +10,27 @@ endif()
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
+# GOD PROMPT "CKKS RUST + CUDA EVOLUTION"/"FAIR BENCHMARKS" rounds: a
+# `-DCMAKE_CUDA_FLAGS="-g -G"` set on SOME earlier `cmake` invocation (not
+# in this file, so not reviewable in version control until now) got
+# cached in CMakeCache.txt and has been SILENTLY applied to every build
+# since, Release included -- CMake always appends CMAKE_CUDA_FLAGS on top
+# of the build-type-specific flags (CMAKE_CUDA_FLAGS_RELEASE=-O3 -DNDEBUG
+# in this project), it never replaces them. `-G` is CUDA's DEVICE DEBUG
+# flag: it disables nearly all device-code optimizations regardless of
+# `-O3` also being present. Discovered this round while investigating why
+# a Rust-host NTT benchmark looked ~2.3x faster than the equivalent C++
+# path -- isolated via a from-scratch nvcc recompile of the exact same
+# kernel source (ruling out language, FFI, and even -rdc=true/false as
+# explanations) down to this ONE flag, confirmed via `VERBOSE=1 cmake
+# --build` showing `-g -G -O3 -DNDEBUG` on every kernel compile. This has
+# likely affected EVERY prior CUDA kernel performance measurement in this
+# project's history, not just this round's work -- see
+# research/EXPERIMENT_LEDGER.md for the full isolation experiment and
+# research/MASTER_STATE.md for which specific benchmark numbers predate
+# this fix and should be treated as device-debug-mode measurements, not
+# true Release performance, until re-run.
+set(CMAKE_CUDA_FLAGS "" CACHE STRING "Extra CUDA flags applied to every build type; must NOT contain -G (device debug) for performance measurements to be meaningful. See comment above." FORCE)
 
 # Core library: pure device-resident FHE, NO OpenFHE dependency.
 add_library(gpufhe STATIC
@@ -159,6 +180,16 @@ gpufhe_test(bench_batch bench/bench_batch.cpp)
 gpufhe_test(bench_evalmult bench/bench_evalmult.cpp)
 gpufhe_test(bench_evalmult_resident bench/bench_evalmult_resident.cpp)
 gpufhe_test(bench_hoist_multi bench/bench_hoist_multi.cpp)
+# GOD PROMPT "CKKS RUST + CUDA EVOLUTION"/"FAIR BENCHMARKS" rounds: Path A
+# (existing C++ host + existing CUDA C++ kernel) of a three-way comparison
+# against rust/crates/ckks-cuda's Path B (Rust host + the SAME kernel).
+# Same n=1024 workload, same tower-0 modulus, same deterministic input,
+# same four-tier (cold-start/context-init/steady-state/end-to-end)
+# measurement structure -- see that file's own header comment for the
+# full methodology and research/EXPERIMENT_LEDGER.md entry #32 for the
+# result (equivalent within noise) and the build-flag bug found along the
+# way.
+gpufhe_test(bench_ntt_roundtrip_cpp_vs_rust bench/bench_ntt_roundtrip_cpp_vs_rust.cpp)
 gpufhe_test(test_mult_barrett tests/test_mult_barrett.cpp)
 # Directive "VERIFY OOM DIAGNOSIS AND REMOVE THE LARGE-N DIAGONAL
 # BOTTLENECK", Priority 3: proves an O(S*2^RST) analytic replacement for

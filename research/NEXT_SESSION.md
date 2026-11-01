@@ -3,10 +3,85 @@
 ## Current commit
 
 Check `git log -3` on resume. As of this writing, HEAD is a new commit
-on top of `8ba09bd` (the GOD PROMPT "RESOLVE POLYEVAL CORRECTNESS"
-round — see `MASTER_STATE.md`'s latest section and
-`EXPERIMENT_LEDGER.md` entry #30). Confirm push status — push again if
-`git status` shows ahead of origin.
+on top of entry #31's commit (the GOD PROMPT "CKKS RUST + CUDA
+EVOLUTION"/"FAIR BENCHMARKS" rounds — see `MASTER_STATE.md`'s latest
+section and `EXPERIMENT_LEDGER.md` entry #32). Confirm push status —
+push again if `git status` shows ahead of origin.
+
+## HIGH PRIORITY, project-wide: every prior CUDA benchmark number in this repo is suspect until re-run
+
+Entry #32 found `CMakeCache.txt` had cached `CMAKE_CUDA_FLAGS=-g -G`
+since some earlier, unrecorded `cmake` invocation, and that CMake
+always appends this ON TOP OF the build-type flags rather than
+replacing them — so `-G` (CUDA device debug, disables nearly all
+device-code optimization) has been silently active in every build,
+Release included, for this ENTIRE project's history. Fixed in
+`CMakeLists.txt` (`set(CMAKE_CUDA_FLAGS "" CACHE STRING ... FORCE)`),
+rebuilt `gpufhe`, re-verified 4 regression tests still pass
+(correctness-neutral, as expected).
+
+**This means every CUDA kernel performance claim anywhere in
+`MASTER_STATE.md`/`EXPERIMENT_LEDGER.md` prior to this fix (CUDA graph
+capture speedups, `bench_evalmult_resident`'s with-relin throughput
+numbers, `bench_resident_chain`, `bench_batch`, `bench_hoist_multi`,
+anything with a "ms" or "us" number in it from before this round) was
+almost certainly measured with device-debug mode silently enabled.**
+None of those numbers should be cited as this project's true
+performance without re-running them under the corrected flags first.
+**Next concrete step**: re-run the existing benchmark suite (at minimum
+`bench_evalmult_resident`, `bench_resident_chain`, `bench_batch`,
+`bench_hoist_multi`) with the SAME methodology each used originally,
+compare against the OLD recorded numbers, and record both the old
+(suspect) and new (corrected) figures side by side in the ledger so the
+magnitude of the historical measurement error is itself documented, not
+silently erased. Do this BEFORE trusting any existing performance
+narrative in this project (e.g. "CUDA graphs gave a 2x speedup on the
+resident chain") going forward.
+
+## Rust evolution: vertical slice done, next operation to port, or widen the three-way comparison
+
+`rust/` workspace (`ckks-core`, `ckks-cuda`) builds and all 7 tests
+pass — see entry #32. `ckks_cuda::NttContext` is the model to follow
+for any FUTURE ported operation: separate one-time setup from a reused
+per-call hot path, FFI straight into the existing proven kernel/host
+function rather than reimplementing algorithmic logic, and benchmark
+with the SAME tiered (cold-start/init/steady-state/end-to-end)
+structure in both languages before trusting any number.
+
+**Not yet done, in priority order**:
+1. Evaluate whether a native-CUDA-Rust-kernel toolchain (e.g. the
+   `rust-cuda`/`rustc_codegen_nvvm` project) actually supports sm_75 +
+   CUDA 13.2 in THIS environment before attempting Path C of the
+   three-way comparison — do not assume compatibility; check the
+   toolchain's own documented support matrix and attempt a trivial
+   build first. If incompatible, document why and stay on Path B
+   (already proven to work, and proven performance-equivalent to pure
+   C++ once the `-G` bug was fixed).
+2. Port a SECOND, slightly more complex operation through the SAME
+   pattern (e.g. `LaunchSwitchModulus` + `LaunchRescaleFuse`, i.e. a
+   full rescale step — already has a proven-correct, well-tested
+   reference in `tests/test_rescale_scalar_diff_n1024.cpp`/
+   `test_rescale_vector_diff_n1024.cpp` from an earlier round) before
+   attempting anything bootstrap-scale.
+3. Memory efficiency work (directive Priority 3): `NttContext`
+   currently allocates one scratch buffer per `(n,q)` context, which is
+   already buffer reuse across calls — the next concrete opportunity is
+   extending this pattern to a MULTI-TOWER context (reusing table
+   buffers across towers sharing the same `n`, not just across calls at
+   one tower) once a second operation is ported and there's a real
+   multi-tower workload to measure against.
+4. `ckks-ffi` (a stable C ABI surface for the Rust layer, so existing
+   C++ consumers could call into it) — not yet justified; revisit once
+   there's more than one ported operation.
+
+## test_polyeval multi-level noise quantification: still the open correctness question, unchanged from entry #30
+
+Not touched this round. See the previous section of this file
+(preserved below) for the exact next experiment: instrument
+`test_polyeval.cpp`'s Chebyshev loop to check whether its maxerr growth
+across levels is quantitatively consistent with inherent
+independent-component rescale noise (entry #29's ~769-unit single-
+rescale figure) rather than a remaining defect.
 
 ## Randomized hoisting A/B: script ready, exact command to run once the memory gate clears
 

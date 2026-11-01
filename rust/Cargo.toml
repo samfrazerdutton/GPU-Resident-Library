@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ckks-core",
+    "crates/ckks-cuda",
+]
+
+# GOD PROMPT "CKKS RUST + CUDA EVOLUTION" round: this workspace is an
+# evolution target living ALONGSIDE the existing, unmodified C++/CUDA
+# engine (the rest of this repository, outside rust/) -- see
+# ../research/EXPERIMENT_LEDGER.md and ../research/MASTER_STATE.md for the
+# status of that baseline. Nothing here replaces or weakens it; the
+# existing engine remains the reference until a Rust/CUDA replacement
+# independently passes the relevant correctness tests and demonstrates a
+# measured advantage, per that directive's own primary architectural
+# principle.
+
+[profile.release]
+opt-level = 3
+lto = true

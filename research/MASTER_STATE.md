@@ -836,3 +836,63 @@ maxerr growth across Chebyshev levels is quantitatively consistent
 with inherent independent-component rescale noise compounding across
 multiple chained mulCt calls — not yet confirmed, recorded as the
 next concrete step in `NEXT_SESSION.md`.
+
+## GOD PROMPT "CKKS RUST + CUDA EVOLUTION"/"FAIR BENCHMARKS": first Rust-to-CUDA vertical slice working, PLUS a major project-wide build-flag bug found and fixed
+
+Full detail: `EXPERIMENT_LEDGER.md` entry #32. Two things happened this
+round, one planned (the Rust evolution's first milestone) and one
+unplanned but more consequential (a build-configuration bug affecting
+every CUDA benchmark this project has ever run).
+
+**The Rust vertical slice** — `rust/` workspace, `ckks-core` (minimal
+validated `RingDimension`/`Modulus` + `CkksError`) and `ckks-cuda`
+(the real work) — compiles and runs against this environment's actual
+toolchain (RTX 2060 Max-Q, CUDA 13.2, `cudarc` 0.19.10 — 0.17.8 does
+not recognize CUDA 13.2). `ckks-cuda::NttContext` calls the EXISTING,
+unmodified `kernels/ntt_ct.cu`/`intt_ct.cu` via FFI (compiled directly
+by a custom `build.rs`, bypassing the main CMake target's
+`CUDA_SEPARABLE_COMPILATION` device-link step since both files are
+self-contained), with primitive-root search delegated to the existing
+`gpufhe::native_root` through a one-function C-ABI bridge rather than
+reimplemented. Its API is deliberately split into one-time setup
+(`NttContext::new`) and a reusable per-call hot path
+(`NttContext::roundtrip`) — an earlier draft mixed these, which made an
+initial benchmark comparison invalid before any number was trusted.
+7/7 Rust tests pass, including the full 56-case-per-tower exact-equality
+NTT round-trip suite via a REUSED context (proving no stale state leaks
+between calls).
+
+**The build-flag bug** — found while chasing down why that benchmark
+first showed Rust ~2.3x faster than C++ for the identical kernel. Ruled
+out, in order: host-vector reallocation asymmetry (fixed, barely moved
+the number), GPU clock-state/run-order confound (reproduced identically
+in both orders), relocatable-device-code (`-rdc=true`) compilation
+(both RDC and non-RDC isolated builds ran at Rust's speed), the
+external GPU-shadowing OpenFHE fork from earlier rounds (still slow
+with OpenFHE unlinked), and "many other kernels sharing the binary"
+(still slow using only the 3 exact objects needed, extracted from
+`libgpufhe.a`). The actual cause: `CMakeCache.txt` had
+`CMAKE_CUDA_FLAGS:STRING=-g -G` cached from some earlier, unrecorded
+`cmake` invocation — CMake always appends this ON TOP OF the
+build-type-specific flags rather than replacing them, so `-G` (CUDA
+device debug, which disables nearly all device-code optimization) has
+been silently present in every build this whole project's history,
+**Release included**. Fixed in `CMakeLists.txt` itself (not just the
+cache) so it cannot silently regress again. Rebuilt `gpufhe` and
+re-ran 4 regression tests — all pass, confirming the fix is
+correctness-neutral.
+
+**After the fix, the honest result**: C++ and Rust host orchestration
+of the identical CUDA kernel are equivalent within measurement noise
+(steady-state 119.6us vs 108.7us median, 9 trials x 100 reps) — no
+genuine language-level performance advantage either way for this
+workload. This is the scientifically expected outcome for a thin host
+layer calling the same GPU kernel, not a disappointing result to hide.
+
+**This finding's blast radius is larger than this one benchmark**:
+every CUDA kernel performance number this project has recorded
+anywhere (CUDA graph capture benchmarks, `bench_evalmult_resident`,
+`bench_resident_chain`, etc.) was very likely measured with
+device-debug mode silently enabled, and should be treated as suspect
+until re-run under the corrected flags — NOT done this round (full
+scope), recorded as a high-priority follow-up in `NEXT_SESSION.md`.

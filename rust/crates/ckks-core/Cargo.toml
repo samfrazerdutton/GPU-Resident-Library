@@ -1,0 +1,5 @@
+[package]
+name = "ckks-core"
+version = "0.1.0"
+edition = "2021"
+description = "Host-side CKKS parameter/error types shared across the Rust evolution crates. No cryptographic algorithms live here."
