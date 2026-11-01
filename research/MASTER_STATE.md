@@ -918,6 +918,27 @@ then rebuilt under the corrected flags and re-ran for "after":
 **Takeaway for anyone touching this project's performance history**:
 neither "every old number is garbage" nor "the bug didn't matter" is
 correct — it is genuinely kernel-dependent, and each specific
-historical claim needs its own re-run before being trusted. `bench_
-batch` and `bench_hoist_multi` were NOT re-run this round (time
-budget) — still open, recorded in `NEXT_SESSION.md`.
+historical claim needs its own re-run before being trusted.
+
+## Same session, completing the list: `bench_batch` and `bench_hoist_multi` re-verified too — all four originally-flagged benchmarks now closed
+
+Full detail: `EXPERIMENT_LEDGER.md` entry #34.
+
+- **`bench_batch`**: robust to the fix (57.68ms→56.35ms gpu batch,
+  ~2% shift, verdict unchanged — "GPU FASTER on throughput" both
+  times). Same pattern as `bench_evalmult_resident`.
+- **`bench_hoist_multi`**: the qualitative verdict ("hoisted path is a
+  measurable win") survives, but the EXACT magnitude does not — both
+  the baseline and hoisted paths got dramatically faster
+  (304.15ms→167.96ms and 125.47ms→46.77ms respectively), and because
+  they sped up non-proportionally, the relative speedup ratio actually
+  **grew** (2.42x→3.59x) while the absolute ms-saved-per-call
+  **shrank** (178.85ms→118.80ms). Citing the old absolute figure (or
+  an implied 2.4x) after this fix would be wrong, even though "hoisting
+  helps" remains true.
+
+All four benchmarks `NEXT_SESSION.md` flagged after entry #32's
+discovery are now re-verified under the corrected build flags. Any
+OTHER standalone performance number in this project not from one of
+these four remains unverified and should still be treated as suspect
+until independently re-run.

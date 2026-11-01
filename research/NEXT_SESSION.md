@@ -3,46 +3,49 @@
 ## Current commit
 
 Check `git log -3` on resume. As of this writing, HEAD is a new commit
-on top of entry #32's commit (the GOD PROMPT "CKKS RUST + CUDA
-EVOLUTION"/"FAIR BENCHMARKS" rounds, including the immediate same-
-session before/after follow-up — see `MASTER_STATE.md`'s latest two
-sections and `EXPERIMENT_LEDGER.md` entries #32-#33). Confirm push
-status — push again if `git status` shows ahead of origin.
+on top of entry #34's commit (the GOD PROMPT "CKKS RUST + CUDA
+EVOLUTION"/"FAIR BENCHMARKS" rounds, including the same-session
+before/after follow-up for all four originally-flagged benchmarks —
+see `MASTER_STATE.md`'s latest sections and `EXPERIMENT_LEDGER.md`
+entries #32-#34). Confirm push status — push again if `git status`
+shows ahead of origin.
 
-## HIGH PRIORITY, project-wide: `bench_batch` and `bench_hoist_multi` are STILL unverified; `bench_resident_chain` and `bench_evalmult_resident` are DONE
+## `-G` build-flag bug: CLOSED for the four originally-flagged benchmarks; one remaining sweep still open
 
 Entry #32 found `CMakeCache.txt` had cached `CMAKE_CUDA_FLAGS=-g -G`
 since some earlier, unrecorded `cmake` invocation, and that CMake
 always appends this ON TOP OF the build-type flags rather than
 replacing them — so `-G` (CUDA device debug, disables nearly all
-device-code optimization) has been silently active in every build,
-Release included, for this ENTIRE project's history. Fixed in
+device-code optimization) had been silently active in every build,
+Release included, for this ENTIRE project's history until fixed in
 `CMakeLists.txt` (`set(CMAKE_CUDA_FLAGS "" CACHE STRING ... FORCE)`).
 
-**Entry #33 already re-ran two of the four flagged benchmarks with a
-genuine before/after (old binary, then rebuilt binary, same machine) —
-do NOT re-do these, read the recorded numbers instead:**
+**All four benchmarks flagged after that discovery are now re-verified
+with a genuine before/after (old binary, then rebuilt binary, same
+machine) — do NOT re-run these again, read the recorded numbers
+instead:**
 - `bench_resident_chain`: the fix REVERSED the verdict (GPU was
   measured slower than CPU before, faster after — a 27% GPU-side
-  kernel time drop). This project's prior belief, if any, that this
-  specific operation doesn't benefit from GPU acceleration was an
-  artifact of the bug.
+  kernel time drop).
 - `bench_evalmult_resident`: the CUDA-graph-vs-direct speedup ratio
-  was essentially UNCHANGED (186.7x -> 192.4x) — this specific "~190x
-  graph speedup" claim survives the fix and can be cited.
+  was essentially UNCHANGED (186.7x -> 192.4x) — robust to the bug.
+- `bench_batch`: also robust (~2% shift, verdict unchanged).
+- `bench_hoist_multi`: qualitative verdict ("hoisting wins") survives,
+  but the exact magnitude does NOT — both paths sped up
+  non-proportionally once fixed, so the relative speedup ratio
+  actually GREW (2.42x->3.59x) while the absolute ms-saved-per-call
+  SHRANK (178.85ms->118.80ms). Do not cite the old absolute figure.
 
-**Still open, next concrete step**: re-run `bench_batch` and
-`bench_hoist_multi` the SAME way (run the EXISTING binary first for a
-genuine "before" number if it's still sitting in `build/` unrebuilt,
-THEN `cmake --build . --target <name>` to pick up the fix, then re-run)
-and record both figures in the ledger, same format as entry #33. Do
-this before citing either benchmark's historical numbers. Also worth
-a final sweep once these two are done: grep `MASTER_STATE.md`/
+**Still open, lower priority**: a final sweep of `MASTER_STATE.md`/
 `EXPERIMENT_LEDGER.md` for any OTHER standalone "ms"/"us"/"speedup"
-performance claim from before entry #32's commit and mark it
-provisionally suspect in a comment if it hasn't been re-verified by
-then, so a future reader doesn't have to re-derive which claims are
-settled vs. still open.
+performance claim NOT from one of these four benchmarks (e.g. anything
+from `bench_evalmult.cpp`, `bench_ks_fastcore`, or narrative mentions
+of "CUDA graph" speedups outside the four already covered) and mark it
+provisionally suspect if it predates entry #32's commit and hasn't
+been independently re-verified, so a future reader doesn't have to
+re-derive which claims are settled vs. still open. Not done this round
+(time budget) — the four benchmarks `NEXT_SESSION.md` explicitly named
+were the priority, and that list is now complete.
 
 ## Rust evolution: vertical slice done, next operation to port, or widen the three-way comparison
 
