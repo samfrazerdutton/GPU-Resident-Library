@@ -311,6 +311,87 @@ impl EvalMultContext {
         self.r1.download_u64(&mut out1)?;
         Ok((out0, out1))
     }
+
+    /// GOD PROMPT "CKKS PHASE 6": TEST-ONLY diagnostic. Identical to
+    /// `multiply_relin_rescale` up through `LaunchCombine`, but STOPS
+    /// there -- returns the combined, UN-RESCALED (t0+ba0, t1+ba1), each
+    /// still `input_towers() * n` elements (full `size_ql`, not
+    /// `size_ql-1`). Exists to isolate whether a real decode-level
+    /// failure in the full pipeline originates in [tensor+keyswitch+
+    /// combine] or in [rescale]/the composition around it -- same
+    /// diagnostic technique that confirmed (via a parallel OpenFHE-based
+    /// investigation, see `tests/test_keyswitch.cpp`'s "real-data
+    /// control" block) that `keyswitch_resident`/`LaunchCombine` satisfy
+    /// the textbook relin identity when checked correctly.
+    #[cfg(test)]
+    pub(crate) fn multiply_relin_no_rescale_for_test(
+        &self,
+        c0a: &[u64],
+        c1a: &[u64],
+        c0b: &[u64],
+        c1b: &[u64],
+    ) -> Result<(Vec<u64>, Vec<u64>), CkksError> {
+        let in_len = self.size_ql as usize * self.n.get() as usize;
+        if c0a.len() != in_len || c1a.len() != in_len || c0b.len() != in_len || c1b.len() != in_len {
+            return Err(CkksError::InvalidRingDimension {
+                n: c0a.len().max(c1a.len()).max(c0b.len()).max(c1b.len()) as u64,
+            });
+        }
+
+        self.c0a.upload_u64(c0a)?;
+        self.c1a.upload_u64(c1a)?;
+        self.c0b.upload_u64(c0b)?;
+        self.c1b.upload_u64(c1b)?;
+
+        let n = self.n.get();
+        let size_q = self.size_ql;
+
+        unsafe {
+            LaunchTensor(
+                self.c0a.as_const_u64(),
+                self.c1a.as_const_u64(),
+                self.c0b.as_const_u64(),
+                self.c1b.as_const_u64(),
+                self.t0.as_mut_u64(),
+                self.t1.as_mut_u64(),
+                self.t2.as_mut_u64(),
+                self.d_mods.as_const_u64(),
+                size_q,
+                n,
+                std::ptr::null_mut(),
+            );
+
+            self.ks
+                .keyswitch_device_resident(self.t2.as_const_u64(), self.ba0.as_mut_u64(), self.ba1.as_mut_u64())?;
+
+            LaunchCombine(
+                self.r0.as_mut_u64(),
+                self.r1.as_mut_u64(),
+                self.t0.as_const_u64(),
+                self.t1.as_const_u64(),
+                self.ba0.as_const_u64(),
+                self.ba1.as_const_u64(),
+                self.d_mods.as_const_u64(),
+                size_q,
+                n,
+                std::ptr::null_mut(),
+            );
+
+            let rc = cudaDeviceSynchronize();
+            if rc != 0 {
+                return Err(CkksError::Cuda(format!(
+                    "cudaDeviceSynchronize failed, cudaError_t={rc}"
+                )));
+            }
+        }
+
+        let out_len = self.input_towers() as usize * self.n.get() as usize;
+        let mut out0 = vec![0u64; out_len];
+        let mut out1 = vec![0u64; out_len];
+        self.r0.download_u64(&mut out0)?;
+        self.r1.download_u64(&mut out1)?;
+        Ok((out0, out1))
+    }
 }
 
 #[cfg(test)]
@@ -796,8 +877,10 @@ mod tests {
     }
 
     // ====================================================================
-    // GOD PROMPT "CKKS PHASE 5": real CKKS encode/encrypt/decrypt/decode,
-    // and the (currently BLOCKED) real encrypted EvalMult round trip.
+    // GOD PROMPT "CKKS PHASE 5"/"PHASE 6": real CKKS encode/encrypt/
+    // decrypt/decode, and the (currently BLOCKED, but for a DIFFERENT
+    // and narrower reason than originally suspected) real encrypted
+    // EvalMult round trip.
     //
     // Everything above this point in this file operates at the raw RNS
     // level (synthetic per-tower residues, never a real plaintext or
@@ -810,68 +893,72 @@ mod tests {
     //
     // The FURTHER step -- routing a real ciphertext through
     // `EvalMultContext::multiply_relin_rescale` and decrypting the
-    // result -- is investigated below but NOT achieved this round. The
-    // investigation (methodically isolating stage by stage, per the
-    // governing directive's own Priority 5) found:
+    // result -- is investigated below and still NOT achieved, but the
+    // ORIGINAL suspected cause is now RESOLVED (PHASE 6,
+    // `research/EXPERIMENT_LEDGER.md` entry #39):
     //   1. encode -> decode alone: exact to ~1e-14 (far below tolerance).
     //   2. encrypt -> decrypt (single ciphertext, no multiply): exact to
     //      ~1e-12 (consistent with the expected Gaussian-noise budget).
-    //   3. tensor -> relin (`keyswitch_resident`) -> combine, checked
-    //      DIRECTLY in eval domain with NO decode/rescale involved
-    //      (`ba0[k]+ba1[k]*s[k] =?= t2[k]*s[k]^2 mod q0`, the textbook
-    //      relin decryption invariant): FAILS, ~50% of q0 -- i.e.
-    //      statistically uncorrelated, not a subtle numerical error.
-    //      Every sign/arithmetic variant tried (`ba0+ba1*s`, `ba0-ba1*s`,
-    //      `-ba0+ba1*s`, `-ba0-ba1*s`) gives the same ~50%-of-q result.
-    //      Reproduces with BOTH `numPart=1` (no digit decomposition at
-    //      all) and `numPart=2`.
+    //   3. tensor -> relin (`keyswitch_resident`) -> combine: Phase 5
+    //      checked `ba0[k]+ba1[k]*s[k] =?= t2[k]*s[k]^2 mod q0` DIRECTLY
+    //      by comparing raw per-coefficient values in NTT (eval) domain,
+    //      and found it FAILS at ~50% of q0. Phase 6 proved this was a
+    //      TEST METHODOLOGY BUG, not a real gap: ring multiplication is
+    //      pointwise ONLY in NTT/evaluation-domain representation; NTT
+    //      is bijective but highly MIXING, so a tiny coefficient-domain
+    //      difference (genuine, small key-switch noise) spreads into
+    //      what looks like a large, pseudo-random difference at every
+    //      individual NTT point. Comparing raw values pointwise in eval
+    //      domain is therefore not a valid "are these nearly the same
+    //      polynomial" test. Checked properly (convert to coefficient
+    //      domain, i.e. an actual INTT, before comparing, exactly
+    //      mirroring how `cc->Decrypt` itself always converts first):
+    //      the identity holds to ~1e-10% of q for real ciphertext data
+    //      -- see `tests/test_evalmult_relin_openfhe_reference.cpp`
+    //      (new, OpenFHE-only cross-validation) and the "real-data
+    //      control" experiment added to `tests/test_keyswitch.cpp`.
     //
-    // This is NOT a new bug -- it is a CONFIRMED, more consequential
-    // recurrence of `research/EXPERIMENT_LEDGER.md` entry #30's own
-    // unresolved finding: an EARLIER round found this SAME naive
-    // algebraic identity fails even on OpenFHE's own bit-exact-proven
-    // `KeySwitchCore` output (`tests/test_keyswitch.cpp`'s own appended
-    // check), and left the exact per-digit/per-part scaling convention
-    // as "an honestly unresolved research question." At the time, that
-    // was filed as a curiosity because `keyswitch_resident`'s OUTPUT was
-    // still proven bit-exact against two independent oracles
-    // (`keyswitch_core_resident` and OpenFHE's `KeySwitchCore`) at the
-    // RNS level, so correctness wasn't actually in doubt. This round
-    // shows the SAME gap now blocks something concrete: a real
-    // decrypt-based verification of EvalMult specifically CANNOT be
-    // built on the naive formula, because it is not simply a cosmetic
-    // check -- `LaunchCombine`'s `r0=t0+ba0, r1=t1+ba1` IS exactly this
-    // identity, so if it does not hold, the composed ciphertext will not
-    // decrypt correctly either (confirmed: the full `multiply_relin_
-    // rescale` -> decrypt -> decode path gives decoded errors of O(100)-
-    // O(1000) in slot space, consistent in magnitude with a ~q0/2-scale
-    // additive error propagating through).
+    // **`keyswitch_resident`'s `ba0`/`ba1` output and `LaunchCombine`'s
+    // `r0=t0+ba0, r1=t1+ba1` formula were correct all along.** This
+    // closes `research/EXPERIMENT_LEDGER.md` entry #30's long-open
+    // "unresolved research question" and this module's own entry #38
+    // finding -- both were the SAME test-methodology artifact, not a
+    // missing sign, scale factor, per-digit normalization, or basis-
+    // conversion term, and not a gap in understanding this scheme's
+    // algebraic convention. Do not re-open this question or re-run the
+    // sign/numPart/P-factor sweeps entry #38 tried -- they were chasing
+    // an artifact, not a real gap.
     //
-    // What this does NOT mean: there is no new evidence here that
-    // `keyswitch_resident`, `rescale_resident_raw`, `LaunchTensor`, or
-    // `LaunchCombine` are incorrect -- every one of them remains
-    // independently proven at the RNS level (entries #35-#37) using
-    // references that do not depend on this specific algebraic identity.
-    // The most likely explanation, based on entry #30's own finding that
-    // OpenFHE's correctly-functioning relin ALSO fails this check, is
-    // that the identity itself is incomplete for this scheme's actual
-    // scaling convention (missing some per-digit or per-part
-    // normalization), not that the implementation is wrong. This has
-    // NOT been confirmed -- it is the leading hypothesis, stated as
-    // such, not as an established fact.
+    // **What remains BLOCKED, and is a DIFFERENT, narrower bug**: the
+    // full `multiply_relin_rescale` -> `codec::decrypt` -> `codec::
+    // decode` round trip below still produces a genuine, large decode-
+    // level error (not explained by the methodology bug above, since
+    // `codec::decrypt`/`decode` already convert domains correctly).
+    // `LaunchTensor`, `keyswitch_device_resident`/`LaunchCombine`, and
+    // `rescale_device_resident` all remain independently proven correct
+    // in isolation (entries #35-37, RNS level; entry #39, real-data,
+    // decrypt-level for keyswitch+combine) -- and this exact fused
+    // composition is ALSO already proven bit-exact against a step-by-
+    // step reference for SYNTHETIC RNS data
+    // (`evalmult_matches_independent_reference_random_data`, Phase 4).
+    // This narrows the remaining bug to something specific to REAL,
+    // CKKS-scaled ciphertext data (large dynamic range, Δ²-scaled
+    // before rescale), most plausibly in `rescale_device_resident`'s
+    // behavior at that magnitude or in the test's own scale/tower-count
+    // bookkeeping -- not a generic buffer-reuse/sequencing hazard, which
+    // would also break the synthetic-data differential test.
     //
-    // Per the governing directive's explicit instruction ("if the root
-    // cause cannot be established in this phase, leave it explicitly
-    // open and document the next experiment"): the next concrete
-    // experiment, not attempted this round, is to link OpenFHE briefly
-    // and run a REAL `cc->EvalMult` + `cc->Decrypt` round trip (not the
-    // algebraic shortcut) at a small scale, to determine definitively
-    // whether OpenFHE's own relin decrypts correctly via normal library
-    // usage (expected: yes, OpenFHE is production-grade) -- then work
-    // backward from ITS actual per-digit scaling convention (reading
-    // `EvalMultsMutable`/`EvalMultCore`'s exact combine step, not just
-    // `KeySwitchCore` in isolation) to find the missing factor, rather
-    // than continuing to guess at sign/scale variants.
+    // **Next concrete experiment, not yet attempted** (see
+    // `research/NEXT_SESSION.md`'s "READ THIS FIRST" section for full
+    // detail): use the new TEST-ONLY
+    // `EvalMultContext::multiply_relin_no_rescale_for_test` method
+    // (returns the combined, UN-rescaled result at full tower count) to
+    // isolate [tensor+keyswitch+combine] from [rescale] directly on
+    // real ciphertext data -- either by building a decode capable of
+    // handling its `delta^2`-scaled, full-tower-count value, or by
+    // reproducing Phase 4's own step-by-step cross-check methodology
+    // with real (not synthetic) inputs feeding `rescale_device_resident`
+    // specifically.
     //
     // The tests below keep this finding VISIBLE and reproducible
     // (`#[ignore]`, not deleted or silently passing) rather than hidden.
@@ -964,7 +1051,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "BLOCKED: relin decryption invariant does not hold for this native eval key -- see this module's own doc comment above (research/EXPERIMENT_LEDGER.md entry #38); known to fail, kept visible rather than deleted"]
+    #[ignore = "BLOCKED: full multiply_relin_rescale->decrypt->decode still fails with a genuine decode-level error, but the ORIGINAL suspected cause (relin identity ba0+ba1*s=?=t2*s^2) is RESOLVED -- entry #39 proved it holds correctly once checked in the right NTT-vs-coefficient domain; entry #38's theory that LaunchCombine's own formula was broken was a test-methodology artifact. The remaining bug is narrower and unidentified -- see research/EXPERIMENT_LEDGER.md entry #39 and research/NEXT_SESSION.md's READ THIS FIRST section for the next concrete experiment (isolate rescale from combine using multiply_relin_no_rescale_for_test)"]
     fn real_encrypted_evalmult_matches_expected_product() {
         let ctx = new_ctx(1234);
         let slots_a = [1.0, 2.0, 3.0, 4.0];
@@ -986,7 +1073,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "BLOCKED: see real_encrypted_evalmult_matches_expected_product's #[ignore] reason and entry #38"]
+    #[ignore = "BLOCKED: see real_encrypted_evalmult_matches_expected_product's #[ignore] reason and entry #39"]
     fn real_encrypted_evalmult_zero_boundary() {
         // Multiplying by an all-zero ciphertext must decode to all-zero,
         // a deterministic boundary case distinct from random data.
@@ -1000,7 +1087,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "BLOCKED: see real_encrypted_evalmult_matches_expected_product's #[ignore] reason and entry #38"]
+    #[ignore = "BLOCKED: see real_encrypted_evalmult_matches_expected_product's #[ignore] reason and entry #39"]
     fn real_encrypted_evalmult_negative_and_fractional_values() {
         let ctx = new_ctx(4242);
         let slots_a = [-1.5, 2.25, -3.0, 0.5];
@@ -1012,7 +1099,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "BLOCKED: see real_encrypted_evalmult_matches_expected_product's #[ignore] reason and entry #38"]
+    #[ignore = "BLOCKED: see real_encrypted_evalmult_matches_expected_product's #[ignore] reason and entry #39"]
     fn real_encrypted_evalmult_repeated_calls_reused_context() {
         // Several independent real round trips on the SAME context,
         // different plaintexts/seeds each time -- proves the reused

@@ -207,9 +207,180 @@ int main() {
             }
             double frac=(double)worst/(double)q;
             if(frac>worst_frac) worst_frac=frac;
-            std::cout<<"  [algebraic check] tower="<<i<<" worst|ba0+ba1*s - a*s^2| = "<<(frac*100.0)<<"% of q\n";
+            std::cout<<"  [algebraic check] tower="<<i<<" worst|ba0+ba1*s - a*s^2| = "<<(frac*100.0)<<"% of q (EVAL domain, pointwise -- see methodology note below)\n";
         }
-        std::cout<<"  [algebraic check] worst fraction of q across all towers: "<<(worst_frac*100.0)<<"%\n";
+        std::cout<<"  [algebraic check] worst fraction of q across all towers (EVAL domain): "<<(worst_frac*100.0)<<"%\n";
+
+        // GOD PROMPT "CKKS PHASE 6" round: the ~50%-of-q result above was
+        // just independently reproduced AND explained using a fresh
+        // OpenFHE-only test (tests/test_evalmult_relin_openfhe_reference.cpp):
+        // ba0/ba1/a/s here are all in Format::EVALUATION (NTT/point-value
+        // domain). NTT is a bijective but highly MIXING linear transform --
+        // a tiny COEFFICIENT-domain difference (genuine key-switch noise,
+        // small relative to q) spreads into something that looks like a
+        // large, pseudo-random difference at EVERY INDIVIDUAL NTT point
+        // (each point is a sum over all n coefficients). Comparing lhs[k]
+        // vs rhs[k] pointwise in EVALUATION domain is therefore NOT a valid
+        // "are these nearly the same polynomial" test. Converting each
+        // tower to Format::COEFFICIENT (an actual INTT) before comparing
+        // resolved the identical check in the OpenFHE-only test (50% of q
+        // -> 4.5e-11% of q). Re-run the SAME check here, in COEFFICIENT
+        // domain, directly on keyswitch_core_resident's own output -- if
+        // this also resolves, it proves ba0/ba1 were correct all along and
+        // entry #30's "unresolved research question" was a test artifact,
+        // not a real gap.
+        {
+            double worst_frac_coeff=0;
+            for(uint32_t i=0;i<sizeQl;++i){
+                auto pp=ep->GetParams()[i];
+                uint64_t q=pp->GetModulus().ConvertToInt();
+
+                NativeVector vA(n,pp->GetModulus()), vBa0(n,pp->GetModulus()), vBa1(n,pp->GetModulus()), vS(n,pp->GetModulus());
+                for(uint32_t k=0;k<n;++k){
+                    vA[k]=NativeInteger(aTowers[(size_t)i*n+k]);
+                    vBa0[k]=NativeInteger(R.ba0[(size_t)i*n+k]);
+                    vBa1[k]=NativeInteger(R.ba1[(size_t)i*n+k]);
+                    vS[k]=NativeInteger(sElem.GetAllElements()[i][k].ConvertToInt());
+                }
+                // FIX (corrects an earlier bug in this exact block): ring
+                // multiplication is POINTWISE multiplication only in
+                // Format::EVALUATION (NTT domain) -- multiplying raw
+                // Format::COEFFICIENT values pointwise via mulmodL is NOT
+                // ring multiplication, it is a meaningless per-index
+                // Hadamard product. Multiply FIRST in EVALUATION format
+                // (where pointwise IS correct ring multiplication, via
+                // OpenFHE's own Poly operators), THEN convert the RESULT
+                // to COEFFICIENT format before comparing -- exactly the
+                // order tests/test_evalmult_relin_openfhe_reference.cpp
+                // uses (and which resolved the identical check there).
+                Poly pA(pp,Format::EVALUATION,true); pA.SetValues(std::move(vA),Format::EVALUATION);
+                Poly pBa0(pp,Format::EVALUATION,true); pBa0.SetValues(std::move(vBa0),Format::EVALUATION);
+                Poly pBa1(pp,Format::EVALUATION,true); pBa1.SetValues(std::move(vBa1),Format::EVALUATION);
+                Poly pS(pp,Format::EVALUATION,true); pS.SetValues(std::move(vS),Format::EVALUATION);
+
+                Poly lhsPoly = pBa0 + (pBa1 * pS);
+                Poly rhsPoly = (pA * pS) * pS;
+                lhsPoly.SetFormat(Format::COEFFICIENT);
+                rhsPoly.SetFormat(Format::COEFFICIENT);
+
+                uint64_t worst=0;
+                for(uint32_t k=0;k<n;++k){
+                    uint64_t lhs=lhsPoly[k].ConvertToInt();
+                    uint64_t rhs=rhsPoly[k].ConvertToInt();
+                    uint64_t diff=(lhs>=rhs)?(lhs-rhs):(rhs-lhs);
+                    uint64_t cdiff=(diff>q-diff)?(q-diff):diff;
+                    if(cdiff>worst) worst=cdiff;
+                }
+                double frac=(double)worst/(double)q;
+                if(frac>worst_frac_coeff) worst_frac_coeff=frac;
+                std::cout<<"  [algebraic check, COEFFICIENT domain] tower="<<i<<" worst|ba0+ba1*s - a*s^2| = "<<(frac*100.0)<<"% of q\n";
+            }
+            std::cout<<"  [algebraic check, COEFFICIENT domain] worst fraction of q across all towers: "<<(worst_frac_coeff*100.0)<<"%\n";
+        }
+    }
+
+    // GOD PROMPT "CKKS PHASE 6" round: the COEFFICIENT-domain fix above did
+    // NOT resolve the identity for THIS test's `a` (still ~50% of q), yet
+    // a separate, standalone OpenFHE-only test
+    // (tests/test_evalmult_relin_openfhe_reference.cpp) found the SAME
+    // identity, on the SAME KeySwitchCore function, DOES hold (to ~1e-10%
+    // of q) when `a` is a REAL ciphertext tensor-product component
+    // (t2=c1a*c1b from genuine encrypted ciphertexts) rather than this
+    // file's synthetic, independently-per-tower-random `a`. Controlled
+    // experiment: reuse this file's OWN `cc`/`kp`/`evalKey` (same context,
+    // same eval key already proven bit-exact against keyswitch_core_resident
+    // above) but swap in a REAL t2 instead of synthetic `a`, and re-run the
+    // identical COEFFICIENT-domain check -- isolating whether "syntheticness"
+    // of the input (not keyswitch_core_resident, not KeySwitchCore, not the
+    // check methodology) is the actual variable that matters.
+    {
+        auto sElem = kp.secretKey->GetPrivateElement();
+        auto mulmodL=[](uint64_t a,uint64_t b,uint64_t q){return (uint64_t)(((unsigned __int128)a*b)%q);};
+        auto addmodL=[](uint64_t a,uint64_t b,uint64_t q){uint64_t s=a+b;return s>=q?s-q:s;};
+
+        std::vector<double> slotsA(n/2, 0.0), slotsB(n/2, 0.0);
+        for (uint32_t k=0;k<4 && k<n/2;++k){ slotsA[k]=(double)(k+1); slotsB[k]=(double)(k+5); }
+        Plaintext ptA = cc->MakeCKKSPackedPlaintext(slotsA);
+        Plaintext ptB = cc->MakeCKKSPackedPlaintext(slotsB);
+        auto ctA = cc->Encrypt(kp.publicKey, ptA);
+        auto ctB = cc->Encrypt(kp.publicKey, ptB);
+
+        // Decisive control: does a REAL cc->EvalMult (with relin) +
+        // cc->Decrypt round trip even work correctly for THIS cc/kp
+        // (depth=3, batchsize=16384)? If yes, by the same airtight
+        // algebra as tests/test_evalmult_relin_openfhe_reference.cpp's
+        // CHECK1/1b/1c, ba0+ba1*s MUST equal t2*s^2 up to small noise --
+        // so a persisting ~50%-of-q result below would mean a bug in
+        // THIS check's own code, not a real mathematical gap.
+        {
+            auto realProduct = cc->EvalMult(ctA, ctB);
+            Plaintext rp;
+            cc->Decrypt(kp.secretKey, realProduct, &rp);
+            rp->SetLength(4);
+            auto dec = rp->GetRealPackedValue();
+            std::vector<double> expect = {5.0,12.0,21.0,32.0};
+            double me=0.0;
+            for (size_t k=0;k<4;++k){ double e=std::abs(dec[k]-expect[k]); if(e>me) me=e; }
+            std::cout << "  [real-data control] CHECK1-equivalent real decrypt: decoded=["
+                      << dec[0] << "," << dec[1] << "," << dec[2] << "," << dec[3]
+                      << "] expected=[5,12,21,32] max_err=" << me
+                      << " -> " << (me<1e-2?"PASS":"FAIL") << "\n";
+        }
+
+        // Raw tensor product, UNRELINEARIZED -- c1a*c1b is exactly t2.
+        auto tensorResult = cc->GetScheme()->EvalMult(ctA, ctB);
+        auto& tcv = tensorResult->GetElements();
+        std::cout << "  [real-data control] tensor component count=" << tcv.size() << "\n";
+        DCRTPoly realT2 = tcv[2];
+
+        auto realRef = cc->GetScheme()->KeySwitchCore(realT2, evalKey);
+        uint32_t realTowers = (uint32_t)realT2.GetAllElements().size();
+        std::cout << "  [real-data control] real t2 towers=" << realTowers << " (sizeQl=" << sizeQl << ")\n";
+        // Verify tower ALIGNMENT directly -- do NOT assume index i means
+        // the same modulus for realT2 and sElem/ep just because sElem
+        // happens to have sizeQl towers. A dropped tower from leveling
+        // could be at the FRONT, not just the back.
+        for (uint32_t i=0;i<realTowers;++i){
+            auto t2tower = realT2.GetElementAtIndex(i);
+            auto stower = sElem.GetElementAtIndex(i);
+            std::cout << "  [real-data control] realT2 tower " << i
+                      << " modulus=" << t2tower.GetModulus() << " root=" << t2tower.GetRootOfUnity()
+                      << "  |  sElem tower " << i
+                      << " modulus=" << stower.GetModulus() << " root=" << stower.GetRootOfUnity() << "\n";
+        }
+
+        double worst_frac_real=0;
+        for(uint32_t i=0;i<realTowers && i<sizeQl;++i){
+            auto pp=ep->GetParams()[i];
+            uint64_t q=pp->GetModulus().ConvertToInt();
+
+            // Same fix as the synthetic-data block above: multiply FIRST
+            // in EVALUATION format (pointwise = correct ring
+            // multiplication there), THEN convert the RESULT to
+            // COEFFICIENT format for comparison.
+            Poly pA = realT2.GetElementAtIndex(i);
+            Poly pBa0 = (*realRef)[0].GetElementAtIndex(i);
+            Poly pBa1 = (*realRef)[1].GetElementAtIndex(i);
+            Poly pS = sElem.GetElementAtIndex(i);
+
+            Poly lhsPoly = pBa0 + (pBa1 * pS);
+            Poly rhsPoly = (pA * pS) * pS;
+            lhsPoly.SetFormat(Format::COEFFICIENT);
+            rhsPoly.SetFormat(Format::COEFFICIENT);
+
+            uint64_t worst=0;
+            for(uint32_t k=0;k<n;++k){
+                uint64_t lhs=lhsPoly[k].ConvertToInt();
+                uint64_t rhs=rhsPoly[k].ConvertToInt();
+                uint64_t diff=(lhs>=rhs)?(lhs-rhs):(rhs-lhs);
+                uint64_t cdiff=(diff>q-diff)?(q-diff):diff;
+                if(cdiff>worst) worst=cdiff;
+            }
+            double frac=(double)worst/(double)q;
+            if(frac>worst_frac_real) worst_frac_real=frac;
+            std::cout<<"  [real-data control, COEFFICIENT domain] tower="<<i<<" worst|ba0+ba1*s - t2*s^2| = "<<(frac*100.0)<<"% of q\n";
+        }
+        std::cout<<"  [real-data control, COEFFICIENT domain] worst fraction of q across all towers: "<<(worst_frac_real*100.0)<<"%\n";
     }
 
     if(bad0==0&&bad1==0){ std::cout<<"[PASS] full resident KeySwitchCore bit-exact vs OpenFHE\n"; return 0; }

@@ -1190,3 +1190,81 @@ MIGRATION_MATRIX.md`.
   (deliberately deferred — benchmarking before the one operation that
   would make it meaningful is correctness-established would violate
   the directive's own ordering), or production integration.
+
+## GOD PROMPT "CKKS PHASE 6": the entry #30/#38 relin-identity mystery ROOT-CAUSED AND RESOLVED — it was a test methodology bug, not a defect in `keyswitch_resident`/`LaunchCombine`; a SEPARATE rescale/composition bug found in the full round trip
+
+Full detail: `EXPERIMENT_LEDGER.md` entry #39. Updated next step:
+`research/NEXT_SESSION.md`'s "READ THIS FIRST" section.
+
+- **The core finding**: `ba0+ba1*s ≈ t2*s²` DOES hold correctly — every
+  prior check of this identity (entry #30's original
+  `tests/test_keyswitch.cpp` check, entry #38's native recurrence, and
+  this round's own first two attempts) compared, or even multiplied,
+  RNS polynomials in the wrong domain. Ring multiplication is pointwise
+  ONLY in `Format::EVALUATION` (NTT domain); NTT is bijective but
+  highly mixing, so a tiny `Format::COEFFICIENT`-domain difference
+  (genuine, small key-switch noise) spreads into what looks like a
+  large, pseudo-random difference at every individual NTT point —
+  making the identity LOOK like it fails at ~50% of q even when the
+  underlying polynomials are nearly identical.
+- Built a new OpenFHE-only reference test
+  (`tests/test_evalmult_relin_openfhe_reference.cpp`) that: (1) proves
+  a REAL `cc->EvalMult()`+`cc->Decrypt()` round trip is correct
+  (max_err~1e-12); (2) re-checks the identity on OpenFHE's own
+  `KeySwitchCore` output, reproducing the same ~50%-of-q "failure" when
+  compared the old (wrong) way; (3) through a systematic elimination
+  (byte-identical extraction, raw-tensor-identity-alone verification,
+  accessor cross-check, explicit tower/root-of-unity alignment — each
+  independently confirmed, none the culprit) isolates the true cause to
+  the comparison domain; (4) confirms the fix: converting both sides to
+  `Format::COEFFICIENT` before comparing drops the residual to 4.5e-11%
+  of q.
+- Applied the same investigation to this project's OWN original entry
+  #30 check (`tests/test_keyswitch.cpp`): naively converting to
+  `Format::COEFFICIENT` did NOT immediately fix it — forced a second
+  look that found a DIFFERENT, newly-introduced bug (multiplying
+  already-COEFFICIENT-domain values pointwise is a meaningless Hadamard
+  product, not ring multiplication). A controlled real-vs-synthetic-data
+  experiment (same context/eval key, swapping entry #30's synthetic
+  random input for a real `t2=c1a*c1b`, plus a real-decrypt control)
+  made the contradiction airtight and pinpointed the fix. After
+  correcting the multiplication order (multiply first in
+  `Format::EVALUATION`, convert the RESULT to `Format::COEFFICIENT`):
+  synthetic data drops to 0.0825% of q; real ciphertext data drops to
+  5.54e-11% of q.
+- **Conclusion: `keyswitch_resident`'s `ba0`/`ba1` output and
+  `LaunchCombine`'s combine formula were correct all along.** This
+  closes entries #30/#38's open question definitively, via an
+  independent, OpenFHE-cross-validated route — it was never a missing
+  sign, scale factor, per-digit normalization, or basis-conversion term.
+- **This does NOT mean the full Rust round trip now passes.** Re-ran
+  the still-`#[ignore]`d `real_encrypted_evalmult_matches_expected_product`:
+  it STILL fails, with a genuine, large, DIFFERENT decode-level error
+  (slot 0: decoded=-370.86, expected=5). Since `codec::decrypt`/`decode`
+  already go through proper domain conversion, this is NOT explained by
+  the methodology bug above — it is a separate, real, not-yet-root-caused
+  issue, most likely in `rescale_device_resident`'s composition within
+  the fused `multiply_relin_rescale` pipeline, or specific to real
+  CKKS-scaled magnitudes rather than the synthetic RNS data entries
+  #35-37's and Phase 4's own differential tests already cover.
+- Added one new TEST-ONLY diagnostic,
+  `EvalMultContext::multiply_relin_no_rescale_for_test` (`#[cfg(test)]`,
+  returns the un-rescaled combined result at full tower count), NOT YET
+  used by a test — building a correct decode for its `delta²`-scaled
+  value exceeds `codec::decrypt`'s documented tower-0-only convention.
+  See `NEXT_SESSION.md` for the two concrete next-step options.
+- No production C++/CUDA source file was modified this round
+  (`src/keyswitch_resident.cpp` etc. untouched) — consistent with
+  "do not invent a fix" when, as it turned out, none was needed for the
+  identity question. Full Rust suite re-confirmed clean: 22 passed, 4
+  ignored (unchanged, correctly still ignored), 0 failed.
+- Also discovered and worked around this round: two SEPARATE, diverged
+  git clones of this repo exist on this machine (a Windows-filesystem
+  one with an unrelated CUDA-kernel-optimization history, and the WSL
+  one, authoritative for this entire thread) — see
+  `NEXT_SESSION.md`'s reminder.
+- **Explicitly NOT claimed**: the full encrypted EvalMult round trip
+  (still blocked, now on a DIFFERENT, narrower bug than previously
+  thought), resolution of `test_polyeval`'s SEPARATE multi-level noise
+  question (untouched), a benchmark of EvalMult (correctness still not
+  fully established end-to-end), or production integration.

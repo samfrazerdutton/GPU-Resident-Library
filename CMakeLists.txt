@@ -96,6 +96,12 @@ gpufhe_test(test_decompose tests/test_decompose.cpp)
 gpufhe_test(test_ks_fastcore tests/test_ks_fastcore.cpp)
 gpufhe_test(test_moddown tests/test_moddown.cpp)
 gpufhe_test(test_keyswitch tests/test_keyswitch.cpp)
+# GOD PROMPT "CKKS PHASE 6": root-causing the relin algebraic identity
+# (entries #30/#38) with OpenFHE as the operational reference -- a real
+# cc->EvalMult()+cc->Decrypt() round trip, plus the SAME algebraic check
+# re-done using OpenFHE's own DCRTPoly operators directly (not hand-
+# extracted raw towers) to rule out a test-side extraction bug.
+gpufhe_test(test_evalmult_relin_openfhe_reference tests/test_evalmult_relin_openfhe_reference.cpp)
 gpufhe_test(test_ks_constants tests/test_ks_constants.cpp)
 gpufhe_test(test_keygen tests/test_keygen.cpp)
 gpufhe_test(test_evalkeygen tests/test_evalkeygen.cpp)
