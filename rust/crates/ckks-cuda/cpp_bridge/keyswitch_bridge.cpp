@@ -63,10 +63,17 @@ void set_err(char* err_buf, size_t err_buf_len, const char* msg) {
 }
 
 // Bundles everything one key-switch fixture owns. See file header comment.
+// secretKey/pubKeyA/pubKeyB (GOD PROMPT "CKKS PHASE 5", new): the first
+// K.sizeQl*n elements of the keypair gpufhe_ks_fixture_create generates
+// internally via keygen_host, retained ONLY so a caller can perform a REAL
+// encrypt/decrypt round trip under the EXACT SAME key the eval key was
+// built for (see gpufhe_ks_fixture_secret_key's own doc comment below for
+// why this is test-only, not a production API).
 struct KsFixture {
     gpufhe::KeySwitchConstants K;
     gpufhe::DeviceKSContext C;
     gpufhe::DeviceKSWork W;
+    std::vector<uint64_t> secretKey, pubKeyA, pubKeyB;
     bool context_created = false;
     bool work_created = false;
 };
@@ -113,6 +120,13 @@ void* gpufhe_ks_fixture_create(uint32_t n, uint32_t size_q, uint32_t size_p,
         for (auto p : modP) rootQP.push_back(gpufhe::native_root(n, p));
 
         auto KPqp = gpufhe::keygen_host(n, modQP, rootQP, /*ns=*/1, /*sigma=*/3.19, seed);
+        // Retain the Q-restricted (first size_q*n elements) prefix of the
+        // keypair -- see KsFixture's own doc comment. KPqp itself (the
+        // full QP-sized vectors) still goes out of scope normally; only
+        // this narrower copy survives.
+        fx->secretKey.assign(KPqp.s.begin(), KPqp.s.begin() + (size_t)size_q * n);
+        fx->pubKeyA.assign(KPqp.pkA.begin(), KPqp.pkA.begin() + (size_t)size_q * n);
+        fx->pubKeyB.assign(KPqp.pkB.begin(), KPqp.pkB.begin() + (size_t)size_q * n);
 
         std::vector<uint64_t> PModq_QP(size_q + size_p);
         for (uint32_t t = 0; t < size_q + size_p; ++t) {
@@ -170,6 +184,45 @@ uint32_t gpufhe_ks_fixture_num_part(void* handle)  { return static_cast<KsFixtur
 // derivation.
 uint64_t gpufhe_ks_fixture_modulus_q(void* handle, uint32_t tower) {
     return static_cast<KsFixture*>(handle)->K.qMod[tower];
+}
+
+// GOD PROMPT "CKKS PHASE 5", new: exposes the Q-restricted secret/public
+// key this fixture's eval key was built under, so a caller can perform a
+// REAL gpufhe::encrypt_host/decrypt_host round trip under the EXACT SAME
+// key -- without this, "EvalMult produces a correct result" could only be
+// checked at the raw RNS level (entries #35-#37), never as actual CKKS
+// ciphertext arithmetic with real encryption noise.
+//
+// TEST-ONLY, explicitly not a production API: a real deployment would
+// never hand its own secret key back to a caller. This exists because
+// `gpufhe_ks_fixture_create`'s `keygen_host` call is the ONLY place this
+// fixture's secret is ever generated (see KsFixture's own doc comment) --
+// there is no separate "regenerate the same key" path, and fabricating a
+// different key here would silently test the wrong thing. `out_len` must
+// equal `size_ql*n` exactly (returns false, writes nothing, otherwise);
+// each copies `size_ql*n` u64 values, never more. Never logs or prints
+// the copied values itself -- what the CALLER does with them afterward is
+// the caller's own responsibility, same as any other secret material.
+bool gpufhe_ks_fixture_secret_key(void* handle, uint64_t* out, size_t out_len) {
+    if (!handle) return false;
+    KsFixture* fx = static_cast<KsFixture*>(handle);
+    if (out_len != fx->secretKey.size()) return false;
+    std::memcpy(out, fx->secretKey.data(), out_len * 8);
+    return true;
+}
+bool gpufhe_ks_fixture_public_key_a(void* handle, uint64_t* out, size_t out_len) {
+    if (!handle) return false;
+    KsFixture* fx = static_cast<KsFixture*>(handle);
+    if (out_len != fx->pubKeyA.size()) return false;
+    std::memcpy(out, fx->pubKeyA.data(), out_len * 8);
+    return true;
+}
+bool gpufhe_ks_fixture_public_key_b(void* handle, uint64_t* out, size_t out_len) {
+    if (!handle) return false;
+    KsFixture* fx = static_cast<KsFixture*>(handle);
+    if (out_len != fx->pubKeyB.size()) return false;
+    std::memcpy(out, fx->pubKeyB.data(), out_len * 8);
+    return true;
 }
 
 // Runs gpufhe::keyswitch_resident (the device-resident path this operation

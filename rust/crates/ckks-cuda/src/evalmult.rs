@@ -724,4 +724,312 @@ mod tests {
             "size_q=0 must be rejected"
         );
     }
+
+    /// Shared tolerance for comparing decoded real-CKKS slot values
+    /// against their mathematically expected value -- see
+    /// [`SLOT_TOLERANCE`]'s own doc comment below for the derivation.
+    fn ckks_mods_and_roots(ctx: &EvalMultContext) -> (Vec<u64>, Vec<u64>) {
+        let size_q = ctx.input_towers();
+        let mods: Vec<u64> = (0..size_q).map(|t| ctx.modulus_q(t)).collect();
+        let roots: Vec<u64> = mods
+            .iter()
+            .map(|&q| crate::ntt::native_root(ctx.ring_dimension(), ckks_core::Modulus::new(q).unwrap()))
+            .collect();
+        (mods, roots)
+    }
+
+    /// Real CKKS encode -> decode round trip, no encryption at all.
+    /// Passes to ~1e-14, confirming `codec::encode_real`/`codec::decode`
+    /// are a correct canonical-embedding transform pair at this crate's
+    /// chosen scale (`delta ~ qLast ~ 2^50`) -- found while root-causing
+    /// the blocked EvalMult round trip below, kept as permanent coverage.
+    #[test]
+    fn encode_decode_round_trip_matches_input() {
+        let ctx = new_ctx(999);
+        let n = ctx.ring_dimension().get();
+        let delta = ctx.modulus_q(ctx.input_towers() - 1) as f64;
+        for slots in [
+            &[1.0, 2.0, 3.0, 4.0][..],
+            &[0.0, 0.0, 0.0, 0.0][..],
+            &[-1.5, 2.25, -3.0, 0.5][..],
+        ] {
+            let m = crate::codec::encode_real(slots, n, delta).unwrap();
+            let (re, im) = crate::codec::decode(&m, n, delta).unwrap();
+            for (i, (&got, &expected)) in re[..slots.len()].iter().zip(slots.iter()).enumerate() {
+                assert!((got - expected).abs() < 1e-9, "slot {i}: got={got} expected={expected}");
+            }
+            for (i, &v) in im[..slots.len()].iter().enumerate() {
+                assert!(v.abs() < 1e-9, "slot {i}: unexpected imaginary component {v}");
+            }
+        }
+    }
+
+    /// Real CKKS encrypt -> decrypt round trip (single ciphertext, no
+    /// multiply), under the SAME native key `EvalMultContext`'s relin
+    /// step uses. Passes to ~1e-12, matching the expected Gaussian-noise
+    /// budget (sigma=3.19) -- confirms `codec::encrypt`/`codec::decrypt`
+    /// and `KeySwitchContext::secret_key`/`public_key_a`/`public_key_b`
+    /// (new this round) are correct as real RLWE encryption, independent
+    /// of whatever is blocking the multiply step (see below).
+    #[test]
+    fn encrypt_decrypt_round_trip_matches_input() {
+        let ctx = new_ctx(999);
+        let n = ctx.ring_dimension().get();
+        let (mods, roots) = ckks_mods_and_roots(&ctx);
+        let delta = ctx.modulus_q(ctx.input_towers() - 1) as f64;
+        let pk_a = ctx.ks.public_key_a();
+        let pk_b = ctx.ks.public_key_b();
+        let s = ctx.ks.secret_key();
+
+        for (seed, slots) in [(111u64, &[1.0, 2.0, 3.0, 4.0][..]), (222, &[0.0, 0.0, 0.0, 0.0][..]), (333, &[-1.5, 2.25, -3.0, 0.5][..])] {
+            let m = crate::codec::encode_real(slots, n, delta).unwrap();
+            let (c0, c1) = crate::codec::encrypt(&m, n, &pk_a, &pk_b, &mods, &roots, 1, 3.19, seed).unwrap();
+            let m_dec = crate::codec::decrypt(&c0, &c1, &s, n, &mods, &roots).unwrap();
+            let (re, im) = crate::codec::decode(&m_dec, n, delta).unwrap();
+            for (i, (&got, &expected)) in re[..slots.len()].iter().zip(slots.iter()).enumerate() {
+                assert!((got - expected).abs() < 1e-6, "seed {seed} slot {i}: got={got} expected={expected}");
+            }
+            for (i, &v) in im[..slots.len()].iter().enumerate() {
+                assert!(v.abs() < 1e-6, "seed {seed} slot {i}: unexpected imaginary component {v}");
+            }
+        }
+    }
+
+    // ====================================================================
+    // GOD PROMPT "CKKS PHASE 5": real CKKS encode/encrypt/decrypt/decode,
+    // and the (currently BLOCKED) real encrypted EvalMult round trip.
+    //
+    // Everything above this point in this file operates at the raw RNS
+    // level (synthetic per-tower residues, never a real plaintext or
+    // real encryption noise) -- deliberately, per this module's own
+    // top-level doc comment. The tests immediately below ARE real CKKS
+    // cryptography (encode -> encrypt -> decrypt -> decode, and encode
+    // -> decode alone) and PASS, proving `codec` correct as actual CKKS
+    // arithmetic with real encryption noise, not merely isolated
+    // encode/decode math.
+    //
+    // The FURTHER step -- routing a real ciphertext through
+    // `EvalMultContext::multiply_relin_rescale` and decrypting the
+    // result -- is investigated below but NOT achieved this round. The
+    // investigation (methodically isolating stage by stage, per the
+    // governing directive's own Priority 5) found:
+    //   1. encode -> decode alone: exact to ~1e-14 (far below tolerance).
+    //   2. encrypt -> decrypt (single ciphertext, no multiply): exact to
+    //      ~1e-12 (consistent with the expected Gaussian-noise budget).
+    //   3. tensor -> relin (`keyswitch_resident`) -> combine, checked
+    //      DIRECTLY in eval domain with NO decode/rescale involved
+    //      (`ba0[k]+ba1[k]*s[k] =?= t2[k]*s[k]^2 mod q0`, the textbook
+    //      relin decryption invariant): FAILS, ~50% of q0 -- i.e.
+    //      statistically uncorrelated, not a subtle numerical error.
+    //      Every sign/arithmetic variant tried (`ba0+ba1*s`, `ba0-ba1*s`,
+    //      `-ba0+ba1*s`, `-ba0-ba1*s`) gives the same ~50%-of-q result.
+    //      Reproduces with BOTH `numPart=1` (no digit decomposition at
+    //      all) and `numPart=2`.
+    //
+    // This is NOT a new bug -- it is a CONFIRMED, more consequential
+    // recurrence of `research/EXPERIMENT_LEDGER.md` entry #30's own
+    // unresolved finding: an EARLIER round found this SAME naive
+    // algebraic identity fails even on OpenFHE's own bit-exact-proven
+    // `KeySwitchCore` output (`tests/test_keyswitch.cpp`'s own appended
+    // check), and left the exact per-digit/per-part scaling convention
+    // as "an honestly unresolved research question." At the time, that
+    // was filed as a curiosity because `keyswitch_resident`'s OUTPUT was
+    // still proven bit-exact against two independent oracles
+    // (`keyswitch_core_resident` and OpenFHE's `KeySwitchCore`) at the
+    // RNS level, so correctness wasn't actually in doubt. This round
+    // shows the SAME gap now blocks something concrete: a real
+    // decrypt-based verification of EvalMult specifically CANNOT be
+    // built on the naive formula, because it is not simply a cosmetic
+    // check -- `LaunchCombine`'s `r0=t0+ba0, r1=t1+ba1` IS exactly this
+    // identity, so if it does not hold, the composed ciphertext will not
+    // decrypt correctly either (confirmed: the full `multiply_relin_
+    // rescale` -> decrypt -> decode path gives decoded errors of O(100)-
+    // O(1000) in slot space, consistent in magnitude with a ~q0/2-scale
+    // additive error propagating through).
+    //
+    // What this does NOT mean: there is no new evidence here that
+    // `keyswitch_resident`, `rescale_resident_raw`, `LaunchTensor`, or
+    // `LaunchCombine` are incorrect -- every one of them remains
+    // independently proven at the RNS level (entries #35-#37) using
+    // references that do not depend on this specific algebraic identity.
+    // The most likely explanation, based on entry #30's own finding that
+    // OpenFHE's correctly-functioning relin ALSO fails this check, is
+    // that the identity itself is incomplete for this scheme's actual
+    // scaling convention (missing some per-digit or per-part
+    // normalization), not that the implementation is wrong. This has
+    // NOT been confirmed -- it is the leading hypothesis, stated as
+    // such, not as an established fact.
+    //
+    // Per the governing directive's explicit instruction ("if the root
+    // cause cannot be established in this phase, leave it explicitly
+    // open and document the next experiment"): the next concrete
+    // experiment, not attempted this round, is to link OpenFHE briefly
+    // and run a REAL `cc->EvalMult` + `cc->Decrypt` round trip (not the
+    // algebraic shortcut) at a small scale, to determine definitively
+    // whether OpenFHE's own relin decrypts correctly via normal library
+    // usage (expected: yes, OpenFHE is production-grade) -- then work
+    // backward from ITS actual per-digit scaling convention (reading
+    // `EvalMultsMutable`/`EvalMultCore`'s exact combine step, not just
+    // `KeySwitchCore` in isolation) to find the missing factor, rather
+    // than continuing to guess at sign/scale variants.
+    //
+    // The tests below keep this finding VISIBLE and reproducible
+    // (`#[ignore]`, not deleted or silently passing) rather than hidden.
+    // ====================================================================
+
+    /// Runs the full real round trip for two REAL (zero-imaginary) slot
+    /// vectors and returns the decoded result's (real, imaginary) parts.
+    /// `slots_a`/`slots_b` may be shorter than `n/2`; the rest are
+    /// implicitly zero, matching `codec::encode_real`'s own contract.
+    ///
+    /// Scale choice: `delta` is set EQUAL to the dropped tower's modulus
+    /// (`qLast = ctx.modulus_q(SIZE_Q-1)`), the standard CKKS
+    /// scale-invariant design -- after one rescale, the new scale
+    /// `delta^2/qLast` works out to `delta` again exactly (as a real
+    /// number; the rescale KERNEL's own integer rounding is the only
+    /// real source of error, not a scale mismatch). See `codec`'s own
+    /// module doc comment for why `decrypt_host`'s tower-0-only recovery
+    /// specifically requires this (not an arbitrary choice).
+    fn real_evalmult_round_trip(
+        ctx: &EvalMultContext,
+        slots_a: &[f64],
+        slots_b: &[f64],
+        seed_a: u64,
+        seed_b: u64,
+    ) -> (Vec<f64>, Vec<f64>) {
+        let n = ctx.ring_dimension().get();
+        let size_q = ctx.input_towers();
+        let survivors = ctx.output_towers();
+
+        let mods: Vec<u64> = (0..size_q).map(|t| ctx.modulus_q(t)).collect();
+        let roots: Vec<u64> = mods
+            .iter()
+            .map(|&q| crate::ntt::native_root(ctx.ring_dimension(), ckks_core::Modulus::new(q).unwrap()))
+            .collect();
+        let delta = ctx.modulus_q(size_q - 1) as f64; // = qLast, the scale-invariant choice
+
+        let pk_a = ctx.ks.public_key_a();
+        let pk_b = ctx.ks.public_key_b();
+
+        let m_a = crate::codec::encode_real(slots_a, n, delta).expect("encode a failed");
+        let m_b = crate::codec::encode_real(slots_b, n, delta).expect("encode b failed");
+        let (c0a, c1a) =
+            crate::codec::encrypt(&m_a, n, &pk_a, &pk_b, &mods, &roots, 1, 3.19, seed_a).expect("encrypt a failed");
+        let (c0b, c1b) =
+            crate::codec::encrypt(&m_b, n, &pk_a, &pk_b, &mods, &roots, 1, 3.19, seed_b).expect("encrypt b failed");
+
+        let (r0, r1) = ctx.multiply_relin_rescale(&c0a, &c1a, &c0b, &c1b).expect("multiply failed");
+        assert_eq!(r0.len(), survivors as usize * n as usize, "unexpected output tower count");
+        assert_eq!(r1.len(), survivors as usize * n as usize, "unexpected output tower count");
+
+        let s_full = ctx.ks.secret_key();
+        let s_survivors: Vec<u64> = s_full[..survivors as usize * n as usize].to_vec();
+        let mods_survivors = &mods[..survivors as usize];
+        let roots_survivors = &roots[..survivors as usize];
+
+        let m_result =
+            crate::codec::decrypt(&r0, &r1, &s_survivors, n, mods_survivors, roots_survivors).expect("decrypt failed");
+        crate::codec::decode(&m_result, n, delta).expect("decode failed")
+    }
+
+    /// Absolute error must stay inside a tolerance derived from the
+    /// actual noise budget, not picked to pass: at `delta ~ qLast ~
+    /// 2^50`, encoding rounding (~O(1) per coefficient), encryption
+    /// Gaussian noise (sigma=3.19), and the relin/rescale kernels' own
+    /// integer rounding (bounded, established in `research/
+    /// EXPERIMENT_LEDGER.md` entry #29's independent-component rescale
+    /// noise analysis) all stay within a few hundred UNITS in the
+    /// integer-coefficient domain even after decode's O(sqrt(n)) random-
+    /// walk amplification -- dividing by `delta ~ 2^50` puts the real
+    /// numerical noise floor around `1e-12`-`1e-10`. `1e-6` leaves four
+    /// to six orders of magnitude of headroom, tight enough to catch a
+    /// real defect (which would show as an O(1) or larger error, not a
+    /// borderline one) without being tuned to this specific run.
+    const SLOT_TOLERANCE: f64 = 1e-6;
+
+    fn assert_slots_close(label: &str, got: &[f64], expected: &[f64]) {
+        assert_eq!(got.len(), expected.len());
+        let mut max_err = 0.0f64;
+        for (i, (&g, &e)) in got.iter().zip(expected.iter()).enumerate() {
+            let err = (g - e).abs();
+            if err > max_err {
+                max_err = err;
+            }
+            assert!(
+                err < SLOT_TOLERANCE,
+                "{label}: slot {i} got={g} expected={e} abs_err={err} exceeds tolerance {SLOT_TOLERANCE}"
+            );
+        }
+        eprintln!("{label}: max abs error = {max_err:e} (tolerance {SLOT_TOLERANCE:e})");
+    }
+
+    #[test]
+    #[ignore = "BLOCKED: relin decryption invariant does not hold for this native eval key -- see this module's own doc comment above (research/EXPERIMENT_LEDGER.md entry #38); known to fail, kept visible rather than deleted"]
+    fn real_encrypted_evalmult_matches_expected_product() {
+        let ctx = new_ctx(1234);
+        let slots_a = [1.0, 2.0, 3.0, 4.0];
+        let slots_b = [5.0, 6.0, 7.0, 8.0];
+        let expected: Vec<f64> = slots_a.iter().zip(slots_b.iter()).map(|(a, b)| a * b).collect();
+
+        let (re, im) = real_evalmult_round_trip(&ctx, &slots_a, &slots_b, 9001, 9002);
+
+        assert_slots_close("known-vector product", &re[..expected.len()], &expected);
+        // Imaginary parts must stay negligible -- real-only inputs should
+        // decode with no meaningful imaginary component.
+        for (i, &v) in im[..expected.len()].iter().enumerate() {
+            assert!(v.abs() < SLOT_TOLERANCE, "slot {i}: unexpected imaginary component {v}");
+        }
+        // Untouched slots (index >= 4) must decode close to zero too.
+        for (i, &v) in re[expected.len()..].iter().enumerate() {
+            assert!(v.abs() < SLOT_TOLERANCE, "untouched slot {}: expected ~0, got {v}", i + expected.len());
+        }
+    }
+
+    #[test]
+    #[ignore = "BLOCKED: see real_encrypted_evalmult_matches_expected_product's #[ignore] reason and entry #38"]
+    fn real_encrypted_evalmult_zero_boundary() {
+        // Multiplying by an all-zero ciphertext must decode to all-zero,
+        // a deterministic boundary case distinct from random data.
+        let ctx = new_ctx(5678);
+        let slots_a = [3.5, -2.0, 0.0, 7.25];
+        let slots_b = [0.0, 0.0, 0.0, 0.0];
+        let expected = [0.0, 0.0, 0.0, 0.0];
+
+        let (re, _im) = real_evalmult_round_trip(&ctx, &slots_a, &slots_b, 111, 222);
+        assert_slots_close("zero boundary", &re[..expected.len()], &expected);
+    }
+
+    #[test]
+    #[ignore = "BLOCKED: see real_encrypted_evalmult_matches_expected_product's #[ignore] reason and entry #38"]
+    fn real_encrypted_evalmult_negative_and_fractional_values() {
+        let ctx = new_ctx(4242);
+        let slots_a = [-1.5, 2.25, -3.0, 0.5];
+        let slots_b = [2.0, -1.0, 0.5, 4.0];
+        let expected: Vec<f64> = slots_a.iter().zip(slots_b.iter()).map(|(a, b)| a * b).collect();
+
+        let (re, _im) = real_evalmult_round_trip(&ctx, &slots_a, &slots_b, 333, 444);
+        assert_slots_close("negative/fractional product", &re[..expected.len()], &expected);
+    }
+
+    #[test]
+    #[ignore = "BLOCKED: see real_encrypted_evalmult_matches_expected_product's #[ignore] reason and entry #38"]
+    fn real_encrypted_evalmult_repeated_calls_reused_context() {
+        // Several independent real round trips on the SAME context,
+        // different plaintexts/seeds each time -- proves the reused
+        // device buffers and embedded KeySwitchContext/RescaleContext
+        // scratch don't leak state across calls even with REAL
+        // encrypted data (not just synthetic RNS residues, entry #37's
+        // own repeated-call test).
+        let ctx = new_ctx(7777);
+        let cases: [([f64; 4], [f64; 4]); 3] = [
+            ([1.0, 1.0, 1.0, 1.0], [1.0, 1.0, 1.0, 1.0]),
+            ([2.0, -3.0, 4.0, -5.0], [1.5, 2.5, -1.0, 0.5]),
+            ([0.1, 0.2, 0.3, 0.4], [10.0, 20.0, 30.0, 40.0]),
+        ];
+        for (call, (a, b)) in cases.iter().enumerate() {
+            let expected: Vec<f64> = a.iter().zip(b.iter()).map(|(x, y)| x * y).collect();
+            let (re, _im) = real_evalmult_round_trip(&ctx, a, b, 1000 + call as u64, 2000 + call as u64);
+            assert_slots_close(&format!("repeated call {call}"), &re[..expected.len()], &expected);
+        }
+    }
 }

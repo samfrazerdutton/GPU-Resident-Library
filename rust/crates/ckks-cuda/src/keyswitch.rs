@@ -98,6 +98,9 @@ extern "C" {
     fn gpufhe_ks_fixture_size_p(handle: *mut c_void) -> u32;
     fn gpufhe_ks_fixture_num_part(handle: *mut c_void) -> u32;
     fn gpufhe_ks_fixture_modulus_q(handle: *mut c_void, tower: u32) -> u64;
+    fn gpufhe_ks_fixture_secret_key(handle: *mut c_void, out: *mut u64, out_len: usize) -> bool;
+    fn gpufhe_ks_fixture_public_key_a(handle: *mut c_void, out: *mut u64, out_len: usize) -> bool;
+    fn gpufhe_ks_fixture_public_key_b(handle: *mut c_void, out: *mut u64, out_len: usize) -> bool;
     fn gpufhe_ks_fixture_run_resident(
         handle: *mut c_void,
         d_a: *const u64,
@@ -240,6 +243,43 @@ impl KeySwitchContext {
     pub fn modulus_q(&self, tower: u32) -> u64 {
         assert!(tower < self.size_ql, "tower out of range");
         unsafe { gpufhe_ks_fixture_modulus_q(self.handle, tower) }
+    }
+
+    /// The Q-restricted secret key (`size_ql * n` elements, eval domain)
+    /// this fixture's eval key was built under. GOD PROMPT "CKKS PHASE
+    /// 5", new -- TEST-ONLY, explicitly not a production API: exists so
+    /// a caller can perform a REAL `codec::encrypt`/`codec::decrypt`
+    /// round trip under the EXACT SAME key, to prove `EvalMultContext`
+    /// correct as actual CKKS ciphertext arithmetic rather than only at
+    /// the raw RNS level. See `cpp_bridge/keyswitch_bridge.cpp`'s
+    /// `gpufhe_ks_fixture_secret_key` for the full rationale (same
+    /// doc comment, not duplicated here) and its security caveats.
+    pub fn secret_key(&self) -> Vec<u64> {
+        let len = self.size_ql as usize * self.n.get() as usize;
+        let mut out = vec![0u64; len];
+        let ok = unsafe { gpufhe_ks_fixture_secret_key(self.handle, out.as_mut_ptr(), len) };
+        assert!(ok, "gpufhe_ks_fixture_secret_key: length mismatch (internal bug)");
+        out
+    }
+
+    /// The Q-restricted public key component `a` (`size_ql * n`
+    /// elements, eval domain). See [`Self::secret_key`]'s doc comment.
+    pub fn public_key_a(&self) -> Vec<u64> {
+        let len = self.size_ql as usize * self.n.get() as usize;
+        let mut out = vec![0u64; len];
+        let ok = unsafe { gpufhe_ks_fixture_public_key_a(self.handle, out.as_mut_ptr(), len) };
+        assert!(ok, "gpufhe_ks_fixture_public_key_a: length mismatch (internal bug)");
+        out
+    }
+
+    /// The Q-restricted public key component `b`. See
+    /// [`Self::secret_key`]'s doc comment.
+    pub fn public_key_b(&self) -> Vec<u64> {
+        let len = self.size_ql as usize * self.n.get() as usize;
+        let mut out = vec![0u64; len];
+        let ok = unsafe { gpufhe_ks_fixture_public_key_b(self.handle, out.as_mut_ptr(), len) };
+        assert!(ok, "gpufhe_ks_fixture_public_key_b: length mismatch (internal bug)");
+        out
     }
 
     /// Steady-state per-call path: upload `a` (eval domain, `size_ql * n`

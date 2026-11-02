@@ -1,11 +1,14 @@
 # Master state
 
-Last updated: this session, GOD PROMPT "CKKS RUST + CUDA PHASE 4" round
-(EvalMult ported to Rust, on top of commit `d75ce68`). **Read
-`## GOD PROMPT "CKKS RUST + CUDA PHASE 4"` near the end of this file
-first**, and `research/MIGRATION_MATRIX.md` for the condensed per-
-operation status table. Everything below that is preserved for history;
-the superseded-claims note this paragraph used to carry (about the
+Last updated: this session, GOD PROMPT "CKKS PHASE 5" round (real
+encode/encrypt/decrypt proven; the real encrypted EvalMult round trip
+found BLOCKED, on top of commit `6a3cf64`). **Read `## GOD PROMPT "CKKS
+PHASE 5"` near the end of this file first**, and `research/
+MIGRATION_MATRIX.md` for the condensed per-operation status table
+(including the new "Real encrypted round trip" column — do not confuse
+it with "Independently tested," which is a weaker, RNS-level-only
+claim). Everything below that is preserved for history; the
+superseded-claims note this paragraph used to carry (about the
 "production integration round") is itself superseded by the Rust/CUDA
 evolution rounds — the main C++ engine's production/security state
 described in the body below is unaffected by the Rust work, which is a
@@ -1128,3 +1131,62 @@ status: `research/MIGRATION_MATRIX.md`.
   attempted), or any security re-certification. Four operations are now
   ported and benchmarked out of a large engine — see
   `MIGRATION_MATRIX.md` for exactly which ones.
+
+## GOD PROMPT "CKKS PHASE 5": real CKKS encode/encrypt/decrypt proven correct; the real encrypted EvalMult round trip found genuinely BLOCKED, not merely unattempted
+
+Full detail: `EXPERIMENT_LEDGER.md` entry #38. Condensed per-operation
+status, with the new real-vs-RNS distinction: `research/
+MIGRATION_MATRIX.md`.
+
+- Built a REAL CKKS encode/encrypt/decrypt/decode pipeline
+  (`codec.rs` + `cpp_bridge/encdec_bridge.cpp`, wrapping the EXISTING
+  `encode_host`/`decode_host`/`encrypt_host`/`decrypt_host` verbatim)
+  and two TEST-ONLY key-material accessors on `KeySwitchContext`
+  (`secret_key`/`public_key_a`/`public_key_b`) so a test can encrypt
+  and decrypt under the EXACT SAME key an eval key was built under.
+  Both round trips (encode->decode; encrypt->decrypt, single
+  ciphertext) PASS with errors far below derived (not fitted)
+  tolerances — genuinely new, stronger-than-RNS-level evidence.
+- Attempting the natural next step — route a real ciphertext through
+  `EvalMultContext::multiply_relin_rescale` and decrypt the result —
+  found a genuine, deeply-investigated blocker: the relin step's
+  output does not satisfy the textbook decryption invariant
+  (`ba0+ba1*s ≈ t2*s²`), checked directly in eval domain with no
+  decode/rescale involved. This is a CONFIRMED, more consequential
+  recurrence of an EARLIER round's own unresolved finding (entry #30)
+  — previously thought to be an unconfirmed algebraic curiosity since
+  `keyswitch_resident`'s output was still independently proven correct
+  at the RNS level; this round shows it ALSO blocks any real
+  decrypt-based verification, since `LaunchCombine`'s `r0=t0+ba0,
+  r1=t1+ba1` IS that exact identity.
+- Tried 4 sign/arithmetic variants, `numPart=1` (no digit decomposition
+  at all) as well as `numPart=2`, and a P/P⁻¹ auxiliary-modulus
+  scaling-factor hypothesis — ALL give ~50% of q0 (statistically
+  uncorrelated), ruling out a simple sign or scale-factor bug.
+- **What this does NOT mean**: no new doubt is cast on
+  `keyswitch_resident`/`rescale_resident_raw`/`LaunchTensor`/
+  `LaunchCombine` themselves — all remain independently proven at the
+  RNS level by entries #35-#37, using references that don't depend on
+  this specific identity. The leading hypothesis is that the identity
+  itself is incomplete for this scheme's real per-digit scaling
+  convention, not that the implementation is wrong — but this round
+  did not find the missing piece.
+- The 4 blocked tests are kept, not deleted, marked `#[ignore]` with
+  the finding documented in the ignore reason and in code — `cargo
+  test` reports them as `ignored`, not silently passing or left red.
+  Full suite: 22 passed, 4 ignored, 0 failed, debug and release.
+- **Explicit next experiment**: link OpenFHE briefly, run a REAL
+  `cc->EvalMult`+`cc->Decrypt` round trip (not the algebraic shortcut)
+  to confirm OpenFHE's own relin decrypts correctly via normal usage,
+  then work backward from its actual `EvalMultCore` combine-step
+  source to find the missing factor.
+- GPU memory confirmed clean (22MiB session floor, no growth). Host
+  free RAM checked via PowerShell throughout (1.64-3.27GB free) — well
+  under the 6GB full-bootstrap gate, correctly not invoked.
+- **Explicitly NOT claimed**: the full encrypted EvalMult round trip,
+  resolution of entry #30 or `test_polyeval`'s SEPARATE multi-level
+  noise question (untouched and must not be conflated with this
+  entry's finding), a benchmark of the real-encryption primitives
+  (deliberately deferred — benchmarking before the one operation that
+  would make it meaningful is correctness-established would violate
+  the directive's own ordering), or production integration.

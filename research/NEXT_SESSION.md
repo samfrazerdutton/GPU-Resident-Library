@@ -3,16 +3,60 @@
 ## Current commit
 
 Check `git log -3` on resume. As of this writing, HEAD is a new commit
-on top of entry #36's commit `d75ce68` (the GOD PROMPT "CKKS RUST +
-CUDA PHASE 4" round: EvalMult ported to Rust as the FOURTH operation by
-COMPOSING `KeySwitchContext`/`RescaleContext` rather than rebuilding
-either, a real domain-confusion bug caught and fixed in this round's
-OWN test before it was trusted, benchmarked with wider-than-usual
-variance honestly flagged, and a memory measurement for this operation
-— see `MASTER_STATE.md`'s latest section, `EXPERIMENT_LEDGER.md` entry
-#37, and `research/MIGRATION_MATRIX.md` for the condensed per-operation
-status table). Confirm push status — push again if `git status` shows
-ahead of origin.
+on top of entry #37's commit `6a3cf64` (the GOD PROMPT "CKKS PHASE 5"
+round: a REAL CKKS encode/encrypt/decrypt/decode pipeline built and
+PROVEN correct (`codec.rs`, `cpp_bridge/encdec_bridge.cpp`, new
+TEST-ONLY key accessors on `KeySwitchContext`); the natural next step —
+a real encrypted `EvalMultContext` round trip — found genuinely BLOCKED
+by a confirmed, more consequential recurrence of entry #30's own
+unresolved relin-identity finding, investigated thoroughly (4 sign
+variants, numPart 1 and 2, a P/P⁻¹ scaling hypothesis, all ruled out)
+but NOT resolved — see `MASTER_STATE.md`'s latest section,
+`EXPERIMENT_LEDGER.md` entry #38, and `research/MIGRATION_MATRIX.md`'s
+new "Real encrypted round trip" column, which must NOT be confused with
+"Independently tested" (RNS-level only, a weaker claim)). Confirm push
+status — push again if `git status` shows ahead of origin.
+
+## READ THIS FIRST if resuming into EvalMult/relin work: the relin identity is BLOCKED, not just "not yet tested"
+
+Entry #38 (this round) confirms, with real encrypted data, that
+`keyswitch_resident`'s relin output does NOT satisfy
+`ba0+ba1*s ≈ t2*s²` (mod q0) -- checked DIRECTLY in eval domain, no
+decode/rescale confound possible. This is the SAME naive identity
+entry #30 (an earlier round) already found invalid on OpenFHE's own
+bit-exact-proven output, now shown to ALSO block any real decrypt-based
+verification of `EvalMultContext`, because `LaunchCombine`'s
+`r0=t0+ba0,r1=t1+ba1` IS exactly this identity.
+
+**Already ruled out this round -- do not re-try these:**
+- All 4 sign/arithmetic variants (`ba0+ba1*s`, `ba0-ba1*s`,
+  `-ba0+ba1*s`, `-ba0-ba1*s`) vs. `t2*s²`: all ~50% of q0.
+- `numPart=1` (eliminating digit decomposition entirely) in addition
+  to `numPart=2`: same ~50% result either way.
+- A P (auxiliary-modulus product) scaling factor: `t2*s²*P` and
+  `t2*s²*P⁻¹` BOTH checked, neither correlates any better.
+
+**What remains unverified, and is NOT implied by the above**:
+whether `keyswitch_resident`/`rescale_resident_raw`/`LaunchTensor`/
+`LaunchCombine` are themselves correct -- they remain independently
+proven at the RNS level (entries #35-#37) via references that do not
+depend on this identity, and that evidence is UNCHANGED by this
+round's finding.
+
+**The next concrete experiment, not yet attempted**: link OpenFHE
+briefly (a throwaway test binary, not a permanent dependency) and run
+a REAL `cc->EvalMult()` + `cc->Decrypt()` round trip (NOT the algebraic
+shortcut `ba0+ba1*s` check -- an ACTUAL decrypt call) at a small scale.
+If OpenFHE's own real decrypt succeeds (expected -- it is
+production-grade and this exact operation is core, everyday
+functionality for it), read its `EvalMultCore`/relin COMBINE step
+source directly (not `KeySwitchCore` in isolation, which is as far as
+entry #30 traced) to find the exact per-digit/per-part factor the
+naive formula is missing, then re-derive the correct identity and
+re-check it against THIS project's native `keyswitch_resident` before
+assuming the gap is OpenFHE-specific. Do not guess at further sign/
+scale variants without this evidence -- the search space tried this
+round (8 combinations) already covers the obvious ones.
 
 ## `-G` build-flag bug: CLOSED for the four originally-flagged benchmarks; one remaining sweep still open
 
@@ -51,7 +95,7 @@ re-derive which claims are settled vs. still open. Not done this round
 (time budget) — the four benchmarks `NEXT_SESSION.md` explicitly named
 were the priority, and that list is now complete.
 
-## Rust evolution: FOUR operations ported now, a real encode/encrypt/decrypt round trip is the next concrete target
+## Rust evolution: FOUR operations ported, real encode/encrypt/decrypt proven, the real EvalMult round trip BLOCKED (see above)
 
 `rust/` workspace (`ckks-core`, `ckks-cuda`) builds and all 20 tests
 pass (4 `ckks-core` + 3 NTT + 6 rescale [4 original + 2 new device-
@@ -93,26 +137,21 @@ time; `rescale::tests` and `evalmult::tests` both now contain worked
 examples of the correct pattern.
 
 **Not yet done, in priority order**:
-1. **A real encode/encrypt/decrypt round trip through `EvalMultContext`**,
-   explicitly deferred this round (see entry #37 and `evalmult.rs`'s own
-   module doc comment): encode two real plaintexts (`encode_host`),
-   encrypt under a native secret key (`encrypt_host` -- note this needs
-   the secret key `s` that `KeySwitchContext`'s opaque fixture currently
-   generates INTERNALLY and never exposes; the smallest safe addition is
-   a new bridge accessor in `cpp_bridge/keyswitch_bridge.cpp` that stores
-   and returns the first `size_ql*n` elements of the internally-generated
-   secret, analogous to the existing `gpufhe_ks_fixture_modulus_q`
-   accessor -- do NOT regenerate a separate key via a second `keygen_host`
-   call with a guessed seed; that would not be the SAME secret the eval
-   key was built under), run through `multiply_relin_rescale`, decrypt
-   (`decrypt_host`) and decode (`decode_host`), and compare against the
-   mathematically expected product within a stated, justified CKKS
-   approximation tolerance (NOT bit-exact -- real encryption noise is
-   expected; the tolerance must be derived, not picked to make the test
-   pass). This is the test that actually proves EvalMult correct as
-   CKKS ciphertext arithmetic, scale included, not merely as RNS bit
-   manipulation -- everything ported so far (including this round) has
-   deliberately stayed below that layer.
+1. **Resolve (or make real further progress on) the relin algebraic-
+   identity blocker** -- see the "READ THIS FIRST" section above for
+   exactly what's been tried and the specific next experiment (link
+   OpenFHE briefly, real `cc->EvalMult`+`cc->Decrypt`, then read
+   `EvalMultCore`'s actual combine-step source). This is now the
+   single highest-value task: it blocks a real, decrypt-based
+   correctness claim for BOTH key switching and EvalMult, not just the
+   round-trip test this round attempted. Once resolved, re-enable the
+   4 `#[ignore]`d tests in `evalmult.rs` (`real_encrypted_evalmult_*`)
+   by removing their `#[ignore]` attributes and confirm they pass --
+   do not write NEW tests for this, the infrastructure (`codec.rs`,
+   `real_evalmult_round_trip` helper, derived tolerances) already
+   exists and is correct; only the relin step's output needs fixing
+   (or the comparison formula needs correcting, depending which the
+   OpenFHE experiment reveals).
 2. Port a FIFTH operation. The natural candidates, in rough order of
    how much of the key-switch/rescale/evalmult machinery they could
    reuse vs. how much is genuinely new: rotation (`rotate_ct_resident`
@@ -121,7 +160,12 @@ examples of the correct pattern.
    bootstrap's C2S/S2C/EvalMod stages (each substantially larger; do
    NOT attempt the full bootstrap pipeline in one step, per every prior
    round's own explicit warning). Inspect the real call graph first,
-   same discipline as every round so far.
+   same discipline as every round so far. Note: rotation ALSO uses
+   `keyswitch_resident` internally (`rotate_ct_resident` ->
+   keyswitch), so it may be worth checking whether rotation's OWN
+   decrypt-based correctness is ALSO blocked by the same relin-identity
+   gap before investing in porting it -- if so, resolving item 1 first
+   is doubly justified.
 3. Evaluate whether a native-CUDA-Rust-kernel toolchain (e.g. the
    `rust-cuda`/`rustc_codegen_nvvm` project) actually supports sm_75 +
    CUDA 13.2 in THIS environment before attempting Path C of the

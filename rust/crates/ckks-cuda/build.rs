@@ -142,6 +142,12 @@ fn main() {
     objs.push(compile_cpp(&root.join("src/ks_constants.cpp"), &out_dir, &include_dir, &cuda_include));
     objs.push(compile_cpp(&root.join("src/keyswitch.cpp"), &out_dir, &include_dir, &cuda_include));
     objs.push(compile_cpp(&root.join("src/keyswitch_resident.cpp"), &out_dir, &include_dir, &cuda_include));
+    // src/encode.cpp / src/encdec.cpp: the EXISTING, unmodified native
+    // CKKS encode/decode/encrypt/decrypt primitives (GOD PROMPT "CKKS
+    // PHASE 5"), wrapped by the new cpp_bridge/encdec_bridge.cpp below.
+    // Both confirmed pure-host, no device state retained across calls.
+    objs.push(compile_cpp(&root.join("src/encode.cpp"), &out_dir, &include_dir, &cuda_include));
+    objs.push(compile_cpp(&root.join("src/encdec.cpp"), &out_dir, &include_dir, &cuda_include));
     objs.push(compile_cpp(
         &manifest_dir.join("cpp_bridge/native_root_bridge.cpp"),
         &out_dir, &include_dir, &cuda_include,
@@ -152,6 +158,10 @@ fn main() {
     ));
     objs.push(compile_cpp(
         &manifest_dir.join("cpp_bridge/keyswitch_bridge.cpp"),
+        &out_dir, &include_dir, &cuda_include,
+    ));
+    objs.push(compile_cpp(
+        &manifest_dir.join("cpp_bridge/encdec_bridge.cpp"),
         &out_dir, &include_dir, &cuda_include,
     ));
 

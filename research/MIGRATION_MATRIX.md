@@ -4,8 +4,9 @@ Tracks, per CKKS primitive operation, exactly how far the "CKKS RUST +
 CUDA EVOLUTION" effort (`rust/` workspace, Path B: Rust host +
 EXISTING, unmodified CUDA C++ kernels via FFI) has gotten. Updated each
 round a new operation is touched. See `EXPERIMENT_LEDGER.md` entries
-#32 (NTT), #35 (rescale), #36 (key switching), and #37 (EvalMult) for
-full narrative detail behind each row.
+#32 (NTT), #35 (rescale), #36 (key switching), #37 (EvalMult), and #38
+(real encode/encrypt/decrypt, and the BLOCKED real-encrypted-EvalMult
+round trip) for full narrative detail behind each row.
 
 Columns, left to right, are cumulative prerequisites (a later column
 implies the earlier ones hold):
@@ -21,24 +22,38 @@ implies the earlier ones hold):
   setup/hot-path split (`NttContext`/`RescaleContext` pattern).
 - **Independently tested**: the Rust wrapper is checked against a
   reference computed FRESH in Rust (not imported from the C++ test),
-  not merely "two implementations agree."
+  not merely "two implementations agree." This column is about ISOLATED
+  RNS-level arithmetic correctness ONLY -- it says nothing about whether
+  a REAL ciphertext (real plaintext, real encryption noise, real scale)
+  decrypts correctly through the operation. See the new **Real
+  encrypted round trip** column for that, added this round after
+  finding the two are NOT interchangeable (entry #38).
 - **Benchmarked fairly**: a same-setup-scope 4-tier (cold-start /
   context-init / steady-state / end-to-end) comparison exists in BOTH
   languages, with results reported as medians across multiple trials,
   run in both orders to rule out a GPU-state confound.
+- **Real encrypted round trip** (new this round): encode -> encrypt ->
+  [this operation] -> decrypt -> decode, compared against the
+  mathematically expected result within a derived (not fitted)
+  tolerance, using REAL ciphertext data and REAL encryption noise --
+  not synthetic RNS residues. Strictly stronger evidence than
+  "independently tested" alone; an operation can pass that column and
+  still fail this one (confirmed: EvalMult does, see below).
 - **Production-integrated**: something in the actual engine or a real
   application calls the Rust path instead of (or alongside) the C++
   path. **Nothing in this table has reached this column yet.**
 
-| Operation | C++-only | FFI-exposed | Rust-abstracted | Independently tested | Benchmarked fairly | Production-integrated |
-|---|---|---|---|---|---|---|
-| Primitive-root search (`native_root`) | done | done (`native_root_bridge.cpp`) | done (`ntt::native_root`) | done (order-exactly-2n check) | n/a (sub-microsecond host call, folded into NTT's cold-start tier) | no |
-| Coefficient-domain NTT/INTT round trip | done | n/a (kernel called directly, no bridge needed) | done (`NttContext`) | done (56/56 exact cases, `test_ntt_roundtrip_n1024.cpp`-equivalent, both one-shot and reused-context) | **done** (entry #32: C++ 119.6us vs Rust 108.7us median, equivalent within noise) | no |
-| Fused-rescale constants (`native_rescale_consts`) | done | done (`rescale_consts_bridge.cpp`, this round) | done (`rescale::native_rescale_consts`) | done (folded into rescale's own differential test) | n/a (sub-microsecond host call, folded into rescale's cold-start tier) | no |
-| Single-modulus RNS rescale (`rescale_resident_raw`'s algorithm) | done | n/a (kernels called directly; constants via the bridge above) | done (`RescaleContext`, this round) | **done** (entry #35: 4 new tests, 0 mismatches vs. a fresh independent RNS reference, including a real domain-mismatch bug CAUGHT in the first draft of the C++ comparison and fixed before any timing was trusted) | **done** (entry #35: C++ 535-573us vs Rust 534-542us steady-state median, equivalent within noise, reproduced in both run orders) | no |
-| Full Hybrid key switching (`keyswitch_resident`, `DeviceKSContext`/`DeviceKSWork`) | done | done (`keyswitch_bridge.cpp`, this round -- a single fixture-lifecycle bridge, not one function per primitive, since the setup state is a genuine eval key, not bookkeeping) | done (`KeySwitchContext`, this round) | **partial, explicitly flagged** (entry #36: 6 new tests, bit-exact vs. `keyswitch_core_resident` -- the established oracle for this exact operation -- across random/boundary/repeated-call cases; this is NOT a from-scratch independent reference the way rescale's RNS identity was, since both paths implement the same high-level algorithm; the one attempted from-scratch algebraic check for this operation (`ba0+ba1*s =?= a*s_old`) was already proven an invalid identity in entry #30 and is not reattempted) | **done** (entry #36: fixture creation ~6.5-6.8ms, steady-state ~1.06-1.09ms, end-to-end ~8.4-9.2ms median, both languages, equivalent within noise, reproduced in both run orders) | no |
-| EvalMult (tensor product + relin + combine + rescale x2) | done | n/a (kernels called directly; relin via the key-switch bridge, rescale via the already-exposed rescale kernels) | done (`EvalMultContext`, this round -- composes `KeySwitchContext` + `RescaleContext` via two new device-pointer adaptation methods, `keyswitch_device_resident`/`rescale_device_resident`) | **done, genuinely independent** (entry #37: 3 new tests, 0 mismatches vs. a FRESH from-scratch reference -- schoolbook tensor/combine arithmetic + the established keyswitch host oracle + rescale's own from-scratch RNS identity, correctly domain-converted around the rescale step; a real domain-confusion bug was caught and fixed in THIS test before it was trusted, see the entry) | **done** (entry #37: fixture creation ~10-20ms, steady-state ~2.4-5.1ms, end-to-end ~14-23ms median across 3 repeated A/B runs in alternating order; wider run-to-run variance than the simpler single-kernel-chain operations, overlapping ranges, no consistent winner either language) | no |
-| Bootstrap pipeline (C2S/S2C/EvalMod) | done | not started | not started | not started | not started | no |
+| Operation | C++-only | FFI-exposed | Rust-abstracted | Independently tested (RNS-level) | Real encrypted round trip | Benchmarked fairly | Production-integrated |
+|---|---|---|---|---|---|---|---|
+| Primitive-root search (`native_root`) | done | done (`native_root_bridge.cpp`) | done (`ntt::native_root`) | done (order-exactly-2n check) | n/a (not a ciphertext operation) | n/a (sub-microsecond host call, folded into NTT's cold-start tier) | no |
+| Coefficient-domain NTT/INTT round trip | done | n/a (kernel called directly, no bridge needed) | done (`NttContext`) | done (56/56 exact cases, `test_ntt_roundtrip_n1024.cpp`-equivalent, both one-shot and reused-context) | n/a (not a ciphertext operation) | **done** (entry #32: C++ 119.6us vs Rust 108.7us median, equivalent within noise) | no |
+| Fused-rescale constants (`native_rescale_consts`) | done | done (`rescale_consts_bridge.cpp`, this round) | done (`rescale::native_rescale_consts`) | done (folded into rescale's own differential test) | n/a (not a ciphertext operation) | n/a (sub-microsecond host call, folded into rescale's cold-start tier) | no |
+| Single-modulus RNS rescale (`rescale_resident_raw`'s algorithm) | done | n/a (kernels called directly; constants via the bridge above) | done (`RescaleContext`, this round) | **done** (entry #35: 4 new tests, 0 mismatches vs. a fresh independent RNS reference, including a real domain-mismatch bug CAUGHT in the first draft of the C++ comparison and fixed before any timing was trusted) | not attempted standalone (exercised only as part of EvalMult's blocked round trip below) | **done** (entry #35: C++ 535-573us vs Rust 534-542us steady-state median, equivalent within noise, reproduced in both run orders) | no |
+| Full Hybrid key switching (`keyswitch_resident`, `DeviceKSContext`/`DeviceKSWork`) | done | done (`keyswitch_bridge.cpp`, this round -- a single fixture-lifecycle bridge, not one function per primitive, since the setup state is a genuine eval key, not bookkeeping) | done (`KeySwitchContext`, this round) | **partial, explicitly flagged** (entry #36: 6 new tests, bit-exact vs. `keyswitch_core_resident` -- the established oracle for this exact operation -- across random/boundary/repeated-call cases; this is NOT a from-scratch independent reference the way rescale's RNS identity was, since both paths implement the same high-level algorithm; the one attempted from-scratch algebraic check for this operation (`ba0+ba1*s =?= a*s_old`) was already proven an invalid identity in entry #30 and is not reattempted) | **BLOCKED** (entry #38: this IS the relin-specific algebraic identity that entry #30 found invalid -- directly checked again this round, with real encrypted data, under 4 sign/arithmetic variants AND a P/P⁻¹ scaling-factor hypothesis; all give ~50% of q0, i.e. uncorrelated; reproduces identically at numPart=1 and numPart=2. Root cause NOT established -- see entry #38 for the full investigation and the next experiment) | **done** (entry #36: fixture creation ~6.5-6.8ms, steady-state ~1.06-1.09ms, end-to-end ~8.4-9.2ms median, both languages, equivalent within noise, reproduced in both run orders) | no |
+| EvalMult (tensor product + relin + combine + rescale x2) | done | n/a (kernels called directly; relin via the key-switch bridge, rescale via the already-exposed rescale kernels) | done (`EvalMultContext`, this round -- composes `KeySwitchContext` + `RescaleContext` via two new device-pointer adaptation methods, `keyswitch_device_resident`/`rescale_device_resident`) | **done, genuinely independent** (entry #37: 3 new tests, 0 mismatches vs. a FRESH from-scratch reference -- schoolbook tensor/combine arithmetic + the established keyswitch host oracle + rescale's own from-scratch RNS identity, correctly domain-converted around the rescale step; a real domain-confusion bug was caught and fixed in THIS test before it was trusted, see the entry) | **BLOCKED, same root cause as key switching's row above** (entry #38: `encode -> encrypt -> EvalMultContext::multiply_relin_rescale -> decrypt -> decode` decodes to O(100)-O(1000) errors, not noise-scale -- because `LaunchCombine`'s `r0=t0+ba0,r1=t1+ba1` IS the same relin identity that doesn't hold. 4 tests written, passing differential-test infrastructure kept, but marked `#[ignore]` with the reason documented in code, not deleted or left silently failing) | **done** (entry #37: fixture creation ~10-20ms, steady-state ~2.4-5.1ms, end-to-end ~14-23ms median across 3 repeated A/B runs in alternating order; wider run-to-run variance than the simpler single-kernel-chain operations, overlapping ranges, no consistent winner either language) | no |
+| CKKS encode/decode (`encode_host`/`decode_host`) | done | done (`encdec_bridge.cpp`, this round) | done (`codec::encode_real`/`codec::decode`) | n/a (these ARE the real-data check; no separate RNS-level form) | **done** (entry #38: `encode_decode_round_trip_matches_input`, 3 input cases incl. zero/negative/fractional, error ~1e-14, far below a 1e-9 tolerance) | not benchmarked (pure host CPU functions, no GPU kernel -- the fair 4-tier GPU methodology doesn't apply; deferred, see entry #38) | no |
+| CKKS encrypt/decrypt, single ciphertext (`encrypt_host`/`decrypt_host`) | done | done (`encdec_bridge.cpp`, this round) | done (`codec::encrypt`/`codec::decrypt`, plus `KeySwitchContext::secret_key`/`public_key_a`/`public_key_b`, TEST-ONLY accessors) | n/a (same reasoning as encode/decode) | **done** (entry #38: `encrypt_decrypt_round_trip_matches_input`, 3 input cases, error ~1e-12, consistent with the expected Gaussian-noise budget, well below a 1e-6 tolerance) | not benchmarked (same reasoning as encode/decode; involves one NTT/INTT each but still CPU-orchestrated, no dedicated GPU-context lifecycle to compare) | no |
+| Bootstrap pipeline (C2S/S2C/EvalMod) | done | not started | not started | not started | not started | not started | no |
 
 **Reminder for future rounds**: do not infer from this table that the
 whole engine is "being ported" or that any security property has been
@@ -49,7 +64,14 @@ an assumption that the established pattern transfers automatically. In
 particular, key switching's "independently tested" status is weaker
 than rescale's, NTT's, or EvalMult's -- see the detail column above and
 `EXPERIMENT_LEDGER.md` entry #36 before citing it as equivalent
-evidence.
+evidence. **Most importantly this round (entry #38): "independently
+tested" (RNS-level) and "real encrypted round trip" are NOT the same
+claim and must never be conflated** -- EvalMult passes the former with
+genuinely independent evidence and still fails the latter, because the
+RNS-level check (by design) never exercises the actual decryption
+invariant a real ciphertext depends on. Do not claim EvalMult -- or
+key switching -- is correct "as CKKS ciphertext arithmetic" on the
+strength of the RNS-level column alone.
 
 ## Memory: what this round measured (entry #36)
 
@@ -112,3 +134,22 @@ first time. **Conclusion, same as entry #36: no cross-context
 table-sharing work is justified by this measurement** -- EvalMult's
 own new buffers are trivial next to the fixed floor, and the floor
 itself is not attributable to anything `EvalMultContext` allocates.
+
+## Memory and benchmarks: deferred this round for the real-encryption primitives (entry #38)
+
+`codec::encode_real`/`decode`/`encrypt`/`decrypt` are PURE HOST
+functions (confirmed by reading `src/encode.cpp`/`src/encdec.cpp`: no
+device allocation, no kernel launch retained across calls -- `encrypt`/
+`decrypt` each do one NTT/INTT internally, but that's a single kernel
+launch on a scratch buffer freed before the function returns, not a
+persistent GPU context). There is therefore no GPU-memory floor to
+measure for them specifically (any GPU footprint observed is entirely
+from whatever `KeySwitchContext`/`EvalMultContext` is already alive in
+the same process) and no "setup vs. steady-state" GPU-context
+distinction for the fair 4-tier benchmark methodology to apply to.
+Deliberately NOT building a benchmark for them this round -- consistent
+with the governing directive's own "benchmark only after correctness
+passes" ordering, and correctness of the ONE operation that would make
+a `codec`-based benchmark meaningful (the full encrypted EvalMult round
+trip) is exactly what entry #38 found BLOCKED. Revisit once that is
+resolved, not before.

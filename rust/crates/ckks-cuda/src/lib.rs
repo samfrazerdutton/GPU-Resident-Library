@@ -29,6 +29,12 @@
 //!   [`evalmult::EvalMultContext`]'s module doc comment for exactly how,
 //!   and why their existing host-slice-oriented public APIs needed a
 //!   small, explicit device-pointer adaptation first.
+//! - [`codec`]: NOT a ported operation -- the CKKS encode/decode/
+//!   encrypt/decrypt primitives (GOD PROMPT "CKKS PHASE 5") that let a
+//!   test drive a REAL ciphertext through `evalmult::EvalMultContext`,
+//!   instead of synthetic raw RNS residues. See its module doc comment
+//!   for why this was deferred until every operation it depends on was
+//!   already proven.
 //!
 //! `ntt` and `rescale` follow an IDENTICAL pattern: a context struct built
 //! once via `::new` that owns every reusable, input-independent resource
@@ -57,6 +63,7 @@
 //! independently in Rust so the two implementations cannot share a
 //! transcription bug and can be cross-checked.
 
+pub mod codec;
 pub mod evalmult;
 pub mod keyswitch;
 pub mod ntt;
