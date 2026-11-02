@@ -281,6 +281,54 @@ impl KeySwitchContext {
         Ok(())
     }
 
+    /// Device-resident hot path for composition into a LARGER fused
+    /// operation (GOD PROMPT "CKKS RUST + CUDA PHASE 4": `evalmult`'s
+    /// relinearization step, which key-switches the tensor product's
+    /// third component without ever bringing it back to the host). Unlike
+    /// [`Self::keyswitch`], this does NOT upload/download through this
+    /// context's own `d_a`/`d_ba0`/`d_ba1` buffers -- it forwards the
+    /// caller's OWN device pointers straight to `keyswitch_resident` via
+    /// the SAME bridge call `keyswitch` uses. This is the "adaptation"
+    /// the governing directive asks for instead of assuming `keyswitch`'s
+    /// host-slice-oriented signature is sufficient as-is: a caller already
+    /// holding device memory (as `evalmult::EvalMultContext` does) would
+    /// otherwise pay two pointless host round trips per relinearization.
+    ///
+    /// # Safety
+    /// `d_a` must be a valid device pointer with at least `size_ql() *
+    /// ring_dimension()` readable `u64` elements; `d_ba0`/`d_ba1` the same,
+    /// writable, and non-overlapping with `d_a` or each other (the
+    /// underlying kernels assume distinct input/output buffers, same as
+    /// `keyswitch_resident`'s own contract in `src/keyswitch_resident.cpp`).
+    /// This call synchronizes the default stream itself (see
+    /// `gpufhe_ks_fixture_run_resident`'s own doc comment in
+    /// `cpp_bridge/keyswitch_bridge.cpp`) before returning, so the caller
+    /// may safely queue further default-stream work on `d_ba0`/`d_ba1`
+    /// immediately after.
+    pub(crate) unsafe fn keyswitch_device_resident(
+        &self,
+        d_a: *const u64,
+        d_ba0: *mut u64,
+        d_ba1: *mut u64,
+    ) -> Result<(), CkksError> {
+        let mut err_buf = [0u8; ERR_BUF_LEN];
+        let rc = gpufhe_ks_fixture_run_resident(
+            self.handle,
+            d_a,
+            d_ba0,
+            d_ba1,
+            err_buf.as_mut_ptr() as *mut c_char,
+            ERR_BUF_LEN,
+        );
+        if rc != 0 {
+            return Err(CkksError::Cuda(format!(
+                "keyswitch_resident (device-resident) failed (code {rc}): {}",
+                err_from_buf(&err_buf)
+            )));
+        }
+        Ok(())
+    }
+
     /// Host-orchestrated reference path (`keyswitch_core_resident`) on the
     /// SAME `KeySwitchConstants` this context holds. NOT the fast path --
     /// exists only as this module's correctness oracle (see the module doc

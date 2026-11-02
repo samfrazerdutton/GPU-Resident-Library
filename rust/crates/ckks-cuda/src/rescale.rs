@@ -272,56 +272,8 @@ impl RescaleContext {
 
         self.d_c.upload_u64(coeffs_in)?;
 
-        let q_last = self.mods[last];
-        let (d_ir, d_ip) = &self.inv_table;
-
         unsafe {
-            // Drop the last tower into its own scratch buffer, INTT it
-            // (eval -> coefficient domain) -- exactly rescale_resident_
-            // raw's first two lines.
-            self.d_drop
-                .copy_from_ptr(self.d_c.tower_const_u64(last, nn) as *const c_void, nn)?;
-            LaunchINTT_GS(
-                self.d_drop.as_mut_u64(),
-                d_ir.as_const_u64(),
-                d_ip.as_const_u64(),
-                nn as u32,
-                q_last,
-                self.n_inv_last,
-                self.n_inv_precon_last,
-                std::ptr::null_mut(),
-            );
-
-            for t in 0..last {
-                let qi = self.mods[t];
-                let (d_fr, d_fp) = &self.fwd_tables[t];
-                self.d_scratch
-                    .copy_from_ptr(self.d_drop.as_const_u64() as *const c_void, nn)?;
-                LaunchSwitchModulus(
-                    self.d_scratch.as_mut_u64(),
-                    q_last,
-                    qi,
-                    nn as u32,
-                    std::ptr::null_mut(),
-                );
-                LaunchNTT_CT(
-                    self.d_scratch.as_mut_u64(),
-                    d_fr.as_const_u64(),
-                    d_fp.as_const_u64(),
-                    nn as u32,
-                    qi,
-                    std::ptr::null_mut(),
-                );
-                LaunchRescaleFuse(
-                    self.d_c.tower_mut_u64(t, nn),
-                    self.d_scratch.as_const_u64(),
-                    self.s1[t],
-                    self.s2[t],
-                    qi,
-                    nn as u32,
-                    std::ptr::null_mut(),
-                );
-            }
+            self.rescale_kernels_in_place()?;
 
             let rc = cudaDeviceSynchronize();
             if rc != 0 {
@@ -337,6 +289,102 @@ impl RescaleContext {
         // the dropped tower's slot is left stale, matching
         // rescale_resident_raw's own contract.
         self.d_c.download_u64(out)
+    }
+
+    /// The exact kernel-launch sequence `rescale_resident_raw` performs,
+    /// operating on `self.d_c` (already populated), WITHOUT the
+    /// surrounding upload/sync/download -- factored out of [`Self::rescale`]
+    /// so [`Self::rescale_device_resident`] can reuse it on data that
+    /// arrived via a device-to-device copy instead of a host upload. Does
+    /// NOT synchronize; callers composing this into a longer chain (same
+    /// default stream throughout, so launch order is already correct) sync
+    /// once at the end of their own chain instead.
+    ///
+    /// # Safety
+    /// Every kernel launched writes into/reads from `self`'s own
+    /// pre-allocated device buffers (`d_c`/`d_scratch`/`d_drop`) at fixed
+    /// offsets computed from `self.n`/`self.towers` -- safe as long as
+    /// those buffers were allocated with the sizes [`Self::new`] always
+    /// allocates them with (true for any live `RescaleContext`).
+    unsafe fn rescale_kernels_in_place(&self) -> Result<(), CkksError> {
+        let nn = self.n.get() as usize;
+        let last = self.towers as usize - 1;
+        let q_last = self.mods[last];
+        let (d_ir, d_ip) = &self.inv_table;
+
+        self.d_drop
+            .copy_from_ptr(self.d_c.tower_const_u64(last, nn) as *const c_void, nn)?;
+        LaunchINTT_GS(
+            self.d_drop.as_mut_u64(),
+            d_ir.as_const_u64(),
+            d_ip.as_const_u64(),
+            nn as u32,
+            q_last,
+            self.n_inv_last,
+            self.n_inv_precon_last,
+            std::ptr::null_mut(),
+        );
+
+        for t in 0..last {
+            let qi = self.mods[t];
+            let (d_fr, d_fp) = &self.fwd_tables[t];
+            self.d_scratch
+                .copy_from_ptr(self.d_drop.as_const_u64() as *const c_void, nn)?;
+            LaunchSwitchModulus(
+                self.d_scratch.as_mut_u64(),
+                q_last,
+                qi,
+                nn as u32,
+                std::ptr::null_mut(),
+            );
+            LaunchNTT_CT(
+                self.d_scratch.as_mut_u64(),
+                d_fr.as_const_u64(),
+                d_fp.as_const_u64(),
+                nn as u32,
+                qi,
+                std::ptr::null_mut(),
+            );
+            LaunchRescaleFuse(
+                self.d_c.tower_mut_u64(t, nn),
+                self.d_scratch.as_const_u64(),
+                self.s1[t],
+                self.s2[t],
+                qi,
+                nn as u32,
+                std::ptr::null_mut(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Device-resident counterpart to [`Self::rescale`] for composition
+    /// into a LARGER fused operation (GOD PROMPT "CKKS RUST + CUDA PHASE
+    /// 4": `evalmult::EvalMultContext`'s two post-relinearization rescale
+    /// steps). Copies `towers * n` elements device-to-device FROM
+    /// `d_c_ext` INTO this context's own `d_c`, runs the same kernel
+    /// sequence [`Self::rescale`] does, then copies the `(towers-1) * n`
+    /// survivor-tower elements device-to-device BACK OUT to `d_c_ext`
+    /// (overwriting its first `(towers-1)*n` elements in place; its
+    /// remaining, now-stale slot is left untouched, matching
+    /// `rescale_resident_raw`'s own contract). Does NOT synchronize --
+    /// same reasoning as [`Self::rescale_kernels_in_place`].
+    ///
+    /// # Safety
+    /// `d_c_ext` must be a valid, readable-and-writable device pointer
+    /// with at least `self.towers as usize * self.n.get() as usize`
+    /// `u64` elements, and must not alias this context's own `d_c`/
+    /// `d_scratch`/`d_drop` buffers.
+    pub(crate) unsafe fn rescale_device_resident(&self, d_c_ext: *mut u64) -> Result<(), CkksError> {
+        let nn = self.n.get() as usize;
+        let towers = self.towers as usize;
+        let last = towers - 1;
+
+        self.d_c.copy_from_ptr(d_c_ext as *const c_void, towers * nn)?;
+        self.rescale_kernels_in_place()?;
+        rt::memcpy_dtod_sync(d_c_ext as *mut c_void, self.d_c.as_const_u64() as *const c_void, last * nn * 8)
+            .map_err(cuda_err)?;
+        Ok(())
     }
 }
 
@@ -419,6 +467,76 @@ mod tests {
             }
         }
         yref
+    }
+
+    /// `rescale_device_resident` (GOD PROMPT "CKKS RUST + CUDA PHASE 4":
+    /// the device-pointer composition entry point `evalmult::
+    /// EvalMultContext` reuses) must agree bit-exact with the
+    /// already-proven host-slice `rescale` on the SAME input -- the
+    /// two share the kernel-launch body (`rescale_kernels_in_place`) by
+    /// construction, but the surrounding device-to-device copy-in/out
+    /// plumbing is new and gets its own direct check here, independent
+    /// of any larger composed operation.
+    #[test]
+    fn rescale_device_resident_matches_rescale() {
+        use rand::{Rng, SeedableRng};
+        let n_dim = RingDimension::new(1024).unwrap();
+        let n = 1024usize;
+        let ctx = RescaleContext::new(n_dim, &MODULI).unwrap();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(424242);
+        let input: Vec<u64> = (0..MODULI.len() * n).map(|i| rng.gen_range(0..MODULI[i / n])).collect();
+
+        let mut out_host = vec![0u64; (MODULI.len() - 1) * n];
+        ctx.rescale(&input, &mut out_host).unwrap();
+
+        let d_ext = DeviceBuf::alloc(input.len() * 8).unwrap();
+        d_ext.upload_u64(&input).unwrap();
+        unsafe {
+            ctx.rescale_device_resident(d_ext.as_mut_u64()).unwrap();
+            cudaDeviceSynchronize();
+        }
+        let mut out_device = vec![0u64; (MODULI.len() - 1) * n];
+        d_ext.download_u64(&mut out_device).unwrap();
+
+        assert_eq!(out_host, out_device, "rescale_device_resident disagrees with rescale on the same input");
+    }
+
+    /// Two `rescale_device_resident` calls in a row on the SAME reused
+    /// context, different buffers -- proves the shared `d_c`/`d_scratch`/
+    /// `d_drop` scratch (reused sequentially by `evalmult::
+    /// EvalMultContext`'s two rescale-after-relin steps) doesn't leak
+    /// state from the first call into the second.
+    #[test]
+    fn rescale_device_resident_twice_in_a_row_no_state_leak() {
+        use rand::{Rng, SeedableRng};
+        let n_dim = RingDimension::new(1024).unwrap();
+        let n = 1024usize;
+        let ctx = RescaleContext::new(n_dim, &MODULI).unwrap();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+        let input_a: Vec<u64> = (0..MODULI.len() * n).map(|i| rng.gen_range(0..MODULI[i / n])).collect();
+        let input_b: Vec<u64> = (0..MODULI.len() * n).map(|i| rng.gen_range(0..MODULI[i / n])).collect();
+
+        let mut exp_a = vec![0u64; (MODULI.len() - 1) * n];
+        ctx.rescale(&input_a, &mut exp_a).unwrap();
+        let mut exp_b = vec![0u64; (MODULI.len() - 1) * n];
+        ctx.rescale(&input_b, &mut exp_b).unwrap();
+
+        let d_a = DeviceBuf::alloc(input_a.len() * 8).unwrap();
+        d_a.upload_u64(&input_a).unwrap();
+        let d_b = DeviceBuf::alloc(input_b.len() * 8).unwrap();
+        d_b.upload_u64(&input_b).unwrap();
+        unsafe {
+            ctx.rescale_device_resident(d_a.as_mut_u64()).unwrap();
+            ctx.rescale_device_resident(d_b.as_mut_u64()).unwrap();
+            cudaDeviceSynchronize();
+        }
+        let mut got_a = vec![0u64; (MODULI.len() - 1) * n];
+        d_a.download_u64(&mut got_a).unwrap();
+        let mut got_b = vec![0u64; (MODULI.len() - 1) * n];
+        d_b.download_u64(&mut got_b).unwrap();
+
+        assert_eq!(exp_a, got_a, "first call (a) mismatch");
+        assert_eq!(exp_b, got_b, "second call (b) mismatch");
     }
 
     #[test]

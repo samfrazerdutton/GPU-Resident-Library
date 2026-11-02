@@ -3,15 +3,16 @@
 ## Current commit
 
 Check `git log -3` on resume. As of this writing, HEAD is a new commit
-on top of entry #35's commit `e3e2142` (the GOD PROMPT "CKKS RUST +
-CUDA PHASE 3" round: full Hybrid key switching ported to Rust as the
-THIRD operation via an opaque-fixture FFI pattern, bit-exact vs. the
-established host reference at a never-before-exercised native
-configuration, benchmarked fairly, and a memory-measurement pass across
-all three operations — see `MASTER_STATE.md`'s latest section,
-`EXPERIMENT_LEDGER.md` entry #36, and `research/MIGRATION_MATRIX.md`
-for the condensed per-operation status table). Confirm push status —
-push again if `git status` shows ahead of origin.
+on top of entry #36's commit `d75ce68` (the GOD PROMPT "CKKS RUST +
+CUDA PHASE 4" round: EvalMult ported to Rust as the FOURTH operation by
+COMPOSING `KeySwitchContext`/`RescaleContext` rather than rebuilding
+either, a real domain-confusion bug caught and fixed in this round's
+OWN test before it was trusted, benchmarked with wider-than-usual
+variance honestly flagged, and a memory measurement for this operation
+— see `MASTER_STATE.md`'s latest section, `EXPERIMENT_LEDGER.md` entry
+#37, and `research/MIGRATION_MATRIX.md` for the condensed per-operation
+status table). Confirm push status — push again if `git status` shows
+ahead of origin.
 
 ## `-G` build-flag bug: CLOSED for the four originally-flagged benchmarks; one remaining sweep still open
 
@@ -50,62 +51,101 @@ re-derive which claims are settled vs. still open. Not done this round
 (time budget) — the four benchmarks `NEXT_SESSION.md` explicitly named
 were the priority, and that list is now complete.
 
-## Rust evolution: THREE operations ported now, EvalMult/relin is the next concrete target
+## Rust evolution: FOUR operations ported now, a real encode/encrypt/decrypt round trip is the next concrete target
 
-`rust/` workspace (`ckks-core`, `ckks-cuda`) builds and all 17 tests
-pass (4 `ckks-core` + 3 NTT + 4 rescale + 6 key-switch). `ckks_cuda::
-NttContext` (entry #32) and `ckks_cuda::RescaleContext` (entry #35) both
-rebuild their own input-independent state in Rust; `ckks_cuda::
-KeySwitchContext` (entry #36, this round) does NOT -- its setup state
-is a genuine eval key, so `KeySwitchContext::new` instead makes ONE
-opaque FFI call into the existing native key-generation pipeline. All
-three still follow the SAME setup/hot-path split at the API level
-(`::new` vs. the per-call method) and the SAME benchmark discipline:
-run with the SAME tiered structure in both languages, in BOTH orders,
-before trusting any number. See `research/MIGRATION_MATRIX.md` for the
-exact per-operation status table — do not re-derive which operations
-are done from narrative text alone, read that table. **Key switching's
-correctness evidence is explicitly weaker than rescale's/NTT's** (see
-the matrix and `keyswitch.rs`'s own module doc comment) — it is checked
-bit-exact against the established host-reference oracle
-(`keyswitch_core_resident`), not a from-scratch independent
-mathematical reference; closing that gap would require either linking
-OpenFHE from Rust (not attempted, a real new dependency) or resolving
-entry #30's still-open algebraic-identity question first.
+`rust/` workspace (`ckks-core`, `ckks-cuda`) builds and all 20 tests
+pass (4 `ckks-core` + 3 NTT + 6 rescale [4 original + 2 new device-
+resident regression tests] + 6 key-switch + 3 EvalMult differential +
+2 EvalMult construction/input-validation). `ckks_cuda::NttContext`
+(entry #32) and `ckks_cuda::RescaleContext` (entry #35) both rebuild
+their own input-independent state in Rust; `ckks_cuda::KeySwitchContext`
+(entry #36) does NOT -- its setup state is a genuine eval key, so it
+makes ONE opaque FFI call into the existing native key-generation
+pipeline instead. `ckks_cuda::EvalMultContext` (entry #37, this round)
+does neither on its own: it COMPOSES one `KeySwitchContext` (relin) and
+one `RescaleContext` (the two post-relin rescale steps), via two new
+`pub(crate)` device-pointer adaptation methods
+(`KeySwitchContext::keyswitch_device_resident`, `RescaleContext::
+rescale_device_resident`) that let the composition stay fully
+device-resident instead of paying host round trips between stages. See
+`research/MIGRATION_MATRIX.md` for the exact per-operation status table
+— do not re-derive which operations are done from narrative text alone,
+read that table. **Key switching's correctness evidence remains
+explicitly weaker than rescale's/NTT's/EvalMult's own** (unchanged from
+entry #36) -- EvalMult's OWN differential test, by contrast, IS a
+genuinely independent from-scratch reference (schoolbook tensor/combine
+math + the established keyswitch oracle + rescale's own from-scratch
+RNS identity), stronger evidence than key-switching's own test, achieved
+by composing already-independently-tested pieces rather than inheriting
+key-switching's specific gap.
+
+**A domain-confusion bug class is now confirmed to recur across
+rounds** (entry #35's rescale benchmark, independently rediscovered in
+entry #37's EvalMult test): applying an RNS-rescale "center the dropped
+tower" identity to data that is NOT actually in coefficient domain
+produces a systematic, 100%-of-elements mismatch, not a subtle
+numerical error. **Any future test or benchmark that uses this specific
+identity (`rescale`'s own, or anything built on top of it) MUST
+forward-NTT its coefficient-domain inputs before feeding the real
+kernel path, and inverse-NTT the kernel's eval-domain output before
+applying the identity for comparison** -- do not re-learn this a third
+time; `rescale::tests` and `evalmult::tests` both now contain worked
+examples of the correct pattern.
 
 **Not yet done, in priority order**:
-1. **Port EvalMult / tensor product + relin** as the FOURTH operation.
-   This is the natural next step after key switching, since relin
-   (`buildK`/the eval-key-based relinearization in
-   `bench_evalmult_resident.cpp`) is itself a key-switch call on the
-   tensor product's 3-tower result -- `KeySwitchContext` from this
-   round may be directly reusable as the relin step's backend, not just
-   a precedent to imitate. Inspect the REAL call graph first (same
-   discipline as every round so far): what exactly `EvalMult`'s tensor
-   product needs (likely a NEW, simple kernel, not yet ported), what
-   shape the relin input takes (3 towers -> 2, requiring a dimension
-   reduction before/interleaved with the key-switch), and whether
-   `bench_evalmult_resident.cpp`'s existing CPU-baseline/GPU-resident
-   comparison already has a usable correctness reference before writing
-   any Rust code.
-2. Evaluate whether a native-CUDA-Rust-kernel toolchain (e.g. the
+1. **A real encode/encrypt/decrypt round trip through `EvalMultContext`**,
+   explicitly deferred this round (see entry #37 and `evalmult.rs`'s own
+   module doc comment): encode two real plaintexts (`encode_host`),
+   encrypt under a native secret key (`encrypt_host` -- note this needs
+   the secret key `s` that `KeySwitchContext`'s opaque fixture currently
+   generates INTERNALLY and never exposes; the smallest safe addition is
+   a new bridge accessor in `cpp_bridge/keyswitch_bridge.cpp` that stores
+   and returns the first `size_ql*n` elements of the internally-generated
+   secret, analogous to the existing `gpufhe_ks_fixture_modulus_q`
+   accessor -- do NOT regenerate a separate key via a second `keygen_host`
+   call with a guessed seed; that would not be the SAME secret the eval
+   key was built under), run through `multiply_relin_rescale`, decrypt
+   (`decrypt_host`) and decode (`decode_host`), and compare against the
+   mathematically expected product within a stated, justified CKKS
+   approximation tolerance (NOT bit-exact -- real encryption noise is
+   expected; the tolerance must be derived, not picked to make the test
+   pass). This is the test that actually proves EvalMult correct as
+   CKKS ciphertext arithmetic, scale included, not merely as RNS bit
+   manipulation -- everything ported so far (including this round) has
+   deliberately stayed below that layer.
+2. Port a FIFTH operation. The natural candidates, in rough order of
+   how much of the key-switch/rescale/evalmult machinery they could
+   reuse vs. how much is genuinely new: rotation (`rotate_ct_resident`
+   -- an automorphism permutation, likely a SMALL new kernel, composed
+   with the SAME key-switch backend this round proved reusable), or
+   bootstrap's C2S/S2C/EvalMod stages (each substantially larger; do
+   NOT attempt the full bootstrap pipeline in one step, per every prior
+   round's own explicit warning). Inspect the real call graph first,
+   same discipline as every round so far.
+3. Evaluate whether a native-CUDA-Rust-kernel toolchain (e.g. the
    `rust-cuda`/`rustc_codegen_nvvm` project) actually supports sm_75 +
    CUDA 13.2 in THIS environment before attempting Path C of the
    three-way comparison — do not assume compatibility; check the
    toolchain's own documented support matrix and attempt a trivial
    build first. If incompatible, document why and stay on Path B
    (already proven to work, and proven performance-equivalent to pure
-   C++ for all THREE ported operations so far).
-3. Memory efficiency: entry #36 MEASURED this (not guessed) and found
-   no current benefit to cross-context table sharing in this crate —
-   all three operations peak at an identical 85MiB GPU floor (fixed
-   CUDA driver/context overhead, not operation data) at n=1024, so
-   there is nothing to optimize yet. Revisit ONLY if/when a genuine
-   multi-tower or bootstrap-scale Rust workload emerges where the
-   per-tower table cost would actually be visible against that floor
-   (the C++ engine's own `g_rtab`/`upc` process-lifetime caches are the
-   pattern to port then, already proven at larger scale).
-4. `ckks-ffi` (a stable C ABI surface for the Rust layer, so existing
+   C++ for all FOUR ported operations so far).
+4. Memory efficiency: entries #36/#37 MEASURED this (not guessed) and
+   found no current benefit to cross-context table sharing in this
+   crate — all four operations peak at a GPU floor dominated by fixed
+   CUDA driver/context overhead (85-108MiB depending on operation, NOT
+   operation data) at n=1024, so there is nothing to optimize yet.
+   Revisit ONLY if/when a genuine multi-tower or bootstrap-scale Rust
+   workload emerges where the per-tower table cost would actually be
+   visible against that floor (the C++ engine's own `g_rtab`/`upc`
+   process-lifetime caches are the pattern to port then, already proven
+   at larger scale). One open, not-yet-investigated detail from entry
+   #37: EvalMult's floor (108MiB) is ~23MiB higher than the other three
+   operations' (85MiB) even accounting for a session-level baseline
+   shift -- plausibly CUDA module-loading overhead for the two new
+   kernel symbols, not independently confirmed; worth a quick check if
+   convenient, not worth a dedicated round on its own.
+5. `ckks-ffi` (a stable C ABI surface for the Rust layer, so existing
    C++ consumers could call into it) — not yet justified; revisit once
    there are more ported operations and a concrete consumer need.
 

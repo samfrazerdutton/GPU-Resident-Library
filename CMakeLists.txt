@@ -210,6 +210,14 @@ gpufhe_test(bench_rescale_cpp_vs_rust bench/bench_rescale_cpp_vs_rust.cpp)
 # ks_context_create/ks_work_create) as rust/crates/ckks-cuda/cpp_bridge/
 # keyswitch_bridge.cpp wraps, so both languages measure the SAME setup.
 gpufhe_test(bench_keyswitch_cpp_vs_rust bench/bench_keyswitch_cpp_vs_rust.cpp)
+# GOD PROMPT "CKKS RUST + CUDA PHASE 4" round: fourth operation's fair
+# comparison (EvalMult: tensor + relin + combine + rescale x2) against
+# rust/crates/ckks-cuda::EvalMultContext. Reuses the SAME native key-switch
+# fixture recipe as bench_keyswitch_cpp_vs_rust, extended with
+# LaunchTensor/LaunchCombine and two rescale_resident_raw calls on the SAME
+# DeviceKSContext (it only needs plain moduli + cached root tables, never
+# the eval key -- entry #35), so both languages measure the SAME setup.
+gpufhe_test(bench_evalmult_cpp_vs_rust bench/bench_evalmult_cpp_vs_rust.cpp)
 gpufhe_test(test_mult_barrett tests/test_mult_barrett.cpp)
 # Directive "VERIFY OOM DIAGNOSIS AND REMOVE THE LARGE-N DIAGONAL
 # BOTTLENECK", Priority 3: proves an O(S*2^RST) analytic replacement for

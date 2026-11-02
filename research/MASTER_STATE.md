@@ -1,8 +1,8 @@
 # Master state
 
-Last updated: this session, GOD PROMPT "CKKS RUST + CUDA PHASE 3" round
-(key switching ported to Rust, on top of commit `e3e2142`). **Read
-`## GOD PROMPT "CKKS RUST + CUDA PHASE 3"` near the end of this file
+Last updated: this session, GOD PROMPT "CKKS RUST + CUDA PHASE 4" round
+(EvalMult ported to Rust, on top of commit `d75ce68`). **Read
+`## GOD PROMPT "CKKS RUST + CUDA PHASE 4"` near the end of this file
 first**, and `research/MIGRATION_MATRIX.md` for the condensed per-
 operation status table. Everything below that is preserved for history;
 the superseded-claims note this paragraph used to carry (about the
@@ -1066,3 +1066,65 @@ status, including this round's row: `research/MIGRATION_MATRIX.md`.
   Three operations are now ported and benchmarked out of a large engine
   — see `MIGRATION_MATRIX.md` for exactly which ones and the honest
   caveat on key switching's weaker correctness evidence.
+
+## GOD PROMPT "CKKS RUST + CUDA PHASE 4": fourth operation (EvalMult) ported by COMPOSING the prior two, a real test-side domain bug caught and fixed, wider benchmark noise honestly flagged
+
+Full detail: `EXPERIMENT_LEDGER.md` entry #37. Condensed per-operation
+status: `research/MIGRATION_MATRIX.md`.
+
+- Ported ciphertext-ciphertext EvalMult (tensor product + relin +
+  combine + rescale x2) as the fourth operation, by COMPOSING the
+  already-ported `KeySwitchContext` (relin backend) and `RescaleContext`
+  (the two post-relin rescale steps) rather than rebuilding either
+  algorithm — confirming the prior round's own prediction that
+  `KeySwitchContext` would be directly reusable here.
+- Their existing public APIs were host-slice-oriented; composing them
+  as-is would force pointless host round trips the real C++ pipeline
+  never pays. Added exactly two new `pub(crate)` device-pointer methods
+  (`keyswitch_device_resident`, `rescale_device_resident`), each reusing
+  100% of the existing tested kernel-launch logic — no duplication.
+- Two new kernels (`LaunchTensor`/`LaunchCombine`, `kernels/tensor.cu`)
+  confirmed self-contained the same way every prior kernel was; no new
+  host `.cpp` files needed.
+- **A real bug was caught in this round's OWN test, not in the
+  production code, before it was trusted**: the first draft generated
+  synthetic eval-domain-looking data and applied rescale's
+  coefficient-domain-only "center the dropped tower" identity directly
+  to it — the exact same domain-confusion bug CLASS as the rescale
+  benchmark's own incident in an earlier round (entry #35), independently
+  rediscovered here. Root-caused by cross-checking every intermediate
+  stage (all matched before rescale) and by confirming the GPU path's
+  own `rescale_device_resident` agreed with the already-proven `rescale`
+  on the exact same data — together isolating the bug to the test's
+  reference formula. Fixed by generating genuinely coefficient-domain
+  inputs and NTT/INTT-ing around the rescale identity, mirroring
+  `rescale`'s own established methodology.
+- 3 new differential tests (genuinely independent reference this time,
+  not sharing the earlier draft's bug), plus 2 new permanent regression
+  tests added to `rescale.rs` while isolating the bug. Full suite 20/20
+  passing, debug and release.
+- **Benchmark**: 3 independent A/B comparisons, alternating which
+  language ran first. Every tier's ranges overlap substantially with no
+  consistent winner — statistically indistinguishable, same conclusion
+  as every prior operation — but with notably WIDER run-to-run variance
+  than the three simpler single-kernel-chain operations, honestly
+  flagged (plausibly more kernel launches per call amplifying
+  host-dispatch/thermal noise, not independently isolated as the cause).
+- **Memory measured, not guessed**: peak 108MiB across 50,000 repeated
+  calls, zero growth. This session's idle floor was 22MiB (not entry
+  #36's 0MiB — a session-level WSL2/driver-reporting difference, not a
+  regression, confirmed via `nvidia-smi --query-compute-apps` showing no
+  attached process). EvalMult's own delta above its floor (86MiB)
+  closely matches key-switching's historical delta (85MiB) — same
+  conclusion as entry #36: no cross-context table-sharing work is
+  justified by this measurement.
+- GPU memory confirmed fully freed after every run. Host free RAM
+  checked via PowerShell throughout (1.64-2.77GB free) — well under the
+  6GB full-bootstrap gate, correctly not invoked since this round's
+  entire workload stayed at n=1024.
+- **Explicitly NOT claimed**: production integration, resolution of
+  `test_polyeval`'s multi-level noise question (untouched), a real
+  encode/encrypt/decrypt round trip (left as an explicit follow-up, not
+  attempted), or any security re-certification. Four operations are now
+  ported and benchmarked out of a large engine — see
+  `MIGRATION_MATRIX.md` for exactly which ones.

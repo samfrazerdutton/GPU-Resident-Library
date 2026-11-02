@@ -21,6 +21,14 @@
 //!   rather than reconstructed field-by-field in Rust. See
 //!   [`keyswitch::KeySwitchContext`] and its module doc comment for why,
 //!   and for the honest limits of this module's correctness evidence.
+//! - [`evalmult`]: the fourth ported operation -- ciphertext-ciphertext
+//!   EvalMult (tensor product + relinearization + rescale). Composes
+//!   [`keyswitch::KeySwitchContext`] (as the relinearization backend) and
+//!   [`rescale::RescaleContext`] (for the two post-relin rescale steps)
+//!   rather than re-deriving either algorithm -- see
+//!   [`evalmult::EvalMultContext`]'s module doc comment for exactly how,
+//!   and why their existing host-slice-oriented public APIs needed a
+//!   small, explicit device-pointer adaptation first.
 //!
 //! `ntt` and `rescale` follow an IDENTICAL pattern: a context struct built
 //! once via `::new` that owns every reusable, input-independent resource
@@ -32,7 +40,11 @@
 //! key-generation pipeline instead of Rust-side reconstruction -- see
 //! `ntt`'s module doc comment for why the split exists at all, and
 //! `keyswitch`'s for why ITS setup step could not be narrowed the same way
-//! `ntt`'s and `rescale`'s were.
+//! `ntt`'s and `rescale`'s were. `evalmult` follows the same split again,
+//! one level up: its setup step builds one `KeySwitchContext` and one
+//! `RescaleContext`, its hot path chains their (new, device-resident)
+//! internals with two new kernels (`LaunchTensor`/`LaunchCombine`) on one
+//! stream.
 //!
 //! No cryptographic algorithm is reimplemented in Rust here. Where a
 //! computation is genuine, non-trivial number theory (primitive-root
@@ -45,11 +57,13 @@
 //! independently in Rust so the two implementations cannot share a
 //! transcription bug and can be cross-checked.
 
+pub mod evalmult;
 pub mod keyswitch;
 pub mod ntt;
 pub mod rescale;
 mod util;
 
+pub use evalmult::EvalMultContext;
 pub use keyswitch::KeySwitchContext;
 pub use ntt::{cold_start_cost_probe, native_root, ntt_roundtrip, NttContext};
 pub use rescale::{cold_start_cost_probe as rescale_cold_start_cost_probe, native_rescale_consts, RescaleContext};

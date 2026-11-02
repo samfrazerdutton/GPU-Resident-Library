@@ -123,6 +123,10 @@ fn main() {
         compile_cuda(&root.join("kernels/basis_convert.cu"), &out_dir, &include_dir),
         compile_cuda(&root.join("kernels/ks_fastcore.cu"), &out_dir, &include_dir),
         compile_cuda(&root.join("kernels/moddown.cu"), &out_dir, &include_dir),
+        // EvalMult's two new kernels (tensor product + relin-combine).
+        // Confirmed self-contained the same way (one inline `mulmod64`
+        // device helper, defined and used in this one file).
+        compile_cuda(&root.join("kernels/tensor.cu"), &out_dir, &include_dir),
     ];
 
     // --- Host-only helpers: plain g++. src/params.cpp defines
