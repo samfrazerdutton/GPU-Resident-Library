@@ -464,13 +464,29 @@ mod tests {
     use super::*;
     use rand::{Rng, SeedableRng};
 
-    // Same configuration as keyswitch::tests -- a known-working native
-    // parameter set, so the relinearization eval key's own correctness
-    // evidence (entry #36) transfers directly to this module's tests.
+    // GOD PROMPT "CKKS PHASE 9": NUM_PART was 2 (alpha=4) until this round.
+    // Entry #42 root-caused the real-encrypted-EvalMult blocker to THIS
+    // choice, not to SIZE_P or any key-switch code: with NUM_PART=2, each
+    // digit covers alpha=4 Q towers (Q_part_max ~210 bits: one 60-bit +
+    // three 50-bit towers), while P = 2*60-bit = 120 bits -- violating the
+    // Hybrid key-switch's REQUIRED P >= Q_part_max correctness condition
+    // (P must be at least as large as the largest digit's own modulus
+    // product, a standard RNS-CKKS requirement, independent of this
+    // project's own code). That deficit (-90 bits) makes the decompose
+    // step's bounded approximation error, once multiplied through the
+    // gadget/eval-key structure and divided by P in ModDown, land near
+    // q/2 instead of negligible -- the "~50% of q, looks random" signature
+    // every earlier round saw. NUM_PART=4 (alpha=2, Q_part_max ~110 bits)
+    // restores a +10-bit margin over P -- confirmed via
+    // tests/test_ks_pq_ratio_sweep.cpp to drop the relin-identity residual
+    // from ~50% of q to ~6e-12% of q, with SIZE_Q, SIZE_P, n, and the
+    // secret distribution (h=64) all UNCHANGED -- this is a digit-grouping
+    // choice with no security-parameter impact (log2(QP) and n are
+    // unaffected; see research/EXPERIMENT_LEDGER.md entry #42).
     const N: u32 = 1024;
     const SIZE_Q: u32 = 8;
     const SIZE_P: u32 = 2;
-    const NUM_PART: u32 = 2;
+    const NUM_PART: u32 = 4;
 
     fn new_ctx(seed: u64) -> EvalMultContext {
         let n = RingDimension::new(N).unwrap();
@@ -1280,7 +1296,17 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "BLOCKED: entry #40's 'evalkeygen_host is broken' diagnosis was WRONG -- it was entry #40's OWN test (eval_key_outside_own_part_range_is_near_zero) that had a sign bug (literally used the source comment's claimed 'bv-av*s', when the true relation is 'bv+av*s'). Phase 8 (entry #41) proved evalkeygen_host correct via a from-scratch isolated C++ test (tests/test_evalkeygen_isolated.cpp, CHECKS 1-3 all pass) and pinpointed the REAL remaining defect to compute_keyswitch_constants/keyswitch_core_resident's own NATIVE decompose+accumulate+moddown reconstruction (src/ks_constants.cpp / src/keyswitch.cpp) -- never independently validated before (entry #39 only validated this algorithm given OpenFHE-SOURCED constants, never its own). See research/EXPERIMENT_LEDGER.md entry #41 and research/NEXT_SESSION.md."]
+    // GOD PROMPT "CKKS PHASE 9": un-ignored. Entry #41's "sizeP=2-specific
+    // key-switch reconstruction defect" was itself superseded by entry #42:
+    // the real cause was NUM_PART=2 (alpha=4) giving each digit a modulus
+    // product (~210 bits) LARGER than P (2*60-bit=120 bits), violating the
+    // Hybrid key-switch's P>=Q_part_max requirement -- not a code defect in
+    // ks_constants.cpp/keyswitch.cpp/basis_convert.cu/moddown.cu, all of
+    // which were independently proven correct in isolation this round
+    // (tests/test_moddown_crt_basis_isolated.cpp, tests/test_decompose_crt_
+    // basis_isolated.cpp, tests/test_moddown_combine_isolated.cpp). Raising
+    // NUM_PART to 4 (alpha=2, Q_part_max ~110 bits, comfortably under P)
+    // fixes it with SIZE_Q/SIZE_P/n/h unchanged. See entry #42.
     fn control_a_relin_combine_matches_raw_tensor_within_keyswitch_noise_test() {
         let ctx = new_ctx(1234);
         let slots_a = [1.0, 2.0, 3.0, 4.0];
@@ -1303,7 +1329,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "BLOCKED: see control_a_relin_combine_matches_raw_tensor_within_keyswitch_noise_test's #[ignore] reason and entry #41 -- this confirms numPart=1 does not change the result (rules out multi-part digit decomposition specifically, pointing at the shared ModDown/complement-basis machinery)"]
+    #[ignore = "EXPECTED TO FAIL, kept as a documented negative case (see entry #42): num_part=1 means alpha=size_q=8, so the single part's own modulus product (Q_part ~410 bits: one 60-bit + seven 50-bit towers) vastly exceeds SIZE_P=2's P (~120 bits), badly violating the Hybrid key-switch's P>=Q_part_max requirement. This is NOT evidence that digit decomposition is irrelevant -- it is the opposite: entry #42 found splitting Q into MORE, SMALLER parts (not fewer) is what keeps each part's own modulus under P. Do not un-ignore this test without also increasing SIZE_P enough to cover Q_part_max at num_part=1 (~410 bits), which would change security-relevant parameters and is out of scope here."]
     fn control_a_relin_combine_matches_raw_tensor_num_part_1_test() {
         let ctx = new_ctx_num_part(1234, 1);
         let slots_a = [1.0, 2.0, 3.0, 4.0];
@@ -1441,7 +1467,9 @@ mod tests {
     // This directly and meaningfully exercises digit decomposition and
     // the eval key's own P*s^2 term.
     #[test]
-    #[ignore = "BLOCKED: see control_a_relin_combine_matches_raw_tensor_within_keyswitch_noise_test's #[ignore] reason and entry #41 -- confirms the defect reproduces even for the simplest possible CRT-consistent (non-ciphertext) input, and was independently reproduced from scratch in isolated C++ (tests/test_evalkeygen_isolated.cpp CHECK 4), ruling out any Rust/FFI-side cause"]
+    // GOD PROMPT "CKKS PHASE 9": un-ignored, see entry #42 -- NUM_PART=4
+    // fixes the P>=Q_part_max violation this test (at the old NUM_PART=2)
+    // was reproducing.
     fn keyswitch_reference_on_constant_crt_consistent_input() {
         let ctx = new_ctx(1234);
         let n = ctx.ring_dimension().get() as usize;
@@ -1525,7 +1553,7 @@ mod tests {
     // EXPERIMENT_LEDGER.md entry #41.
     #[test]
     fn eval_key_outside_own_part_range_is_near_zero() {
-        let ctx = new_ctx(1234); // NUM_PART=2, alpha=4, SIZE_Q=8
+        let ctx = new_ctx(1234); // NUM_PART=4, alpha=2, SIZE_Q=8 (see entry #42)
         let n = ctx.ring_dimension().get() as usize;
         let alpha = ctx.ks.alpha();
         let eval_key_towers = ctx.ks.eval_key_towers();
@@ -1703,7 +1731,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "BLOCKED: full multiply_relin_rescale->decrypt->decode still fails with a genuine decode-level error. Entry #39 proved the relin IDENTITY itself holds (once checked in the right NTT-vs-coefficient domain); entry #40's 'evalkeygen_host is broken' diagnosis was then shown WRONG by entry #41 (a sign bug in entry #40's own test) -- entry #41 pinpoints the actual defect to compute_keyswitch_constants/keyswitch_core_resident's own NATIVE decompose+accumulate+moddown reconstruction (src/ks_constants.cpp / src/keyswitch.cpp), independently reproduced from scratch in isolated C++ (tests/test_evalkeygen_isolated.cpp). See research/EXPERIMENT_LEDGER.md entry #41 and research/NEXT_SESSION.md's READ THIS FIRST section for the next concrete experiment."]
+    // GOD PROMPT "CKKS PHASE 9": un-ignored. The full round trip was
+    // blocked by NUM_PART=2 violating the Hybrid key-switch's
+    // P>=Q_part_max requirement (entry #42), not by any defect in
+    // evalkeygen_host (disproven, entry #41) or in the key-switch
+    // reconstruction code itself (independently proven correct in
+    // isolation this round). NUM_PART=4 fixes it.
     fn real_encrypted_evalmult_matches_expected_product() {
         let ctx = new_ctx(1234);
         let slots_a = [1.0, 2.0, 3.0, 4.0];
@@ -1725,7 +1758,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "BLOCKED: see real_encrypted_evalmult_matches_expected_product's #[ignore] reason and entry #41"]
+    // GOD PROMPT "CKKS PHASE 9": un-ignored, see entry #42.
     fn real_encrypted_evalmult_zero_boundary() {
         // Multiplying by an all-zero ciphertext must decode to all-zero,
         // a deterministic boundary case distinct from random data.
@@ -1739,7 +1772,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "BLOCKED: see real_encrypted_evalmult_matches_expected_product's #[ignore] reason and entry #41"]
+    // GOD PROMPT "CKKS PHASE 9": un-ignored, see entry #42.
     fn real_encrypted_evalmult_negative_and_fractional_values() {
         let ctx = new_ctx(4242);
         let slots_a = [-1.5, 2.25, -3.0, 0.5];
@@ -1751,7 +1784,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "BLOCKED: see real_encrypted_evalmult_matches_expected_product's #[ignore] reason and entry #41"]
+    // GOD PROMPT "CKKS PHASE 9": un-ignored, see entry #42.
     fn real_encrypted_evalmult_repeated_calls_reused_context() {
         // Several independent real round trips on the SAME context,
         // different plaintexts/seeds each time -- proves the reused

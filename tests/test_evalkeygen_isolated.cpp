@@ -147,19 +147,25 @@ int main() {
     // specific prime/bit-width) rather than a general algorithmic one.
     const uint32_t sizeQl = 8, sizeP = 2, sizeQlP = sizeQl + sizeP;
     const uint32_t numPart = 2, alpha = 4; // part 0: [0,4), part 1: [4,8) -- matches the real Rust fixture's exact configuration (N=1024/SIZE_Q=8/SIZE_P=2/NUM_PART=2).
-    // CONFIG-SPECIFICITY, established this round (see this file's own
-    // history / research/EXPERIMENT_LEDGER.md entry #41): CHECK 4 below
-    // PASSES at sizeQl=5/sizeP=3 (matching tests/test_ks_constants.cpp's
-    // proven-bit-exact-vs-OpenFHE config) and at sizeQl=4/sizeP=1, but
-    // FAILS (~50% of q) at sizeQl=5/sizeP=2 AND at this file's sizeQl=8/
-    // sizeP=2 -- i.e. sizeP=2 SPECIFICALLY triggers the defect,
-    // independent of sizeQl. numPart=1 (single part) was also verified
-    // to fail identically, ruling out multi-part digit decomposition.
-    // The exact line within compute_keyswitch_constants/keyswitch_core_
-    // resident/kernels/basis_convert.cu/moddown.cu responsible for the
-    // sizeP=2-specific failure was NOT pinpointed this round, despite
-    // verifying K.pInvModq/K.pHatInv individually satisfy their defining
-    // modular-inverse relations correctly even at sizeP=2.
+    // CONFIG-SPECIFICITY, established in Phase 8 (research/EXPERIMENT_
+    // LEDGER.md entry #41) and SUPERSEDED in Phase 9 (entry #42): CHECK 4
+    // below was originally observed to PASS at sizeQl=5/sizeP=3 and FAIL
+    // at sizeQl=5/sizeP=2 and sizeQl=8/sizeP=2, which entry #41 framed as
+    // "sizeP=2 specifically triggers the defect." Phase 9 found this was
+    // an INCOMPLETE parameter sweep, not a real "sizeP=2" property: the
+    // numPart=2/alpha=4 configuration here gives each digit a modulus
+    // product (Q_part, ~210 bits for sizeQl=8) that must stay UNDER P's
+    // own bit-length for the Hybrid key-switch's approximation to be
+    // small (a standard RNS-CKKS requirement, not specific to this
+    // codebase) -- sizeP=3 (P~180 bits) happens to satisfy this for
+    // sizeQl=5/8's Q_part (~160/210 bits, net positive-ish margin),
+    // sizeP=1/2 (P~60/120 bits) do not, and NEITHER does sizeP=3 at
+    // numPart=1 (Q_part~410 bits, since numPart=1 was ALSO never
+    // re-checked at sizeP=1/3 in Phase 8 -- it fails at every sizeP in
+    // this file's range, not just sizeP=2). See entry #42 for the full
+    // parameter-ratio sweep (tests/test_ks_pq_ratio_sweep.cpp) that
+    // establishes this precisely and the production fix it motivated
+    // (raising the real Rust fixture's NUM_PART from 2 to 4).
 
     std::vector<uint64_t> modQ, modP;
     gpufhe::native_primes(modQ, 1, 60, n, {});

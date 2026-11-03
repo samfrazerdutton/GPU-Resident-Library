@@ -3,16 +3,17 @@
 ## Current commit
 
 Check `git log -3` on resume. As of this writing, HEAD is a new commit
-on top of entry #40's commit (the GOD PROMPT "CKKS PHASE 8" round:
-entry #40's "evalkeygen_host is broken" diagnosis is DISPROVEN -- it
-was entry #40's OWN test that had a sign bug. `evalkeygen_host`/
-`evalkeygen_host_sold`/`keygen_host` are now proven correct by four
-independent routes. The real, still-unresolved defect is pinpointed to
-`compute_keyswitch_constants`+`keyswitch_core_resident`'s own native
-reconstruction, triggered specifically by `sizeP=2` -- the exact
-P-tower count the real Rust fixture uses. See `EXPERIMENT_LEDGER.md`
-entry #41 for the full evidence chain). Confirm push status -- push
-again if `git status` shows ahead of origin.
+on top of entry #41's commit `1f1cf93` (the GOD PROMPT "CKKS PHASE 9"
+round: entry #41's "sizeP=2-specific key-switch reconstruction defect"
+is SUPERSEDED -- `sizeP=2` was never the trigger. The real cause was
+the real Rust fixture's `NUM_PART=2` choosing a digit size (`Q_part`)
+larger than the auxiliary modulus `P`, violating the Hybrid
+key-switch's standard `P>=Q_part_max` requirement. Raising `NUM_PART`
+to 4 fixed it. **The real encrypted EvalMult round trip now PASSES
+end-to-end** -- the first time since this investigation began (Phase
+5). See `EXPERIMENT_LEDGER.md` entry #42 for the full evidence chain).
+Confirm push status -- push again if `git status` shows ahead of
+origin.
 
 **Reminder, confirmed the hard way in an earlier round**: this machine
 has (at least) two SEPARATE git clones of this GitHub repo -- the WSL
@@ -23,104 +24,86 @@ an entirely unrelated commit history (raw CUDA-kernel-optimization
 work) and untracked, stale copies of `rust/`/`research/` -- never run
 `git status`/`log`/commit decisions against it for this work.
 
-## READ THIS FIRST if resuming into EvalMult/relin work: `evalkeygen_host` is PROVEN CORRECT -- the real defect is `sizeP=2`-specific, inside compute_keyswitch_constants/keyswitch_core_resident's own reconstruction
+## READ THIS FIRST if resuming into EvalMult/relin work: the real encrypted EvalMult round trip PASSES. The blocker was a parameter choice, not a code defect, and it is FIXED.
 
-**Entry #40's diagnosis ("evalkeygen_host is broken") was WRONG and is
-now DISPROVEN.** It was entry #40's own test
-(`eval_key_outside_own_part_range_is_near_zero`) that had a sign bug:
-it computed `bv0[idx]-av_s`, literally implementing `src/evalkeygen.cpp`'s
-own doc comment, which itself claims the WRONG sign. **The true
-relation is `bv+av*s ~= P*s2` (in a part's own range) / `~=0` (outside
-it) -- PLUS, not MINUS.** Derivation: `keygen_host`
-(`src/keygen.cpp:105`) computes `b=ns*e-a*s`, so `b+a*s=ns*e` (small);
-substituting into `evalkeygen_host_sold`'s `av=pkA*u+ns*e1`,
-`bv=pkB*u+ns*e0[+Ps2]` gives `bv+av*s = u*ns*e_keygen +
-ns*(e0+e1*s) + Ps2 ~= Ps2`. **Do not re-doubt `evalkeygen_host`,
-`evalkeygen_host_sold`, or `keygen_host` without new evidence** -- all
-three are now proven correct by FOUR independent routes (see entry
-#41): a from-scratch isolated C++ test covering Q AND P towers
-(`tests/test_evalkeygen_isolated.cpp`, CHECKS 1-3, worst ~3.5e-11% of
-q); the sign-corrected Rust test (worst 3.16e-11% of q); and two
-PRE-EXISTING, previously-overlooked July-era tests
-(`tests/test_evalkeygen.cpp`, `tests/test_ks_constants.cpp`), both of
-which already used the correct "+" convention and already passed
-when rebuilt.
+**The multi-phase EvalMult investigation (Phases 5-9) is RESOLVED.**
+Every prior round's "defect" hypothesis (entry #30/#38's relin
+identity, entry #40's `evalkeygen_host`, entry #41's `sizeP=2`-specific
+key-switch reconstruction) is now understood as either a test
+methodology bug or an incomplete parameter sweep -- NOT a defect in
+`src/` or `kernels/`. The real, final cause: the test fixture
+(`rust/crates/ckks-cuda/src/evalmult.rs`'s `new_ctx`,
+`SIZE_Q=8,SIZE_P=2,NUM_PART=2`) chose `NUM_PART=2` (alpha=4), giving
+each key-switch digit a modulus product (`Q_part`, ~210 bits: one
+60-bit + three 50-bit Q towers) LARGER than the auxiliary modulus `P`
+(2*60-bit = ~120 bits) -- violating the Hybrid key-switch's standard
+`P >= Q_part_max` correctness requirement (the auxiliary modulus must
+be at least as large as the largest digit's own modulus product; a
+property of RNS-CKKS Hybrid key-switching itself, not specific to this
+codebase). **Fix: raised `NUM_PART` from 2 to 4** (alpha=2, `Q_part_max`
+drops to ~110 bits, a +10-bit margin over `P`) -- `SIZE_Q`, `SIZE_P`,
+`n`, and the secret distribution (`h=64`) are ALL UNCHANGED; this is a
+digit-grouping choice with zero security-parameter impact. **Result:
+`real_encrypted_evalmult_matches_expected_product` passes with max abs
+error `2.5896e-11` (tolerance `1e-6`)**; all sibling tests pass too.
+Full Rust suite: 34 passed, 0 failed, 1 ignored (down from 7 ignored).
 
-**The real, still-unresolved defect**: CHECK 4 of
-`tests/test_evalkeygen_isolated.cpp` runs the REAL
-`compute_keyswitch_constants`+`evalkeygen_host`+`keyswitch_core_resident`
-full reconstruction (decompose, fast-core accumulate, moddown) on a
-constant CRT-consistent input, at the exact real Rust fixture's
-configuration (`n=1024, sizeQl=8, sizeP=2, numPart=2, alpha=4` --
-`rust/crates/ckks-cuda/src/evalmult.rs`'s `new_ctx`). **It FAILS at
-~50% of q across all 8 towers.** Systematically varying the
-configuration isolated the trigger precisely:
-- `sizeP=2` -> FAILS (both at `sizeQl=8` and `sizeQl=5`).
-- `sizeP=3` -> PASSES cleanly (~1e-11% of q), at both `sizeQl=8` and
-  `sizeQl=5` -- **`sizeQl` is NOT the variable.**
-- `numPart=1` -> STILL FAILS at `sizeP=2` -- **digit
-  decomposition/multi-part effects are NOT the cause.**
-- `K.pInvModq[i]*(P mod q_i)==1 mod q_i` and
-  `K.pHatInv[j]*((P/p_j) mod p_j)==1 mod p_j` both verified to hold
-  EXACTLY even at `sizeP=2` -- these specific modular-inverse
-  CONSTANTS are individually correct; their downstream USE inside
-  `keyswitch_core_resident`'s moddown step is NOT yet cleared.
-- An unexplained asymmetry: tower 0 (the 60-bit prime) shows only
-  0.096% of q; towers 1-7 (50-bit primes) show ~49.94-50.00%. Not yet
-  understood, may be informative.
+**Decisive evidence, in case this needs re-deriving**: `tests/
+test_ks_pq_ratio_sweep.cpp` holds `sizeP=2` FIXED and sweeps ONLY
+`numPart` -- `numPart=1,2,3` (deficit -290b/-90b/-40b) all FAIL ~50% of
+q; `numPart=4,8` (surplus +10b/+60b) both PASS ~6e-12% of q. The
+failure flips exactly when `P - Q_part_max` crosses zero, with `sizeP`
+never changing -- this is what overturned entry #41's framing.
 
-**This is exactly the configuration the real Rust fixture uses** --
-explaining why the real encrypted-EvalMult round trip has been
-blocked all along, by a cause entirely distinct from entry #40's
-eval-key diagnosis.
+**Do not re-doubt, without new evidence**:
+- `evalkeygen_host`/`evalkeygen_host_sold`/`keygen_host` (proven
+  correct, entry #41, four independent routes).
+- `compute_keyswitch_constants`'s ModDown family (`pHatInv`/
+  `pHatModq`/`mdBMu*`/`pInvModq`) and decompose family (`partQHatInv`/
+  `partQHatModp`/`partComplMod`/`partBMu*`) -- BOTH independently
+  proven correct at every `sizeP` in {1,2,3} via `tests/
+  test_moddown_crt_basis_isolated.cpp` and `tests/
+  test_decompose_crt_basis_isolated.cpp` (entry #42), using CPU
+  references independent of the production algorithm.
+- `LaunchApproxSwitchCRTBasis`, `LaunchModDownCombine`, and the full
+  ModDown chain (INTT->basis-convert->NTT->combine) at real n=1024
+  scale -- proven correct via `tests/test_moddown_combine_isolated.cpp`
+  (entry #42).
+- `keyswitch_core_resident`'s decompose (STAGE 2) and accumulate
+  (STAGE 3a) steps -- proven EXACT (zero tolerance) across the full
+  `sizeQl x sizeP x numPart` matrix via `tests/
+  test_keyswitch_stage_trace.cpp` (entry #42); the ONLY thing that
+  varies with the P/Q_part ratio is the final relin identity (STAGE
+  3b's accumulated noise), never decompose or accumulate correctness.
 
-**A methodology trap, already hit once this round -- do not repeat
-it**: `LaunchApproxSwitchCRTBasis` is an APPROXIMATE basis conversion
-BY DESIGN (it reconstructs `x+k*P` for some small bounded `k`, not `x`
-exactly). A naive hand-reconstruction test expecting EXACT equality
-from this function ALONE (without the surrounding
-`LaunchModDownCombine` step, which is specifically designed to cancel
-the bounded `k*P` term by dividing by `P`) will show a spurious,
-exactly-explainable-by-`k*P` "failure" that is not a real defect. This
-was tried, understood, and removed from the committed test this
-round -- do not re-add it as evidence.
+**If a FUTURE round picks a new `SIZE_Q`/`SIZE_P`/`NUM_PART`
+combination and sees the same "~50% of q" signature again**: compute
+`Q_part_max = max over parts of (sum of bit-lengths of that part's own
+Q towers)` and compare against `P`'s total bit length
+(`sum of bit-lengths of all P towers`) BEFORE suspecting a code
+defect. If `P < Q_part_max`, that is sufficient explanation by itself
+-- raise `NUM_PART` (cheapest, no security impact) or `SIZE_P`
+(changes `log2(QP)`, a security-relevant parameter, needs
+re-validating `research/SECURITY_ASSESSMENT.md`).
 
-**Hypotheses tested and REFUTED this round -- do not re-try without new
-evidence**:
-- `evalkeygen_host`/`evalkeygen_host_sold` having any defect (entry
-  #40's entire diagnosis) -- see above, disproven by four routes.
-- Digit decomposition / `numPart` as the `sizeP=2` trigger (1 and 2
-  both fail identically).
-- `K.pInvModq`/`K.pHatInv`'s own modular-inverse correctness (both
-  individually verified exact even at `sizeP=2`).
-- The naive CRT-reconstruction-exactness framing (methodology error,
-  not a defect -- see above).
-
-**Hypotheses NOT yet tested -- the recommended starting points**:
-- `K.pHatModq`'s correct USE inside `keyswitch_core_resident`'s
-  `moddown()` lambda (`src/keyswitch.cpp`), specifically for a
-  2-element source (P) basis -- instrument with bounded per-coefficient
-  printouts (ONE or TWO coefficients, not secret material in bulk) and
-  hand-derive the expected value at `sizeP=2`.
-- `LaunchApproxSwitchCRTBasis`/`approx_switch_kernel`
-  (`kernels/basis_convert.cu`)'s Barrett reduction
-  (`barrett_u128_mod_u64`) or Shoup multiplication for small source
-  counts -- test in complete isolation (no surrounding ModDown) with a
-  KNOWN, simple input across source sizes 1/2/3 to find exactly where
-  `sizeP=2` diverges from the passing `sizeP=1`/`sizeP=3` cases.
-- `LaunchModDownCombine`'s own combine arithmetic
-  (`kernels/moddown.cu`).
-- The unexplained tower-0-vs-towers-1-7 asymmetry (0.096% vs ~50%) --
-  may point directly at the mechanism once understood.
-
-**Secondary, not yet resolved either**: the full
-`EvalMultContext::multiply_relin_rescale` -> `codec::decrypt` ->
-`codec::decode` round trip (`real_encrypted_evalmult_matches_expected_
-product` and siblings) still fails -- EXPECTED, since it depends on
-the `sizeP=2` reconstruction defect above being fixed. Do not
-investigate rescale/composition further until that defect is
-resolved and `control_a_relin_combine_matches_raw_tensor_within_
-keyswitch_noise_test` passes.
+**Not addressed, deliberately out of scope this round**:
+- `control_a_relin_combine_matches_raw_tensor_num_part_1_test`
+  (forces `numPart=1`) correctly remains `#[ignore]`d -- `numPart=1`
+  at `SIZE_P=2` genuinely violates `P>=Q_part_max` (`Q_part=410b` vs
+  `P=120b`) and would need a much larger `SIZE_P` to fix, which is a
+  security-relevant change.
+- `keyswitch.rs`'s own test fixture (`src/keyswitch.rs`) uses the
+  IDENTICAL `SIZE_Q=8,SIZE_P=2,NUM_PART=2` combo and was never updated
+  -- its tests only check `keyswitch_device_resident` against
+  `keyswitch_reference` (self-consistency between two implementations
+  of the same formula), which is unaffected by the P/Q_part ratio, so
+  nothing there is currently broken. Flagged as a dormant instance of
+  the same pattern for anyone adding a decrypt-based check there later.
+- Whether `NUM_PART=4` is the BEST (fastest) choice for this fixture
+  was not measured -- only that it is correct. Performance work can
+  resume on this operation now that correctness is established.
+- `test_polyeval`'s own, separate multi-level noise question (entry
+  #26/#29/#30, never resolved) is untouched by this round.
 
 ## `-G` build-flag bug: CLOSED for the four originally-flagged benchmarks; one remaining sweep still open
 
@@ -159,7 +142,7 @@ re-derive which claims are settled vs. still open. Not done this round
 (time budget) — the four benchmarks `NEXT_SESSION.md` explicitly named
 were the priority, and that list is now complete.
 
-## Rust evolution: FOUR operations ported, real encode/encrypt/decrypt proven, the real EvalMult round trip BLOCKED (see above)
+## Rust evolution: FOUR operations ported, real encode/encrypt/decrypt proven, the real EvalMult round trip NOW PASSES (entry #42, see above)
 
 `rust/` workspace (`ckks-core`, `ckks-cuda`) builds and all 20 tests
 pass (4 `ckks-core` + 3 NTT + 6 rescale [4 original + 2 new device-
@@ -201,21 +184,14 @@ time; `rescale::tests` and `evalmult::tests` both now contain worked
 examples of the correct pattern.
 
 **Not yet done, in priority order**:
-1. **Resolve (or make real further progress on) the relin algebraic-
-   identity blocker** -- see the "READ THIS FIRST" section above for
-   exactly what's been tried and the specific next experiment (link
-   OpenFHE briefly, real `cc->EvalMult`+`cc->Decrypt`, then read
-   `EvalMultCore`'s actual combine-step source). This is now the
-   single highest-value task: it blocks a real, decrypt-based
-   correctness claim for BOTH key switching and EvalMult, not just the
-   round-trip test this round attempted. Once resolved, re-enable the
-   4 `#[ignore]`d tests in `evalmult.rs` (`real_encrypted_evalmult_*`)
-   by removing their `#[ignore]` attributes and confirm they pass --
-   do not write NEW tests for this, the infrastructure (`codec.rs`,
-   `real_evalmult_round_trip` helper, derived tolerances) already
-   exists and is correct; only the relin step's output needs fixing
-   (or the comparison formula needs correcting, depending which the
-   OpenFHE experiment reveals).
+1. **RESOLVED (entry #42)**: the relin algebraic-identity blocker is
+   fixed (`NUM_PART` 2->4 in `evalmult.rs`'s `new_ctx`); all 4
+   `real_encrypted_evalmult_*` tests are un-ignored and passing. The
+   NEW highest-value task is item 2 below (a fifth operation), OR
+   revisiting `keyswitch.rs`'s own dormant `NUM_PART=2` fixture (not
+   currently broken, but one decrypt-based test away from reproducing
+   this exact pattern) if a stronger key-switching correctness claim
+   is ever needed there.
 2. Port a FIFTH operation. The natural candidates, in rough order of
    how much of the key-switch/rescale/evalmult machinery they could
    reuse vs. how much is genuinely new: rotation (`rotate_ct_resident`

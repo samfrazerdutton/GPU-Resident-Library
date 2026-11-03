@@ -1446,3 +1446,91 @@ rewritten this round).
   depend on fixing this reconstruction defect, not `evalkeygen_host`);
   resolution of `test_polyeval`'s SEPARATE multi-level noise question
   (untouched).
+
+## GOD PROMPT "CKKS PHASE 9": the real encrypted EvalMult round trip PASSES end-to-end for the first time (since Phase 5) — entry #41's "sizeP=2-specific defect" framing is SUPERSEDED; the real cause was a test-fixture parameter choice (NUM_PART=2 violating the Hybrid key-switch's P>=Q_part_max requirement), not a code defect, and it is fixed
+
+Full detail: `EXPERIMENT_LEDGER.md` entry #42. `NEXT_SESSION.md`'s
+"READ THIS FIRST" section is entirely rewritten to reflect this
+resolution.
+
+- **The core finding**: `sizeP=2` was never the trigger. Holding
+  `sizeP=2` FIXED and sweeping ONLY `numPart` (`tests/
+  test_ks_pq_ratio_sweep.cpp`, calling the real, unmodified
+  `keyswitch_core_resident` directly) shows the relin-identity
+  residual flips from ~50% of q to ~6e-12% of q EXACTLY when
+  `P - Q_part_max` (the auxiliary modulus's bit length minus the
+  largest key-switch digit's own modulus-product bit length) crosses
+  from negative to positive: `numPart=1,2,3` (deficits
+  -290/-90/-40 bits) all FAIL; `numPart=4,8` (surpluses +10/+60 bits)
+  both PASS cleanly. This is the standard Hybrid key-switch
+  correctness requirement (P must be at least as large as the largest
+  digit's own modulus product) — a property of RNS-CKKS Hybrid
+  key-switching itself, not a defect anywhere in this codebase.
+- **The evidence chain that got there**: (1) `tests/
+  test_moddown_crt_basis_isolated.cpp` — isolated `LaunchApproxSwitchCRTBasis`
+  in the exact ModDown P->Q configuration, with an INDEPENDENT CPU
+  reference deriving the expected `(V+k*P) mod q_i` relation, searching
+  for a consistent `k` across all target towers. PASSES cleanly for
+  `sizeP` in {1,2,3} at both `sizeQl=5,8`. (2) `tests/
+  test_decompose_crt_basis_isolated.cpp` — the SAME methodology
+  applied to decompose's OWN, different constant family
+  (`partQHatInv`/`partQHatModp`), never independently tested before.
+  ALSO passes cleanly at every `sizeP`. (3) `tests/
+  test_moddown_combine_isolated.cpp` — the full ModDown chain
+  (INTT->basis-convert->NTT->combine) at real n=1024 scale, fed a
+  hand-constructed input giving an EXACT zero-tolerance expected
+  output. PASSES cleanly at every `sizeP`. (4) `tests/
+  test_keyswitch_stage_trace.cpp` — instrumented the REAL end-to-end
+  pipeline (real secret, real eval key) across the full `sizeQl x
+  sizeP x numPart` matrix with THREE inline checks: decompose (exact)
+  and accumulate (exact) ALWAYS pass; only the final relin identity
+  (approximate, noise-tolerant) fails, and the failing set does NOT
+  track `sizeP` alone — `numPart=1` fails even at `sizeP=3`, which
+  entry #41's Phase 8 round never checked. (5) `tests/
+  test_ks_pq_ratio_sweep.cpp` — the decisive discriminator described
+  above.
+- **Fix applied**: `rust/crates/ckks-cuda/src/evalmult.rs`'s
+  `new_ctx`'s `NUM_PART` constant changed from `2` to `4` (alpha drops
+  4->2, `Q_part_max` drops ~210->~110 bits, a +10-bit margin over
+  `P`'s ~120 bits). `SIZE_Q`, `SIZE_P`, `n`, and the secret
+  distribution (`h=64`) are ALL UNCHANGED — this is a digit-grouping
+  choice with zero security-parameter impact (`log2(QP)` unaffected).
+- **Result**: `real_encrypted_evalmult_matches_expected_product`
+  passes with max abs error `2.5896e-11` (tolerance `1e-6`); its 3
+  siblings (`zero_boundary`, `negative_and_fractional_values`,
+  `repeated_calls_reused_context`) all pass too.
+  `control_a_relin_combine_matches_raw_tensor_within_keyswitch_noise_test`
+  and `keyswitch_reference_on_constant_crt_consistent_input` (both
+  `#[ignore]`d since entry #40) now pass, un-ignored. Full Rust suite:
+  **34 passed, 0 failed, 1 ignored** (down from 7 ignored), identical
+  in both `--release` and debug profiles.
+- **Correctly kept ignored**:
+  `control_a_relin_combine_matches_raw_tensor_num_part_1_test`
+  (forces `numPart=1`, `Q_part=410b` vs `P=120b` — a genuine, much
+  larger deficit that `NUM_PART=4` does not fix; would need a far
+  larger `SIZE_P`, a security-relevant change, out of scope).
+- **No production C++/CUDA source file changed** — every constant
+  family and kernel in `ks_constants.cpp`/`keyswitch.cpp`/
+  `basis_convert.cu`/`moddown.cu` was independently proven correct in
+  isolation this round, at every tested `sizeP`. `CMakeLists.txt`
+  gained 5 new test registrations (additive only); `tests/
+  test_evalkeygen_isolated.cpp`'s own header comment was corrected to
+  explain the now-superseded `sizeP=2` framing rather than restate it
+  as fact (its own CHECK 4, at its fixed `sizeQl=8,sizeP=2,numPart=2`,
+  still correctly and intentionally fails — now understood, not an
+  open mystery). Pre-existing OpenFHE-cross-validated tests
+  (`test_ks_constants.cpp`, `test_evalkeygen.cpp`) re-verified passing
+  (fresh rebuild, not a cached binary), confirming no regression.
+- **Not attempted**: a full CMake rebuild (real Windows host free
+  memory was 1.41GB at check time, far under the established 6GB
+  gate) — all new isolated tests verified via direct `nvcc`/`g++`
+  compilation instead, per the established pattern. No performance
+  claim is made for `NUM_PART=4` vs `NUM_PART=2` (not measured, per
+  the governing directive's explicit instruction not to claim a
+  performance improvement from correctness instrumentation).
+  `keyswitch.rs`'s own test fixture retains the identical
+  `NUM_PART=2` combo — not currently broken (its tests check only
+  self-consistency between two implementations of the same formula,
+  unaffected by the P/Q_part ratio) but flagged as a dormant instance
+  of the same pattern. `test_polyeval`'s own, separate multi-level
+  noise question remains untouched.

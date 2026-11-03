@@ -106,11 +106,32 @@ gpufhe_test(test_ks_constants tests/test_ks_constants.cpp)
 gpufhe_test(test_keygen tests/test_keygen.cpp)
 gpufhe_test(test_evalkeygen tests/test_evalkeygen.cpp)
 # GOD PROMPT "CKKS PHASE 8": fully native (OpenFHE-free) isolation of
-# evalkeygen_host/evalkeygen_host_sold + compute_keyswitch_constants +
-# keyswitch_core_resident, pinpointing that sizeP=2 specifically (not
-# sizeQl, not numPart) triggers the real-encrypted-EvalMult blocker --
-# see research/EXPERIMENT_LEDGER.md entry #41.
+# evalkeygen_host/evalkeygen_host_sold -- proved correct (entry #41).
+# NOTE: this test's own header comment describes an earlier, SUPERSEDED
+# "sizeP=2 is the trigger" framing -- entry #42 found the real cause was
+# NUM_PART=2 violating P>=Q_part_max, not sizeP's raw count. See entries
+# #41/#42 and the tests registered below.
 gpufhe_test(test_evalkeygen_isolated tests/test_evalkeygen_isolated.cpp)
+# GOD PROMPT "CKKS PHASE 9": isolate ApproxSwitchCRTBasis (both directions:
+# ModDown's P->Q and decompose's Q->complement) and the full ModDown
+# combine chain, each against an independent CPU reference -- all PASS
+# cleanly for sizeP in {1,2,3}, ruling out the basis-conversion kernel and
+# both its constant families as the real defect (entry #42).
+gpufhe_test(test_moddown_crt_basis_isolated tests/test_moddown_crt_basis_isolated.cpp)
+gpufhe_test(test_decompose_crt_basis_isolated tests/test_decompose_crt_basis_isolated.cpp)
+gpufhe_test(test_moddown_combine_isolated tests/test_moddown_combine_isolated.cpp)
+# Instruments the REAL end-to-end pipeline (real secret/eval key, real
+# decompose+accumulate+moddown) stage by stage across the full sizeQl x
+# sizeP x numPart discriminating matrix -- isolates the failure to the
+# relin-identity check specifically, never decompose or accumulate
+# (both exact, zero-tolerance, always pass), pointing at the P-vs-Q_part
+# ratio rather than a code defect (entry #42).
+gpufhe_test(test_keyswitch_stage_trace tests/test_keyswitch_stage_trace.cpp)
+# Decisive discriminator: holds sizeP=2 FIXED and sweeps ONLY numPart,
+# showing the relin-identity residual flips from ~50% of q to ~1e-11% of q
+# exactly when P - Q_part_max crosses from negative to positive -- proving
+# sizeP=2 itself was never the defect (entry #42).
+gpufhe_test(test_ks_pq_ratio_sweep tests/test_ks_pq_ratio_sweep.cpp)
 gpufhe_test(test_encdec tests/test_encdec.cpp)
 gpufhe_test(test_evalmult tests/test_evalmult.cpp)
 gpufhe_test(test_ks_resident tests/test_ks_resident.cpp)
