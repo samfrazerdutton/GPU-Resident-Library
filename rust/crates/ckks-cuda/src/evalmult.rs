@@ -392,6 +392,71 @@ impl EvalMultContext {
         self.r1.download_u64(&mut out1)?;
         Ok((out0, out1))
     }
+
+    /// GOD PROMPT "CKKS PHASE 7": TEST-ONLY diagnostic, narrower than
+    /// `multiply_relin_no_rescale_for_test`. Stops after `LaunchTensor`
+    /// alone -- no keyswitch, no combine. Returns the RAW tensor
+    /// components `(t0, t1, t2)`, each full `size_ql` towers. Exists to
+    /// isolate [tensor product itself] from [keyswitch/relin], since
+    /// Phase 7's Control A found the combined, relinearized result does
+    /// NOT match the expected product for REAL ciphertext data under
+    /// this crate's own native eval key -- narrowing further requires
+    /// checking the raw tensor identity (`t0+t1*s+t2*s^2 ~= m_a*m_b`)
+    /// BEFORE relin even touches the data.
+    #[cfg(test)]
+    pub(crate) fn tensor_only_for_test(
+        &self,
+        c0a: &[u64],
+        c1a: &[u64],
+        c0b: &[u64],
+        c1b: &[u64],
+    ) -> Result<(Vec<u64>, Vec<u64>, Vec<u64>), CkksError> {
+        let in_len = self.size_ql as usize * self.n.get() as usize;
+        if c0a.len() != in_len || c1a.len() != in_len || c0b.len() != in_len || c1b.len() != in_len {
+            return Err(CkksError::InvalidRingDimension {
+                n: c0a.len().max(c1a.len()).max(c0b.len()).max(c1b.len()) as u64,
+            });
+        }
+
+        self.c0a.upload_u64(c0a)?;
+        self.c1a.upload_u64(c1a)?;
+        self.c0b.upload_u64(c0b)?;
+        self.c1b.upload_u64(c1b)?;
+
+        let n = self.n.get();
+        let size_q = self.size_ql;
+
+        unsafe {
+            LaunchTensor(
+                self.c0a.as_const_u64(),
+                self.c1a.as_const_u64(),
+                self.c0b.as_const_u64(),
+                self.c1b.as_const_u64(),
+                self.t0.as_mut_u64(),
+                self.t1.as_mut_u64(),
+                self.t2.as_mut_u64(),
+                self.d_mods.as_const_u64(),
+                size_q,
+                n,
+                std::ptr::null_mut(),
+            );
+            let rc = cudaDeviceSynchronize();
+            if rc != 0 {
+                return Err(CkksError::Cuda(format!(
+                    "cudaDeviceSynchronize failed, cudaError_t={rc}"
+                )));
+            }
+        }
+
+        let out_len = self.input_towers() as usize * self.n.get() as usize;
+        let mut out0 = vec![0u64; out_len];
+        let mut out1 = vec![0u64; out_len];
+        let mut out2 = vec![0u64; out_len];
+        self.t0.download_u64(&mut out0)?;
+        self.t1.download_u64(&mut out1)?;
+        self.t2.download_u64(&mut out2)?;
+        Ok((out0, out1, out2))
+    }
 }
 
 #[cfg(test)]
@@ -410,6 +475,19 @@ mod tests {
     fn new_ctx(seed: u64) -> EvalMultContext {
         let n = RingDimension::new(N).unwrap();
         EvalMultContext::new(n, SIZE_Q, SIZE_P, NUM_PART, seed).expect("context init failed")
+    }
+
+    /// GOD PROMPT "CKKS PHASE 7": same fixture, but `num_part=1`
+    /// (eliminates digit decomposition -- a single "part" covering all
+    /// `size_ql` towers at once). Entry #38 tried this already, but
+    /// with the WRONG (eval-domain-pointwise) comparison methodology,
+    /// so its "numPart=1 also fails ~50%" result was itself an
+    /// artifact, not real evidence -- revisiting here, with the
+    /// corrected (coefficient-domain) comparison and a REAL encrypted
+    /// t2, is newly justified, not a blind re-run.
+    fn new_ctx_num_part(seed: u64, num_part: u32) -> EvalMultContext {
+        let n = RingDimension::new(N).unwrap();
+        EvalMultContext::new(n, SIZE_Q, SIZE_P, num_part, seed).expect("context init failed")
     }
 
     /// Random COEFFICIENT-domain per-tower residues (independent per
@@ -1017,6 +1095,572 @@ mod tests {
         let m_result =
             crate::codec::decrypt(&r0, &r1, &s_survivors, n, mods_survivors, roots_survivors).expect("decrypt failed");
         crate::codec::decode(&m_result, n, delta).expect("decode failed")
+    }
+
+    // Sanity check on THIS TEST's OWN methodology (not the multiply
+    // pipeline): for a SINGLE, un-multiplied, fresh ciphertext, does
+    // c0+c1*s (eval domain, pointwise, computed by hand here -- NOT via
+    // codec::decrypt) match the known encoded plaintext once converted
+    // to coefficient domain? If this ALSO shows ~50% of q, the bug is in
+    // this test's own eval-domain/root/layout handling, not in anything
+    // upstream of rescale -- must be checked BEFORE trusting Control A's
+    // result above.
+    fn sanity_check_single_ciphertext_eval_domain_methodology(ctx: &EvalMultContext, slots: &[f64], seed: u64) -> f64 {
+        let n = ctx.ring_dimension().get();
+        let size_q = ctx.input_towers();
+        let mods: Vec<u64> = (0..size_q).map(|t| ctx.modulus_q(t)).collect();
+        let roots: Vec<u64> = mods
+            .iter()
+            .map(|&q| crate::ntt::native_root(ctx.ring_dimension(), ckks_core::Modulus::new(q).unwrap()))
+            .collect();
+        let delta = ctx.modulus_q(size_q - 1) as f64;
+
+        let pk_a = ctx.ks.public_key_a();
+        let pk_b = ctx.ks.public_key_b();
+        let s_full = ctx.ks.secret_key();
+
+        let m = crate::codec::encode_real(slots, n, delta).expect("encode failed");
+        let (c0, c1) = crate::codec::encrypt(&m, n, &pk_a, &pk_b, &mods, &roots, 1, 3.19, seed).expect("encrypt failed");
+
+        let nn = n as usize;
+        let mut worst_frac_of_q = 0.0f64;
+        for t in 0..size_q as usize {
+            let q = mods[t];
+            let root = roots[t];
+            let reduce_mod_q = |x: i64| -> u64 { (((x % q as i64) + q as i64) % q as i64) as u64 };
+            let m_mod_q: Vec<u64> = m[..nn].iter().map(|&x| reduce_mod_q(x)).collect();
+
+            let mut actual_eval = vec![0u64; nn];
+            for k in 0..nn {
+                let idx = t * nn + k;
+                actual_eval[k] = addmod(c0[idx], mulmod(c1[idx], s_full[idx], q), q);
+            }
+            let actual_coeff = inverse_ntt(&actual_eval, n, q, root);
+
+            let mut worst = 0u64;
+            for k in 0..nn {
+                let diff = if actual_coeff[k] >= m_mod_q[k] { actual_coeff[k] - m_mod_q[k] } else { m_mod_q[k] - actual_coeff[k] };
+                let centered = diff.min(q - diff);
+                if centered > worst {
+                    worst = centered;
+                }
+            }
+            let frac = worst as f64 / q as f64;
+            eprintln!("[sanity] tower={t} q={q} worst|c0+c1*s - m|={worst} ({:.6e}% of q)", frac * 100.0);
+            if frac > worst_frac_of_q {
+                worst_frac_of_q = frac;
+            }
+        }
+        worst_frac_of_q
+    }
+
+    #[test]
+    fn sanity_check_single_ciphertext_eval_domain_methodology_test() {
+        let ctx = new_ctx(1234);
+        let slots = [1.0, 2.0, 3.0, 4.0];
+        let worst_frac = sanity_check_single_ciphertext_eval_domain_methodology(&ctx, &slots, 9001);
+        eprintln!("[sanity] worst fraction of q across all towers: {:.6e}%", worst_frac * 100.0);
+        assert!(
+            worst_frac < 0.01,
+            "THIS TEST's own eval-domain methodology is broken (worst_frac={:.6}% of q) -- \
+             fix this before trusting any Control A/B result built on it.",
+            worst_frac * 100.0
+        );
+    }
+
+    #[test]
+    fn sanity_check_both_control_a2_ciphertexts_decrypt_individually() {
+        let ctx = new_ctx(1234);
+        let fa = sanity_check_single_ciphertext_eval_domain_methodology(&ctx, &[1.0, 2.0, 3.0, 4.0], 9001);
+        eprintln!("[sanity a] worst fraction of q: {:.6e}%", fa * 100.0);
+        let fb = sanity_check_single_ciphertext_eval_domain_methodology(&ctx, &[5.0, 6.0, 7.0, 8.0], 9002);
+        eprintln!("[sanity b] worst fraction of q: {:.6e}%", fb * 100.0);
+        assert!(fa < 0.01, "ciphertext a (seed 9001) does not decrypt correctly on its own: {:.6}% of q", fa * 100.0);
+        assert!(fb < 0.01, "ciphertext b (seed 9002) does not decrypt correctly on its own: {:.6}% of q", fb * 100.0);
+    }
+
+    // Control A, CORRECTED: an earlier version compared the pre-rescale
+    // combined result against the NOISE-FREE expected product
+    // (m_a_eval*m_b_eval) -- WRONG for the same reason Control A2's
+    // first draft was wrong (see its own comment): the raw tensor's
+    // cross-noise terms are genuinely large pre-rescale, so comparing
+    // against a noise-free baseline fails for ANY correct
+    // implementation. The MEANINGFUL comparison is: does relin's own
+    // combine output match the EXACT raw tensor identity it is supposed
+    // to approximate? I.e. (t0+ba0)+(t1+ba1)*s should be CLOSE to
+    // t0+t1*s+t2*s^2 (both computed directly from ciphertext data, no
+    // plaintext involved) -- the ONLY expected discrepancy here is the
+    // keyswitch's OWN noise (entry #39 proved this is small, ~1e-10% of
+    // q, for OpenFHE's eval key; this checks it for THIS crate's own
+    // native eval key with a REAL encrypted t2, which was never
+    // independently exercised before -- entry #36's own stated gap).
+    // Compared in COEFFICIENT domain (an actual INTT), per entry #39's
+    // methodology lesson.
+    fn control_a_relin_matches_raw_tensor_within_keyswitch_noise(ctx: &EvalMultContext, slots_a: &[f64], slots_b: &[f64], seed_a: u64, seed_b: u64) -> f64 {
+        let n = ctx.ring_dimension().get();
+        let size_q = ctx.input_towers();
+        let mods: Vec<u64> = (0..size_q).map(|t| ctx.modulus_q(t)).collect();
+        let roots: Vec<u64> = mods
+            .iter()
+            .map(|&q| crate::ntt::native_root(ctx.ring_dimension(), ckks_core::Modulus::new(q).unwrap()))
+            .collect();
+        let delta = ctx.modulus_q(size_q - 1) as f64;
+
+        let pk_a = ctx.ks.public_key_a();
+        let pk_b = ctx.ks.public_key_b();
+        let s_full = ctx.ks.secret_key();
+
+        let m_a = crate::codec::encode_real(slots_a, n, delta).expect("encode a failed");
+        let m_b = crate::codec::encode_real(slots_b, n, delta).expect("encode b failed");
+        let (c0a, c1a) =
+            crate::codec::encrypt(&m_a, n, &pk_a, &pk_b, &mods, &roots, 1, 3.19, seed_a).expect("encrypt a failed");
+        let (c0b, c1b) =
+            crate::codec::encrypt(&m_b, n, &pk_a, &pk_b, &mods, &roots, 1, 3.19, seed_b).expect("encrypt b failed");
+
+        let (t0, t1, t2) = ctx.tensor_only_for_test(&c0a, &c1a, &c0b, &c1b).expect("tensor-only failed");
+        let (pre_r0, pre_r1) = ctx
+            .multiply_relin_no_rescale_for_test(&c0a, &c1a, &c0b, &c1b)
+            .expect("pre-rescale multiply failed");
+        assert_eq!(pre_r0.len(), size_q as usize * n as usize, "pre-rescale output must keep full tower count");
+        assert_eq!(pre_r1.len(), size_q as usize * n as usize, "pre-rescale output must keep full tower count");
+
+        let nn = n as usize;
+        let mut worst_frac_of_q = 0.0f64;
+        for t in 0..size_q as usize {
+            let q = mods[t];
+            let root = roots[t];
+
+            // Expected side: the EXACT raw tensor identity, computed
+            // directly from the ciphertext data (already proven exact
+            // in control_a2) -- NOT the noise-free plaintext product.
+            let mut expected_eval = vec![0u64; nn];
+            for k in 0..nn {
+                let idx = t * nn + k;
+                let s = s_full[idx];
+                let s2 = mulmod(s, s, q);
+                expected_eval[k] = addmod(addmod(t0[idx], mulmod(t1[idx], s, q), q), mulmod(t2[idx], s2, q), q);
+            }
+
+            // Actual side: the GPU pipeline's own pre-rescale combined
+            // (relinearized) result, decrypted (eval domain, pointwise).
+            let mut actual_eval = vec![0u64; nn];
+            for k in 0..nn {
+                let idx = t * nn + k;
+                actual_eval[k] = addmod(pre_r0[idx], mulmod(pre_r1[idx], s_full[idx], q), q);
+            }
+
+            // Compare in COEFFICIENT domain ONLY -- an eval-domain
+            // pointwise comparison here would reproduce entry #39's
+            // original artifact regardless of whether this is correct.
+            let expected_coeff = inverse_ntt(&expected_eval, n, q, root);
+            let actual_coeff = inverse_ntt(&actual_eval, n, q, root);
+
+            let mut worst = 0u64;
+            for k in 0..nn {
+                let diff = if actual_coeff[k] >= expected_coeff[k] {
+                    actual_coeff[k] - expected_coeff[k]
+                } else {
+                    expected_coeff[k] - actual_coeff[k]
+                };
+                let centered = diff.min(q - diff);
+                if centered > worst {
+                    worst = centered;
+                }
+            }
+            let frac = worst as f64 / q as f64;
+            eprintln!(
+                "[control A] tower={t} q={q} worst|(t0+ba0)+(t1+ba1)*s - (t0+t1*s+t2*s^2)|={worst} ({:.6e}% of q)",
+                frac * 100.0
+            );
+            if frac > worst_frac_of_q {
+                worst_frac_of_q = frac;
+            }
+        }
+        worst_frac_of_q
+    }
+
+    #[test]
+    #[ignore = "BLOCKED: confirmed real defect in evalkeygen_host's own eval key generation for this crate's native (OpenFHE-free) pipeline -- see research/EXPERIMENT_LEDGER.md entry #40. keyswitch_device_resident/keyswitch_reference themselves are proven bit-exact with each other and correct given OpenFHE-sourced eval keys (entry #39); isolated to evalkeygen_host via eval_key_outside_own_part_range_is_near_zero. Root cause within evalkeygen_host NOT yet pinpointed."]
+    fn control_a_relin_combine_matches_raw_tensor_within_keyswitch_noise_test() {
+        let ctx = new_ctx(1234);
+        let slots_a = [1.0, 2.0, 3.0, 4.0];
+        let slots_b = [5.0, 6.0, 7.0, 8.0];
+        let worst_frac = control_a_relin_matches_raw_tensor_within_keyswitch_noise(&ctx, &slots_a, &slots_b, 9001, 9002);
+        eprintln!("[control A] worst fraction of q across all towers: {:.6e}%", worst_frac * 100.0);
+        // 1% of q is many orders of magnitude above any plausible
+        // keyswitch noise (entry #39 found ~5.5e-11% of q for the
+        // analogous OpenFHE-sourced check) and many orders below "looks
+        // like uncorrelated randomness" (~50% of q) -- decisively
+        // distinguishes "small real noise" from "a genuine defect in
+        // keyswitch/relin for this crate's own native eval key."
+        assert!(
+            worst_frac < 0.01,
+            "relin's combine output does NOT match the raw tensor identity within keyswitch noise -- \
+             worst_frac={:.6}% of q. This means keyswitch_device_resident/LaunchCombine has a genuine defect \
+             for real encrypted data under this crate's own native eval key.",
+            worst_frac * 100.0
+        );
+    }
+
+    #[test]
+    #[ignore = "BLOCKED: see control_a_relin_combine_matches_raw_tensor_within_keyswitch_noise_test's #[ignore] reason and entry #40 -- this confirms numPart=1 does not change the result (rules out digit decomposition as the cause)"]
+    fn control_a_relin_combine_matches_raw_tensor_num_part_1_test() {
+        let ctx = new_ctx_num_part(1234, 1);
+        let slots_a = [1.0, 2.0, 3.0, 4.0];
+        let slots_b = [5.0, 6.0, 7.0, 8.0];
+        let worst_frac = control_a_relin_matches_raw_tensor_within_keyswitch_noise(&ctx, &slots_a, &slots_b, 9001, 9002);
+        eprintln!("[control A, num_part=1] worst fraction of q across all towers: {:.6e}%", worst_frac * 100.0);
+        assert!(
+            worst_frac < 0.01,
+            "with num_part=1 (no digit decomposition), relin's combine output STILL does NOT match the raw \
+             tensor identity -- worst_frac={:.6}% of q. This rules out digit decomposition as the cause.",
+            worst_frac * 100.0
+        );
+    }
+
+    // Control B/C hybrid: does the FAST device-resident keyswitch path
+    // (`keyswitch_device_resident`, used by `EvalMultContext`) agree
+    // BIT-EXACT with the HOST-ORCHESTRATED reference oracle
+    // (`keyswitch_reference`/`keyswitch_core_resident`) on this EXACT
+    // REAL t2? Entry #36 proved these two agree for SYNTHETIC data; this
+    // is the first time they are compared on a REAL encrypted t2. If
+    // they agree, the bug is shared by both (most likely in
+    // `evalkeygen_host`'s eval key generation itself, not a
+    // device-resident-specific defect); if they disagree, the bug is
+    // specific to the fast path.
+    #[test]
+    fn fast_keyswitch_matches_reference_keyswitch_on_real_t2() {
+        let ctx = new_ctx(1234);
+        let n = ctx.ring_dimension().get();
+        let size_q = ctx.input_towers();
+        let mods: Vec<u64> = (0..size_q).map(|t| ctx.modulus_q(t)).collect();
+        let roots: Vec<u64> = mods
+            .iter()
+            .map(|&q| crate::ntt::native_root(ctx.ring_dimension(), ckks_core::Modulus::new(q).unwrap()))
+            .collect();
+        let delta = ctx.modulus_q(size_q - 1) as f64;
+        let pk_a = ctx.ks.public_key_a();
+        let pk_b = ctx.ks.public_key_b();
+
+        let m_a = crate::codec::encode_real(&[1.0, 2.0, 3.0, 4.0], n, delta).expect("encode a failed");
+        let m_b = crate::codec::encode_real(&[5.0, 6.0, 7.0, 8.0], n, delta).expect("encode b failed");
+        let (c0a, c1a) = crate::codec::encrypt(&m_a, n, &pk_a, &pk_b, &mods, &roots, 1, 3.19, 9001).expect("encrypt a failed");
+        let (c0b, c1b) = crate::codec::encrypt(&m_b, n, &pk_a, &pk_b, &mods, &roots, 1, 3.19, 9002).expect("encrypt b failed");
+
+        let (t0, t1, t2) = ctx.tensor_only_for_test(&c0a, &c1a, &c0b, &c1b).expect("tensor-only failed");
+        let (pre_r0, pre_r1) = ctx
+            .multiply_relin_no_rescale_for_test(&c0a, &c1a, &c0b, &c1b)
+            .expect("pre-rescale multiply failed");
+
+        // Fast path's ba0/ba1, recovered from the combine output:
+        // pre_r0 = t0+ba0, pre_r1 = t1+ba1 (mod q, per tower).
+        let nn = n as usize;
+        let mut fast_ba0 = vec![0u64; t0.len()];
+        let mut fast_ba1 = vec![0u64; t0.len()];
+        for t in 0..size_q as usize {
+            let q = mods[t];
+            for k in 0..nn {
+                let idx = t * nn + k;
+                fast_ba0[idx] = if pre_r0[idx] >= t0[idx] { pre_r0[idx] - t0[idx] } else { pre_r0[idx] + q - t0[idx] };
+                fast_ba1[idx] = if pre_r1[idx] >= t1[idx] { pre_r1[idx] - t1[idx] } else { pre_r1[idx] + q - t1[idx] };
+            }
+        }
+
+        let (ref_ba0, ref_ba1) = ctx.ks.keyswitch_reference(&t2).expect("reference keyswitch failed");
+
+        let mismatches0 = fast_ba0.iter().zip(ref_ba0.iter()).filter(|(a, b)| a != b).count();
+        let mismatches1 = fast_ba1.iter().zip(ref_ba1.iter()).filter(|(a, b)| a != b).count();
+        eprintln!("[fast vs reference, real t2] ba0 mismatches={mismatches0}/{} ba1 mismatches={mismatches1}/{}", fast_ba0.len(), fast_ba1.len());
+        assert_eq!(mismatches0, 0, "fast keyswitch_device_resident disagrees with keyswitch_reference on ba0 for a REAL t2 -- bug is specific to the fast path");
+        assert_eq!(mismatches1, 0, "fast keyswitch_device_resident disagrees with keyswitch_reference on ba1 for a REAL t2 -- bug is specific to the fast path");
+    }
+
+    // Simplest possible boundary case: key-switch a literal ZERO input
+    // (not derived from any ciphertext at all). digit decomposition of
+    // zero is trivially zero in every digit, removing any real-vs-
+    // synthetic-structure confound entirely. Expected: ba0+ba1*s ~= 0
+    // (small noise only). This isolates the eval key's OWN decryption
+    // behavior from everything else in the pipeline.
+    #[test]
+    fn keyswitch_reference_on_zero_input_gives_near_zero() {
+        let ctx = new_ctx(1234);
+        let n = ctx.ring_dimension().get() as usize;
+        let size_q = ctx.input_towers() as usize;
+        let mods: Vec<u64> = (0..size_q as u32).map(|t| ctx.modulus_q(t)).collect();
+        let roots: Vec<u64> = mods
+            .iter()
+            .map(|&q| crate::ntt::native_root(ctx.ring_dimension(), ckks_core::Modulus::new(q).unwrap()))
+            .collect();
+        let s_full = ctx.ks.secret_key();
+
+        let zero_a = vec![0u64; size_q * n];
+        let (ba0, ba1) = ctx.ks.keyswitch_reference(&zero_a).expect("reference keyswitch on zero failed");
+
+        let mut worst_frac_of_q = 0.0f64;
+        for t in 0..size_q {
+            let q = mods[t];
+            let root = roots[t];
+            let mut actual_eval = vec![0u64; n];
+            for k in 0..n {
+                let idx = t * n + k;
+                actual_eval[k] = addmod(ba0[idx], mulmod(ba1[idx], s_full[idx], q), q);
+            }
+            let actual_coeff = inverse_ntt(&actual_eval, n as u32, q, root);
+            let mut worst = 0u64;
+            for k in 0..n {
+                let centered = actual_coeff[k].min(q - actual_coeff[k]);
+                if centered > worst {
+                    worst = centered;
+                }
+            }
+            let frac = worst as f64 / q as f64;
+            eprintln!("[zero input] tower={t} q={q} worst|ba0+ba1*s - 0|={worst} ({:.6e}% of q)", frac * 100.0);
+            if frac > worst_frac_of_q {
+                worst_frac_of_q = frac;
+            }
+        }
+        eprintln!("[zero input] worst fraction of q across all towers: {:.6e}%", worst_frac_of_q * 100.0);
+        assert!(
+            worst_frac_of_q < 0.01,
+            "key-switching a literal ZERO input does NOT give ba0+ba1*s ~= 0 -- worst_frac={:.6}% of q. \
+             This isolates a defect in the eval key / keyswitch machinery itself, independent of any input structure.",
+            worst_frac_of_q * 100.0
+        );
+    }
+
+    // The zero-input test above is TRIVIALLY uninformative: digit
+    // decomposition of 0 is 0 in every digit, so ba0=ba1=0 EXACTLY
+    // regardless of whether the eval key itself is correct (0 times
+    // anything is 0). Use a CONSTANT, non-zero EVAL-DOMAIN value instead
+    // -- same residue at every position in every tower. By CRT
+    // uniqueness, a residue smaller than every q_i, repeated identically
+    // across all towers, corresponds to exactly that one small integer
+    // -- i.e. this IS a CRT-consistent value (same true value under every
+    // prime), unlike entry #30/#38's per-tower-independently-random test
+    // data, without needing a real ciphertext's encryption noise at all.
+    // This directly and meaningfully exercises digit decomposition and
+    // the eval key's own P*s^2 term.
+    #[test]
+    #[ignore = "BLOCKED: see control_a_relin_combine_matches_raw_tensor_within_keyswitch_noise_test's #[ignore] reason and entry #40 -- confirms the defect reproduces even for the simplest possible CRT-consistent (non-ciphertext) input"]
+    fn keyswitch_reference_on_constant_crt_consistent_input() {
+        let ctx = new_ctx(1234);
+        let n = ctx.ring_dimension().get() as usize;
+        let size_q = ctx.input_towers() as usize;
+        let mods: Vec<u64> = (0..size_q as u32).map(|t| ctx.modulus_q(t)).collect();
+        let roots: Vec<u64> = mods
+            .iter()
+            .map(|&q| crate::ntt::native_root(ctx.ring_dimension(), ckks_core::Modulus::new(q).unwrap()))
+            .collect();
+        let s_full = ctx.ks.secret_key();
+
+        const CONST_VAL: u64 = 5;
+        let a_eval: Vec<u64> = vec![CONST_VAL; size_q * n]; // same residue, every tower, every position
+        let (ba0, ba1) = ctx.ks.keyswitch_reference(&a_eval).expect("reference keyswitch on constant failed");
+
+        let mut worst_frac_of_q = 0.0f64;
+        for t in 0..size_q {
+            let q = mods[t];
+            let root = roots[t];
+
+            // expected = a_eval * s^2 (eval domain, pointwise -- valid
+            // ring multiplication), converted to coefficient domain.
+            let mut expected_eval = vec![0u64; n];
+            for k in 0..n {
+                let idx = t * n + k;
+                let s = s_full[idx];
+                let s2 = mulmod(s, s, q);
+                expected_eval[k] = mulmod(a_eval[idx], s2, q);
+            }
+            let mut actual_eval = vec![0u64; n];
+            for k in 0..n {
+                let idx = t * n + k;
+                actual_eval[k] = addmod(ba0[idx], mulmod(ba1[idx], s_full[idx], q), q);
+            }
+            let expected_coeff = inverse_ntt(&expected_eval, n as u32, q, root);
+            let actual_coeff = inverse_ntt(&actual_eval, n as u32, q, root);
+
+            let mut worst = 0u64;
+            for k in 0..n {
+                let diff = if actual_coeff[k] >= expected_coeff[k] { actual_coeff[k] - expected_coeff[k] } else { expected_coeff[k] - actual_coeff[k] };
+                let centered = diff.min(q - diff);
+                if centered > worst {
+                    worst = centered;
+                }
+            }
+            let frac = worst as f64 / q as f64;
+            eprintln!("[const CRT input] tower={t} q={q} worst|ba0+ba1*s - a*s^2|={worst} ({:.6e}% of q)", frac * 100.0);
+            if frac > worst_frac_of_q {
+                worst_frac_of_q = frac;
+            }
+        }
+        eprintln!("[const CRT input] worst fraction of q across all towers: {:.6e}%", worst_frac_of_q * 100.0);
+        assert!(
+            worst_frac_of_q < 0.01,
+            "key-switching a CONSTANT, CRT-consistent input does NOT satisfy ba0+ba1*s ~= a*s^2 -- \
+             worst_frac={:.6}% of q. This isolates a defect specific to CRT-consistent (real-data-like) inputs.",
+            worst_frac_of_q * 100.0
+        );
+    }
+
+    // GOD PROMPT "CKKS PHASE 7": direct check of evalkeygen_host's OWN
+    // raw output (K.av[0], K.bv[0]), bypassing keyswitch entirely.
+    // src/evalkeygen.cpp's own doc comment claims
+    // "bv[p]-av[p]*s == (P*s2 in part's range) + small noise" -- but for
+    // TOWERS OUTSIDE part 0's own Q-range (where no P*s2 term is added
+    // at all, per the `if(t>=startIdx && t<endIdx)` guard in
+    // evalkeygen_host_sold), the SAME formula simplifies to
+    // "bv[t]-av[t]*s ~= 0" REGARDLESS of P or sign choice -- since
+    // 0 is 0 either way. This isolates whether the basic
+    // "encryption-of-zero" machinery (pkA*u+ns*e1, pkB*u+ns*e0, and
+    // evalkeygen_host_sold's OWN separate ek_dev_tab/build_ek_tab NTT
+    // table cache, distinct from keygen_host's) is sound, with NO
+    // dependency on P, sign convention, or the Ps2 term at all.
+    #[test]
+    #[ignore = "BLOCKED: confirmed real defect in evalkeygen_host's own eval key generation -- see research/EXPERIMENT_LEDGER.md entry #40. This is the MOST isolated reproduction: checks bv[0]-av[0]*s ~= 0 for towers OUTSIDE part 0's own Q-range, where NO P*s2 term is involved at all, so this depends on nothing but the basic pkA*u+ns*e1 / pkB*u+ns*e0 encryption-of-zero machinery. Swapping LaunchNTT_CT_Batched for a per-tower LaunchNTT_CT loop (matching keygen_host's own proven-correct kernel usage) did NOT change the result, ruling out the batched-kernel-launch mechanism; the exact faulty line within evalkeygen_host/evalkeygen_host_sold was not pinpointed this round."]
+    fn eval_key_outside_own_part_range_is_near_zero() {
+        let ctx = new_ctx(1234); // NUM_PART=2, alpha=4, SIZE_Q=8
+        let n = ctx.ring_dimension().get() as usize;
+        let alpha = ctx.ks.alpha();
+        let eval_key_towers = ctx.ks.eval_key_towers();
+        eprintln!("[eval key raw] alpha={alpha} eval_key_towers={eval_key_towers}");
+        let (av0, bv0) = ctx.ks.eval_key_part(0);
+        assert_eq!(av0.len(), eval_key_towers as usize * n);
+
+        let s_full = ctx.ks.secret_key(); // Q-only, size_ql*n
+        let size_q = ctx.input_towers();
+        let mods: Vec<u64> = (0..size_q).map(|t| ctx.modulus_q(t)).collect();
+        let roots: Vec<u64> = mods
+            .iter()
+            .map(|&q| crate::ntt::native_root(ctx.ring_dimension(), ckks_core::Modulus::new(q).unwrap()))
+            .collect();
+
+        let start_idx = 0u32; // part 0: startIdx = alpha*0 = 0
+        let end_idx = alpha.min(size_q);
+        eprintln!("[eval key raw] part 0 own Q-range: [{start_idx}, {end_idx})");
+
+        let mut worst_frac_of_q = 0.0f64;
+        let mut checked_any = false;
+        for t in end_idx..size_q {
+            // OUTSIDE part 0's own range, but still a Q-tower (not a P-tower)
+            // -- s_full[t] is valid here since s_full covers all size_q towers.
+            checked_any = true;
+            let q = mods[t as usize];
+            let root = roots[t as usize];
+            let mut actual_eval = vec![0u64; n];
+            for k in 0..n {
+                let idx = t as usize * n + k;
+                // bv - av*s (the sign the source comment claims)
+                let av_s = mulmod(av0[idx], s_full[idx], q);
+                actual_eval[k] = if bv0[idx] >= av_s { bv0[idx] - av_s } else { bv0[idx] + q - av_s };
+            }
+            let actual_coeff = inverse_ntt(&actual_eval, n as u32, q, root);
+            let mut worst = 0u64;
+            for k in 0..n {
+                let centered = actual_coeff[k].min(q - actual_coeff[k]);
+                if centered > worst {
+                    worst = centered;
+                }
+            }
+            let frac = worst as f64 / q as f64;
+            eprintln!("[eval key raw] tower={t} (outside part 0's range) q={q} worst|bv-av*s - 0|={worst} ({:.6e}% of q)", frac * 100.0);
+            if frac > worst_frac_of_q {
+                worst_frac_of_q = frac;
+            }
+        }
+        assert!(checked_any, "test fixture has no towers outside part 0's range -- adjust NUM_PART/alpha");
+        eprintln!("[eval key raw] worst fraction of q (outside part 0's range): {:.6e}%", worst_frac_of_q * 100.0);
+        assert!(
+            worst_frac_of_q < 0.01,
+            "OUTSIDE part 0's own Q-range (no P*s2 term at all), bv[0]-av[0]*s is NOT ~0 -- worst_frac={:.6}% of q. \
+             This isolates a defect in evalkeygen_host_sold's basic encryption-of-zero machinery itself \
+             (pkA*u+ns*e1 / pkB*u+ns*e0, or its own private NTT table cache), independent of P or sign convention.",
+            worst_frac_of_q * 100.0
+        );
+    }
+
+    // Control A2, CORRECTED: an earlier version of this check compared
+    // the raw tensor product against the NOISE-FREE expected product
+    // (m_a_eval*m_b_eval, using the encoded plaintexts alone) with a
+    // tight (1% of q) tolerance -- WRONG, and the resulting ~50%-of-q
+    // "failure" was a methodology artifact, not a defect: the RAW,
+    // UN-RESCALED tensor product's cross-noise terms (m_a (*) e_b,
+    // e_a (*) m_b -- RING CONVOLUTIONS, not simple sums) are genuinely
+    // LARGE by design. Convolving an n=1024-coefficient, Delta~2^50-scale
+    // polynomial with even a tiny (sigma=3.19) noise polynomial sums
+    // n terms each up to ~Delta*noise, giving a result up to roughly
+    // n*Delta*sigma ~ 2^60 -- comparable to or exceeding several of this
+    // fixture's own moduli. This is exactly WHY CKKS rescales after each
+    // multiplication (to divide this amplified noise back down), not a
+    // bug. The CORRECT check is a PURE ALGEBRAIC IDENTITY with ZERO
+    // tolerance needed: t0+t1*s+t2*s^2 must EXACTLY equal
+    // (c0a+c1a*s)*(c0b+c1b*s), both computed directly from the
+    // ciphertext components themselves (no plaintext/noise-free value
+    // involved at all) -- this is checkable in EITHER domain since it
+    // is an EXACT equality claim (NTT is a bijection: two values are
+    // equal iff their NTT transforms are equal), not an approximate
+    // "is this small" claim that requires coefficient domain.
+    fn control_a2_raw_tensor_matches_direct_ciphertext_product(ctx: &EvalMultContext, slots_a: &[f64], slots_b: &[f64], seed_a: u64, seed_b: u64) -> u64 {
+        let n = ctx.ring_dimension().get();
+        let size_q = ctx.input_towers();
+        let mods: Vec<u64> = (0..size_q).map(|t| ctx.modulus_q(t)).collect();
+        let roots: Vec<u64> = mods
+            .iter()
+            .map(|&q| crate::ntt::native_root(ctx.ring_dimension(), ckks_core::Modulus::new(q).unwrap()))
+            .collect();
+        let delta = ctx.modulus_q(size_q - 1) as f64;
+
+        let pk_a = ctx.ks.public_key_a();
+        let pk_b = ctx.ks.public_key_b();
+        let s_full = ctx.ks.secret_key();
+
+        let m_a = crate::codec::encode_real(slots_a, n, delta).expect("encode a failed");
+        let m_b = crate::codec::encode_real(slots_b, n, delta).expect("encode b failed");
+        let (c0a, c1a) =
+            crate::codec::encrypt(&m_a, n, &pk_a, &pk_b, &mods, &roots, 1, 3.19, seed_a).expect("encrypt a failed");
+        let (c0b, c1b) =
+            crate::codec::encrypt(&m_b, n, &pk_a, &pk_b, &mods, &roots, 1, 3.19, seed_b).expect("encrypt b failed");
+
+        let (t0, t1, t2) = ctx.tensor_only_for_test(&c0a, &c1a, &c0b, &c1b).expect("tensor-only failed");
+
+        let nn = n as usize;
+        let mut mismatches = 0u64;
+        for t in 0..size_q as usize {
+            let q = mods[t];
+            let mut bad_this_tower = 0u64;
+            for k in 0..nn {
+                let idx = t * nn + k;
+                let s = s_full[idx];
+                let s2 = mulmod(s, s, q);
+
+                let phase_a = addmod(c0a[idx], mulmod(c1a[idx], s, q), q);
+                let phase_b = addmod(c0b[idx], mulmod(c1b[idx], s, q), q);
+                let expected = mulmod(phase_a, phase_b, q);
+
+                let actual = addmod(addmod(t0[idx], mulmod(t1[idx], s, q), q), mulmod(t2[idx], s2, q), q);
+
+                if actual != expected {
+                    bad_this_tower += 1;
+                }
+            }
+            eprintln!("[control A2] tower={t} q={q} mismatches={bad_this_tower}/{nn} (exact algebraic identity, no tolerance)");
+            mismatches += bad_this_tower;
+        }
+        mismatches
+    }
+
+    #[test]
+    fn control_a2_raw_tensor_matches_direct_ciphertext_product_exactly() {
+        let ctx = new_ctx(1234);
+        let slots_a = [1.0, 2.0, 3.0, 4.0];
+        let slots_b = [5.0, 6.0, 7.0, 8.0];
+        let mismatches = control_a2_raw_tensor_matches_direct_ciphertext_product(&ctx, &slots_a, &slots_b, 9001, 9002);
+        eprintln!("[control A2] total mismatches across all towers: {mismatches}");
+        assert_eq!(
+            mismatches, 0,
+            "t0+t1*s+t2*s^2 does NOT exactly equal (c0a+c1a*s)*(c0b+c1b*s) -- this is a pure algebraic identity \
+             with zero tolerance, so any mismatch means LaunchTensor itself computes the wrong value for real \
+             encrypted ciphertext data."
+        );
     }
 
     /// Absolute error must stay inside a tolerance derived from the

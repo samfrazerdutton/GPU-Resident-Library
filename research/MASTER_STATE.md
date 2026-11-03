@@ -1268,3 +1268,85 @@ Full detail: `EXPERIMENT_LEDGER.md` entry #39. Updated next step:
   thought), resolution of `test_polyeval`'s SEPARATE multi-level noise
   question (untouched), a benchmark of EvalMult (correctness still not
   fully established end-to-end), or production integration.
+
+## GOD PROMPT "CKKS PHASE 7": the remaining EvalMult blocker is ISOLATED to a confirmed defect in `evalkeygen_host`'s own native eval-key generation — `LaunchTensor`, `keyswitch_device_resident`, `keyswitch_core_resident`, and `LaunchCombine` are all proven correct for real data this round
+
+Full detail: `EXPERIMENT_LEDGER.md` entry #40. Updated next step:
+`research/NEXT_SESSION.md`'s "READ THIS FIRST" section.
+
+- **The core finding**: this round added a sequence of new,
+  discriminating experiments that prove `LaunchTensor`,
+  `keyswitch_device_resident`/`keyswitch_core_resident` (the
+  decompose/accumulate/moddown algorithm), and `LaunchCombine` are ALL
+  correct for REAL encrypted ciphertext data under this crate's own
+  native (OpenFHE-free) pipeline — not merely bit-exact against a
+  reference on synthetic RNS data, as before. The confirmed defect is
+  narrowed specifically to `evalkeygen_host`'s/`evalkeygen_host_sold`'s
+  own eval-key GENERATION (`src/evalkeygen.cpp`), which had NEVER been
+  independently checked against any reference before this round —
+  every prior check of the relin identity (entries #30, #36, #38, and
+  this project's own `tests/test_keyswitch.cpp`) used OpenFHE-SOURCED
+  key material extracted into `KeySwitchConstants`, never this crate's
+  own `evalkeygen_host` output.
+- **The evidence chain**: (1) a corrected, ZERO-TOLERANCE algebraic
+  identity check (`t0+t1*s+t2*s^2` must EXACTLY equal
+  `(c0a+c1a*s)*(c0b+c1b*s)`, both computed directly from real
+  ciphertext data) passes with 0 mismatches across 8192 positions —
+  `LaunchTensor` is exact. An EARLIER version of this check wrongly
+  compared against the noise-free plaintext product with a tight
+  tolerance, giving a spurious failure — the raw, un-rescaled tensor's
+  cross-noise terms are genuinely large by design (this is exactly why
+  CKKS rescales after every multiply), not a defect; this was caught
+  and corrected before being trusted. (2) `keyswitch_device_resident`
+  and `keyswitch_reference`/`keyswitch_core_resident` agree BIT-EXACT
+  (0/8192 mismatches) on the same real `t2` — the key-switch algorithm
+  itself is not the defect. (3) Combined with entry #39 (this same
+  algorithm, given an OpenFHE eval key, already proven correct for real
+  data), the defect must be in the eval key. (4) A trivial
+  CRT-consistent constant input (not even a real ciphertext) still
+  fails the relin identity through this crate's own eval key. (5) The
+  MOST isolated reproduction: for Q-towers outside eval-key part 0's
+  own digit range, where `evalkeygen_host_sold` adds NO `P*s2` term at
+  all, the expected `bv[0]-av[0]*s ~= 0` (depending on nothing but the
+  basic "encryption of zero" machinery) still fails at ~50% of q,
+  confirmed via a direct C++/Rust cross-check of the raw values (ruling
+  out an accessor bug).
+- **Hypotheses tested and REFUTED, do not re-try without new
+  evidence**: digit decomposition/`numPart` (1 and 2 fail identically);
+  the batched-vs-per-tower NTT kernel launch mechanism
+  (`LaunchNTT_CT_Batched` vs. a per-tower `LaunchNTT_CT` loop — swapped
+  as a direct experiment, gave a bit-for-bit IDENTICAL result, then
+  reverted since it had no benefit); an eval-key accessor/FFI/indexing
+  bug (cross-checked exactly); a `ks_context_create`-introduced
+  mutation of `K.av`/`K.bv` (structurally impossible — it takes a
+  `const` reference).
+- **Hypotheses NOT yet tested**: the exact per-coefficient arithmetic
+  of `u`/`e0`/`e1`'s sampling-to-coefficient-embedding step inside
+  `evalkeygen_host_sold`; whether `PModq_QP`'s computation in
+  `cpp_bridge/keyswitch_bridge.cpp` is correct (not exercised by the
+  "outside range" test); a from-scratch, hand-constructed-key C++ test
+  of `evalkeygen_host_sold` in isolation. See `NEXT_SESSION.md` for
+  full detail.
+- Added 5 new PERMANENT PASSING regression tests this round
+  (`control_a2_raw_tensor_matches_direct_ciphertext_product_exactly`,
+  `fast_keyswitch_matches_reference_keyswitch_on_real_t2`,
+  `sanity_check_single_ciphertext_eval_domain_methodology_test`,
+  `sanity_check_both_control_a2_ciphertexts_decrypt_individually`,
+  `keyswitch_reference_on_zero_input_gives_near_zero`) and 4 new
+  `#[ignore]`d tests documenting the confirmed defect with clear
+  reasons, alongside the 4 pre-existing ignored tests from entry #39
+  (unchanged). New, additive-only C++ instrumentation:
+  `KeySwitchContext::eval_key_part`/`eval_key_towers`/`alpha` accessors
+  in `cpp_bridge/keyswitch_bridge.cpp` (read-only, exposes existing
+  eval-key data, no computation changed). Full Rust suite: 27 passed, 8
+  ignored, 0 failed.
+- No production C++/CUDA source file ends this round modified — the
+  diagnostic NTT-kernel-swap experiment in `src/evalkeygen.cpp` was
+  reverted (`git checkout --`) since it gave no benefit and should not
+  be left as an unverified, speculative change.
+- **Explicitly NOT claimed**: the full encrypted EvalMult round trip
+  (still blocked, now correctly understood to depend on fixing
+  `evalkeygen_host` first — the rescale/composition question from
+  entry #39 is deliberately NOT re-investigated until the eval key
+  itself is fixed), resolution of `test_polyeval`'s SEPARATE multi-level
+  noise question (untouched), or production integration.

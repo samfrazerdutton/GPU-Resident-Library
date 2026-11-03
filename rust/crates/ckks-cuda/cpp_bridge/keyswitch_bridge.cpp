@@ -225,6 +225,28 @@ bool gpufhe_ks_fixture_public_key_b(void* handle, uint64_t* out, size_t out_len)
     return true;
 }
 
+// GOD PROMPT "CKKS PHASE 7": exposes the RAW eval key (K.av[part],
+// K.bv[part]), full QP-range (evalKeyTowers*n each) -- TEST-ONLY,
+// bypasses keyswitch_core_resident/keyswitch_device_resident entirely.
+// Exists to check the eval key's OWN claimed decryption identity
+// (bv[part]-av[part]*s == P*s2 in part's Q-range + small noise, per
+// src/evalkeygen.cpp's own doc comment) directly against evalkeygen_
+// host's raw output, isolating it from the accumulate/decompose/
+// moddown logic (which entries #35-37/#39 already independently prove
+// correct via OpenFHE-sourced eval keys). `out_len` must equal
+// `K.evalKeyTowers*n` exactly.
+bool gpufhe_ks_fixture_eval_key_part(void* handle, uint32_t part, uint64_t* out_av, uint64_t* out_bv, size_t out_len) {
+    if (!handle) return false;
+    KsFixture* fx = static_cast<KsFixture*>(handle);
+    if (part >= fx->K.av.size()) return false;
+    if (out_len != fx->K.av[part].size() || out_len != fx->K.bv[part].size()) return false;
+    std::memcpy(out_av, fx->K.av[part].data(), out_len * 8);
+    std::memcpy(out_bv, fx->K.bv[part].data(), out_len * 8);
+    return true;
+}
+uint32_t gpufhe_ks_fixture_eval_key_towers(void* handle) { return static_cast<KsFixture*>(handle)->K.evalKeyTowers; }
+uint32_t gpufhe_ks_fixture_alpha(void* handle) { return static_cast<KsFixture*>(handle)->K.alpha; }
+
 // Runs gpufhe::keyswitch_resident (the device-resident path this operation
 // ports) on preallocated device buffers: d_a (sizeQl*n, eval domain) ->
 // d_ba0/d_ba1 (sizeQl*n each, caller-preallocated). Synchronizes the default

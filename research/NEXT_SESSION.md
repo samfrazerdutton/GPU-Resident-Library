@@ -3,104 +3,130 @@
 ## Current commit
 
 Check `git log -3` on resume. As of this writing, HEAD is a new commit
-on top of entry #38's commit `fcef689` (the GOD PROMPT "CKKS PHASE 6"
-round: entries #30/#38's "ba0+ba1*s =?= t2*s^2 fails at ~50% of q"
-relin-identity mystery is ROOT-CAUSED AND RESOLVED -- it was a test
-methodology bug (comparing/multiplying RNS polynomials in the wrong
-NTT-vs-coefficient domain), not a defect in `keyswitch_resident` or
-`LaunchCombine`. See `EXPERIMENT_LEDGER.md` entry #39 for the full,
-multi-step elimination. A SEPARATE, real, not-yet-root-caused bug
-remains in the full `EvalMultContext::multiply_relin_rescale` -> decrypt
--> decode round trip -- see "READ THIS FIRST" below). Confirm push
-status -- push again if `git status` shows ahead of origin.
+on top of entry #39's commit `19598f9` (the GOD PROMPT "CKKS PHASE 7"
+round: the remaining real-encrypted-EvalMult blocker is ISOLATED to a
+confirmed, reproducible defect in `evalkeygen_host`'s OWN native
+(OpenFHE-free) eval-key generation -- `keyswitch_device_resident`,
+`keyswitch_core_resident`, `LaunchTensor`, and `LaunchCombine` are all
+proven correct this round by new, decisive discriminating experiments.
+The EXACT faulty line within `evalkeygen_host`/`evalkeygen_host_sold`
+was NOT pinpointed. See `EXPERIMENT_LEDGER.md` entry #40 for the full
+elimination). Confirm push status -- push again if `git status` shows
+ahead of origin.
 
-**Reminder, confirmed the hard way this round**: this machine has (at
-least) two SEPARATE git clones of this GitHub repo -- the WSL one
-(`~/GPU-Resident-Library`) is authoritative for all Rust/relin/CKKS
+**Reminder, confirmed the hard way in an earlier round**: this machine
+has (at least) two SEPARATE git clones of this GitHub repo -- the WSL
+one (`~/GPU-Resident-Library`) is authoritative for all Rust/relin/CKKS
 work and should always be checked via a WSL shell, not a Windows one;
 a Windows-filesystem clone (`C:\Users\samca\GPU-Resident-Library`) has
 an entirely unrelated commit history (raw CUDA-kernel-optimization
 work) and untracked, stale copies of `rust/`/`research/` -- never run
 `git status`/`log`/commit decisions against it for this work.
 
-## READ THIS FIRST if resuming into EvalMult/relin work: the relin IDENTITY is RESOLVED; a SEPARATE rescale/composition bug remains
+## READ THIS FIRST if resuming into EvalMult/relin work: the defect is now ISOLATED to `evalkeygen_host` specifically -- do not re-doubt keyswitch/tensor/combine
 
-Entry #39 (this round) definitively resolves entries #30/#38's
-`ba0+ba1*s =?= t2*s²` mystery: using a fresh OpenFHE-only reference
-test plus a controlled real-vs-synthetic-data experiment inside
-`tests/test_keyswitch.cpp`, it proved the identity holds correctly
-(worst residual ~1e-10% of q for real ciphertext data) once compared
-properly -- ring multiplication is pointwise ONLY in `Format::EVALUATION`
-(NTT domain); every prior check (entries #30, #38, and this round's own
-first two attempts) either compared, or even multiplied, raw per-tower
-values in the wrong domain, producing a spurious ~50%-of-q "failure"
-that was never a real defect. `keyswitch_resident`/`LaunchCombine` are
-now proven correct via an INDEPENDENT, OpenFHE-cross-validated route.
-**Do not re-open this question or re-run the sign/numPart/P-factor
-sweeps from entry #38 -- they were chasing a test artifact, not
-real gaps, and the identity is now closed.**
+Entry #39 already closed entries #30/#38's `ba0+ba1*s =?= t2*s²`
+methodology mystery. Entry #40 (this round) went further and PROVED,
+via new discriminating experiments, that the Rust native pipeline's
+`LaunchTensor`, `keyswitch_device_resident`/`keyswitch_core_resident`
+(the decompose/accumulate/moddown ALGORITHM), and `LaunchCombine` are
+ALL correct for REAL encrypted ciphertext data -- not just synthetic
+RNS data. **The confirmed defect is narrower than previously thought:
+it is specifically in `evalkeygen_host`'s/`evalkeygen_host_sold`'s own
+native eval-key GENERATION** (`src/evalkeygen.cpp`), which has NEVER
+been independently checked against any reference before this round
+(every prior check of the relin identity -- entries #30, #36, #38, and
+this project's own `tests/test_keyswitch.cpp` -- used OpenFHE-SOURCED
+key material extracted into `KeySwitchConstants`, never this crate's
+own `evalkeygen_host` output). **Do not re-doubt `LaunchTensor`,
+`keyswitch_device_resident`, `keyswitch_core_resident`, or
+`LaunchCombine` without new evidence -- they are proven correct this
+round** (see the decisive tests below, now permanent passing
+regression coverage in `evalmult.rs`).
 
-**What this does NOT resolve**: the full Rust
+**The decisive evidence chain, in order**:
+1. `control_a2_raw_tensor_matches_direct_ciphertext_product_exactly`
+   (passing): `t0+t1*s+t2*s^2` EXACTLY equals
+   `(c0a+c1a*s)*(c0b+c1b*s)` computed directly from real ciphertext
+   data -- 0 mismatches across all 8192 positions. `LaunchTensor` is
+   exact.
+2. `fast_keyswitch_matches_reference_keyswitch_on_real_t2` (passing):
+   `keyswitch_device_resident` and `keyswitch_reference`
+   (`keyswitch_core_resident`) agree BIT-EXACT (0/8192 mismatches) on
+   the SAME real `t2`. The key-switch ALGORITHM is not the defect --
+   whatever it computes, both paths compute the identical thing.
+3. Combined with entry #39 (this SAME algorithm, given an
+   OpenFHE-generated eval key, correctly satisfies the relin identity
+   for real data at ~5.5e-11% of q): the defect must be in the eval
+   key itself, i.e. in `evalkeygen_host`.
+4. `keyswitch_reference_on_constant_crt_consistent_input` (ignored,
+   FAILING, ~50% of q): even a trivial CRT-consistent constant value
+   (not a real ciphertext at all) fails the relin identity through
+   this crate's own eval key.
+5. `eval_key_outside_own_part_range_is_near_zero` (ignored, FAILING,
+   ~50% of q): THE most isolated reproduction. For Q-towers outside
+   part 0's own digit range, `evalkeygen_host_sold` adds NO `P*s2`
+   term at all (`if(t>=startIdx && t<endIdx)` guard) -- the expected
+   `bv[0]-av[0]*s ~= 0` depends on NOTHING but the basic
+   `pkA*u+ns*e1`/`pkB*u+ns*e0` "encryption of zero" machinery. Still
+   fails. A C++/Rust cross-check confirmed the raw `pkA`/`pkB`/`av`/`bv`
+   values read by the test exactly match what `evalkeygen_host_sold`
+   computed (ruling out an accessor bug).
+
+**Hypotheses tested and REFUTED this round -- do not re-try without new
+evidence**:
+- Digit decomposition / `numPart` (1 and 2 both fail identically via
+  `control_a_relin_combine_matches_raw_tensor_num_part_1_test` and its
+  `_within_keyswitch_noise_test` sibling).
+- The batched-vs-per-tower NTT kernel launch mechanism: temporarily
+  swapped `evalkeygen_host_sold`'s `LaunchNTT_CT_Batched` (used only
+  by this function, for its own private `u`/`e0`/`e1` sampling) for a
+  per-tower loop using `LaunchNTT_CT` (the kernel `keygen_host` uses
+  successfully) -- bit-for-bit IDENTICAL result either way. This
+  change was REVERTED (`git checkout -- src/evalkeygen.cpp`) since it
+  gave no benefit; do not re-attempt without a new reason.
+- An eval-key accessor/FFI/indexing bug: C++ and Rust read the exact
+  same raw `pkA`/`pkB`/`av`/`bv` values for the same (tower,
+  coefficient) -- confirmed via a direct cross-check.
+- A `ks_context_create`-introduced mutation of `K.av`/`K.bv`: it takes
+  `const KeySwitchConstants&`, so this is structurally impossible.
+
+**Hypotheses NOT yet tested -- the recommended starting points**:
+- The exact per-coefficient arithmetic of `u`/`e0`/`e1`'s
+  sampling-to-coefficient-embedding step (`src/evalkeygen.cpp`, lines
+  ~98-109) -- add a bounded debug dump (ONE tower, ONE coefficient,
+  not secret material in bulk) INSIDE `evalkeygen_host_sold` and
+  independently verify the FULL per-coefficient arithmetic chain by
+  hand for a tower outside part 0's range, to find the exact
+  divergence point. (A similar one-off debug dump was added and
+  removed this round at `part==0 && t==4 && k==0`; the raw values
+  cross-checked consistently against Rust, but the SINGLE-coordinate
+  hand-verification done at the time incorrectly compared in
+  eval-domain rather than converting the WHOLE tower to coefficient
+  domain first -- repeat this check properly, i.e. over all `k`,
+  INTT'd, not a single eval-domain point, which is exactly the trap
+  entry #39 already warned about.)
+- Whether `PModq_QP`'s computation (`cpp_bridge/keyswitch_bridge.cpp`,
+  lines ~131-136) is correct -- NOT exercised by the "outside range"
+  test, which deliberately avoids needing it.
+- Write a tiny, from-scratch C++ test calling `evalkeygen_host_sold`
+  directly (bypassing the fixture/bridge entirely) with a
+  HAND-CONSTRUCTED, trivial `sQP`/`pkA_QP`/`pkB_QP` (e.g. an all-zero
+  secret, so `pkB=ns*e` trivially and `bv` should equal exactly
+  `ns*e0` with no `s`-dependence at all) to isolate the computation
+  from `keygen_host`'s own output entirely.
+
+**Secondary, not yet resolved either (was the original Phase 6/7 open
+question, still true)**: the full
 `EvalMultContext::multiply_relin_rescale` -> `codec::decrypt` ->
-`codec::decode` round trip (the still-`#[ignore]`d
-`real_encrypted_evalmult_matches_expected_product` and its 3 siblings
-in `rust/crates/ckks-cuda/src/evalmult.rs`) still FAILS, with a large,
-genuine decode-level error (slot 0: decoded=-370.86, expected=5,
-abs_err=375.86 -- re-confirmed this round, not stale). Since
-`codec::decrypt`/`decode` already go through proper NTT/coefficient
-domain conversion (unlike the now-fixed raw checks above), this is a
-DIFFERENT bug, not explained by entry #39's finding.
-
-**Already independently proven correct, do not re-doubt without new
-evidence**: `LaunchTensor`, `keyswitch_device_resident`/
-`LaunchCombine` (entries #35-37, RNS-level; entry #39, real-data,
-decrypt-level), and `rescale_device_resident` (entries #35-37,
-RNS-level, including two-calls-in-a-row-no-leak). Phase 4's own
-`evalmult_matches_independent_reference_random_data` ALREADY proves
-the exact fused composition (`multiply_relin_rescale`'s own sequence of
-calls) bit-exact against a step-by-step reference -- for SYNTHETIC RNS
-data. This narrows the remaining bug to something specific to REAL,
-CKKS-scaled ciphertext data (large dynamic range, Δ²-scaled before
-rescale) rather than a generic buffer-reuse/sequencing hazard in the
-fused device-resident chain, which would also have broken the
-synthetic-data differential test.
-
-**The next concrete experiment, not yet attempted**: isolate
-[tensor+keyswitch+combine] from [rescale] directly on REAL ciphertext
-data. A new TEST-ONLY method,
-`EvalMultContext::multiply_relin_no_rescale_for_test` (`#[cfg(test)]`,
-`pub(crate)`, already added to `evalmult.rs` this round), returns the
-combined, UN-rescaled `(t0+ba0, t1+ba1)` at full `size_ql` towers
-(scale Δ², not Δ) -- but is NOT YET USED by any test, because
-`codec::decrypt`'s documented "tower-0-only recovery" convention only
-works for `delta`-scaled (post-rescale) values, not the `delta²`-scaled
-pre-rescale result, which will generally exceed a single tower's
-modulus range. Two viable paths, neither attempted yet:
-(a) write a minimal, full-CRT-reconstruction decode in Rust (or call an
-existing C++ `decode_host`/multi-tower decrypt helper via a NEW bridge
-function, if the engine has one) capable of handling a `delta²`-scaled,
-full-`size_ql`-tower value, and verify
-`multiply_relin_no_rescale_for_test`'s output decrypts to the expected
-product directly; or (b) bypass decrypt entirely and instead
-reproduce Phase 4's OWN "step-by-step reference, cross-checked at
-every intermediate stage" methodology but with REAL (not synthetic)
-ciphertext inputs feeding `rescale_device_resident` specifically,
-to see at which exact stage (combine's output vs. rescale's output)
-real CKKS-scaled data first diverges from the expected value. Path (b)
-is likely cheaper (reuses existing, already-proven helper functions,
-no new CRT-reconstruction code) and is the recommended starting point.
-
-**Also worth checking, not yet ruled out**: whether `rescale_device_
-resident`'s correctness (entries #35-37) was ever specifically
-exercised with REAL CKKS-scaled magnitudes (large dynamic range
-concentrated by a genuine encryption + tensor product) as opposed to
-uniformly-random synthetic RNS residues spanning the full modulus
-range -- if its rounding/division-by-dropped-tower logic has an
-edge case specific to the MAGNITUDE distribution real ciphertexts
-produce (as opposed to the VALUES themselves, which entries #35-37's
-synthetic tests already span the full range of), that would explain
-why the isolated-kernel and synthetic-composition tests pass while
-real data fails. This is a hypothesis, not yet tested.
+`codec::decode` round trip (`real_encrypted_evalmult_matches_expected_
+product` and siblings) still fails -- but this is now EXPECTED, since
+it depends on `evalkeygen_host`'s eval key being correct, which entry
+#40 shows it is not. Fixing `evalkeygen_host` is the PREREQUISITE for
+re-attempting the rescale/composition question (previously the leading
+open item) -- do not investigate rescale further until the eval key
+itself is fixed and `control_a_relin_combine_matches_raw_tensor_within_
+keyswitch_noise_test` passes.
 
 ## `-G` build-flag bug: CLOSED for the four originally-flagged benchmarks; one remaining sweep still open
 

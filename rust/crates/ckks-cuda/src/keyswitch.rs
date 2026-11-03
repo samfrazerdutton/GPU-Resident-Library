@@ -119,6 +119,15 @@ extern "C" {
         err_buf: *mut c_char,
         err_buf_len: usize,
     ) -> i32;
+    fn gpufhe_ks_fixture_eval_key_part(
+        handle: *mut c_void,
+        part: u32,
+        out_av: *mut u64,
+        out_bv: *mut u64,
+        out_len: usize,
+    ) -> bool;
+    fn gpufhe_ks_fixture_eval_key_towers(handle: *mut c_void) -> u32;
+    fn gpufhe_ks_fixture_alpha(handle: *mut c_void) -> u32;
 }
 
 const ERR_BUF_LEN: usize = 512;
@@ -280,6 +289,36 @@ impl KeySwitchContext {
         let ok = unsafe { gpufhe_ks_fixture_public_key_b(self.handle, out.as_mut_ptr(), len) };
         assert!(ok, "gpufhe_ks_fixture_public_key_b: length mismatch (internal bug)");
         out
+    }
+
+    /// GOD PROMPT "CKKS PHASE 7": the RAW eval key component
+    /// `(av[part], bv[part])`, full QP range (`eval_key_towers() * n`
+    /// elements each, eval domain) -- TEST-ONLY. Bypasses
+    /// `keyswitch`/`keyswitch_reference` entirely, exposing exactly
+    /// what `evalkeygen_host` generated, to check its OWN claimed
+    /// decryption identity (`bv[part]-av[part]*s == P*s2` in part's
+    /// Q-range + small noise, per `src/evalkeygen.cpp`'s doc comment)
+    /// directly, isolated from the accumulate/decompose/moddown logic.
+    pub fn eval_key_part(&self, part: u32) -> (Vec<u64>, Vec<u64>) {
+        let len = self.eval_key_towers() as usize * self.n.get() as usize;
+        let mut av = vec![0u64; len];
+        let mut bv = vec![0u64; len];
+        let ok = unsafe { gpufhe_ks_fixture_eval_key_part(self.handle, part, av.as_mut_ptr(), bv.as_mut_ptr(), len) };
+        assert!(ok, "gpufhe_ks_fixture_eval_key_part: length mismatch or invalid part (internal bug)");
+        (av, bv)
+    }
+
+    /// Tower count of the eval key's own QP range (`size_ql + size_p`,
+    /// confirmed via the accessor rather than assumed).
+    pub fn eval_key_towers(&self) -> u32 {
+        unsafe { gpufhe_ks_fixture_eval_key_towers(self.handle) }
+    }
+
+    /// Per-part tower span (`alpha`) `compute_keyswitch_constants`
+    /// derived -- so a caller can locate each part's own Q-range
+    /// without re-deriving `ceil(size_ql/alpha)` itself.
+    pub fn alpha(&self) -> u32 {
+        unsafe { gpufhe_ks_fixture_alpha(self.handle) }
     }
 
     /// Steady-state per-call path: upload `a` (eval domain, `size_ql * n`
