@@ -142,6 +142,12 @@ fn main() {
     objs.push(compile_cpp(&root.join("src/ks_constants.cpp"), &out_dir, &include_dir, &cuda_include));
     objs.push(compile_cpp(&root.join("src/keyswitch.cpp"), &out_dir, &include_dir, &cuda_include));
     objs.push(compile_cpp(&root.join("src/keyswitch_resident.cpp"), &out_dir, &include_dir, &cuda_include));
+    // GOD PROMPT "CKKS PHASE 10": the Hybrid key-switch P>=Q_part_max
+    // validator (include/ks_params_validate.h), called from
+    // keyswitch_resident.cpp's ks_context_create -- pure host C++, no
+    // CUDA, but still compiled via this build script's g++ path since it
+    // links into the same static object set every other file here does.
+    objs.push(compile_cpp(&root.join("src/ks_params_validate.cpp"), &out_dir, &include_dir, &cuda_include));
     // src/encode.cpp / src/encdec.cpp: the EXISTING, unmodified native
     // CKKS encode/decode/encrypt/decrypt primitives (GOD PROMPT "CKKS
     // PHASE 5"), wrapped by the new cpp_bridge/encdec_bridge.cpp below.

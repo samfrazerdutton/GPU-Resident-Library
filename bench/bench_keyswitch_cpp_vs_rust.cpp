@@ -8,8 +8,16 @@
 // (src/evalkeygen.cpp), ks_context_create/ks_work_create/keyswitch_resident
 // (src/keyswitch_resident.cpp) -- so both languages are measured doing the
 // SAME setup work, same kernels, same configuration (n=1024, sizeQ=8,
-// sizeP=2, numPart=2, matching tests/test_keyswitch_core_native_diff.cpp
-// and this round's Rust test module).
+// sizeP=2, numPart=4, matching rust/crates/ckks-cuda/src/keyswitch.rs's
+// test module. GOD PROMPT "CKKS PHASE 10": numPart was 2 until this
+// round -- that combination violates the Hybrid key-switch's required
+// P>=Q_part_max condition (research/EXPERIMENT_LEDGER.md entry #42/#43)
+// and is now REJECTED at ks_context_create construction time, so this
+// benchmark would abort with a validation error at the old value. This
+// file only measures timing (never checks the key-switched result
+// against a decryption invariant), so the old value never produced a
+// visibly wrong number -- it would simply have stopped building a
+// context at all once validation landed.
 //
 // UNLIKE rescale's benchmark, there is no "narrower setup" story available
 // here: key switching genuinely needs the full eval key + DeviceKSContext +
@@ -120,7 +128,7 @@ static void report(const char* label, std::vector<double>& per_trial) {
 }
 
 int main(int argc, char** argv) {
-    const uint32_t n = 1024, sizeQ = 8, sizeP = 2, numPart = 2;
+    const uint32_t n = 1024, sizeQ = 8, sizeP = 2, numPart = 4; // see entry #42/#43: numPart=2 violates P>=Q_part_max
     size_t reps = argc > 1 ? (size_t)std::atoi(argv[1]) : 20;
     size_t trials = argc > 2 ? (size_t)std::atoi(argv[2]) : 7;
 

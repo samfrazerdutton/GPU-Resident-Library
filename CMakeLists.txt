@@ -38,6 +38,7 @@ add_library(gpufhe STATIC
   src/ckks_ops.cpp
   src/keyswitch.cpp
   src/ks_constants.cpp
+  src/ks_params_validate.cpp
   src/keygen.cpp
   src/evalkeygen.cpp
   src/encdec.cpp
@@ -103,6 +104,14 @@ gpufhe_test(test_keyswitch tests/test_keyswitch.cpp)
 # extracted raw towers) to rule out a test-side extraction bug.
 gpufhe_test(test_evalmult_relin_openfhe_reference tests/test_evalmult_relin_openfhe_reference.cpp)
 gpufhe_test(test_ks_constants tests/test_ks_constants.cpp)
+# GOD PROMPT "CKKS PHASE 10": standalone, no-GPU correctness test for
+# check_hybrid_keyswitch_params (include/ks_params_validate.h), the
+# single authoritative Hybrid key-switch P>=Q_part_max validator enforced
+# at ks_context_create (src/keyswitch_resident.cpp, entry #43) -- cross-
+# checked independently via tools/verify_ks_params_validate.py (Python's
+# native arbitrary-precision arithmetic, a different implementation
+# stack).
+gpufhe_test(test_ks_params_validate tests/test_ks_params_validate.cpp)
 gpufhe_test(test_keygen tests/test_keygen.cpp)
 gpufhe_test(test_evalkeygen tests/test_evalkeygen.cpp)
 # GOD PROMPT "CKKS PHASE 8": fully native (OpenFHE-free) isolation of

@@ -900,6 +900,28 @@ mod tests {
         );
     }
 
+    // GOD PROMPT "CKKS PHASE 10": the FORMER default fixture (NUM_PART=2)
+    // was invalid per the Hybrid key-switch's P>=Q_part_max requirement
+    // (research/EXPERIMENT_LEDGER.md entry #42) -- this pins down that it
+    // is now REJECTED at construction time (entry #43's `ks_context_
+    // create` validation, propagated through `KeySwitchContext::new`
+    // which `EvalMultContext::new` builds first), independent of this
+    // module's own `NUM_PART` constant having already moved to 4.
+    #[test]
+    fn former_invalid_num_part_2_fixture_is_now_rejected() {
+        let n = RingDimension::new(N).unwrap();
+        let result = EvalMultContext::new(n, SIZE_Q, SIZE_P, 2, 1);
+        let err = match result {
+            Ok(_) => panic!("the old NUM_PART=2 fixture (SIZE_Q=8, SIZE_P=2) violates P>=Q_part_max and must be rejected"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("Q_part_max") || msg.contains("Hybrid key-switch"),
+            "rejection error should name the actual violated condition, got: {msg}"
+        );
+    }
+
     /// Shared tolerance for comparing decoded real-CKKS slot values
     /// against their mathematically expected value -- see
     /// [`SLOT_TOLERANCE`]'s own doc comment below for the derivation.

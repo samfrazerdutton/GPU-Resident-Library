@@ -1534,3 +1534,102 @@ resolution.
   unaffected by the P/Q_part ratio) but flagged as a dormant instance
   of the same pattern. `test_polyeval`'s own, separate multi-level
   noise question remains untouched.
+
+## GOD PROMPT "CKKS PHASE 10": repository-wide parameter audit + centralized, exact enforcement of the Hybrid key-switch's P>=Q_part_max requirement — four more invalid fixtures found and fixed, keyswitch.rs's own fixture corrected with a new decrypt-based test, invalid configurations now REJECTED at construction time
+
+Full detail: `EXPERIMENT_LEDGER.md` entry #43. `NEXT_SESSION.md`'s
+"READ THIS FIRST" section rewritten to reflect this.
+
+- **The core deliverable**: entry #42 established the `P>=Q_part_max`
+  requirement as a derived FACT; this round implemented it as CODE —
+  `include/ks_params_validate.h`/`src/ks_params_validate.cpp`'s
+  `check_hybrid_keyswitch_params`, using true arbitrary-precision
+  integer products (never a bit-length approximation, since
+  `Q_part_max` can exceed 128 bits and two numbers of equal bit length
+  can differ by orders of magnitude). Cross-checked independently
+  against Python's native bigints (`tools/verify_ks_params_validate.py`)
+  — byte-for-byte decimal agreement on every tested configuration, a
+  completely different implementation stack from the C++ BigUint code.
+- **Enforced at `ks_context_create`** (`src/keyswitch_resident.cpp`),
+  immediately after its pre-existing `K.av.size()!=K.numPart` check —
+  the single construction-time choke point every real caller passes
+  through (the Rust FFI bridge, hence `KeySwitchContext::new` AND
+  `EvalMultContext::new`; every benchmark/example building a usable
+  context directly in C++). Deliberately NOT inside
+  `compute_keyswitch_constants` (several permanent diagnostic tests
+  intentionally drive it with invalid configs on purpose) and NOT
+  duplicated in Rust (Rust has zero independent copy — it only learns
+  of a rejection via the C++ exception's propagated message). Zero
+  hot-path cost: the per-call functions never call `ks_context_create`
+  again after construction.
+- **Repository-wide audit found FOUR MORE invalid fixtures** entry
+  #42's audit missed (it only checked `rust/crates/ckks-cuda/src/`):
+  `examples/bench_evalmult.rs`, `examples/bench_keyswitch.rs` (both
+  `NUM_PART=2`), and `bench/bench_evalmult_cpp_vs_rust.cpp`, `bench/
+  bench_keyswitch_cpp_vs_rust.cpp` (both `numPart=2`, direct C++,
+  bypassing the Rust FFI bridge entirely, and registered as auto-run
+  `ctest`s — these would have broken the test suite outright once
+  validation landed). All four fixed to `NUM_PART=4`/`numPart=4`.
+  `tests/test_keyswitch_core_native_diff.cpp`'s default (`numPart=2`
+  via argv, doesn't call `ks_context_create`, so not construction-
+  blocking) was also bumped to 4 purely so running it with no
+  arguments now reports a clean PASS.
+- **Fixed `keyswitch.rs`'s own fixture** (the GOD PROMPT's explicitly
+  named target): `NUM_PART` 2->4. Added THREE new tests:
+  `invalid_num_part_at_old_value_is_now_rejected` (confirms the exact
+  old default is now rejected with a message naming `Q_part_max`),
+  `valid_num_part_with_surplus_still_constructs` (confirms the
+  validation doesn't over-reject), and
+  `real_decrypt_based_relin_round_trip` — THE decrypt-based correctness
+  test this module's own doc comment flagged as missing: builds a real
+  ciphertext pair under the fixture's own secret/public key, forms the
+  degree-2 tensor product via pure host-side schoolbook arithmetic
+  (entry #37's methodology, genuinely independent of the production
+  `LaunchTensor` kernel), relinearizes through the REAL `keyswitch`
+  call, rescales via the independently-proven `RescaleContext`,
+  decrypts and decodes via `codec`, and compares against the plaintext
+  product computed in the clear. **Result: max abs error `2.23e-11`**
+  (tolerance `1e-6`). Also added `evalmult.rs::
+  former_invalid_num_part_2_fixture_is_now_rejected` confirming the
+  rejection propagates through `EvalMultContext::new` too.
+- **Audited and confirmed VALID (no fix needed), via the exact
+  validator, not assumption**: `tests/test_ks_raii.cpp`, `tests/
+  test_ks_context_create_validation.cpp` (`n=8192,sizeQ=4,sizeP=2,
+  numPart=2`); `tests/test_hoist_*.cpp`/`test_rot_resident.cpp`/
+  `bench/bench_hoist_multi.cpp` (all `n=8192,sizeQ=30,sizeP=2,
+  numPart=15`); `tests/test_ks_resident.cpp` (OpenFHE's own `HYBRID`
+  parameter choice at `n=32768`, re-built fresh with validation
+  active, still bit-exact). **Trusted, not independently re-derived**:
+  `bench/bench_evalmult.cpp`/`bench_evalmult_resident.cpp`
+  (OpenFHE-sourced `GetNumPartQ`/`GetParamsP`). **Deliberately exempt**
+  (never call `ks_context_create`, intentionally drive invalid configs
+  for diagnostic purposes): `tests/test_evalkeygen_isolated.cpp`,
+  `tests/test_ks_pq_ratio_sweep.cpp`, `tests/
+  test_keyswitch_stage_trace.cpp`, `tests/
+  test_moddown_crt_basis_isolated.cpp`, `tests/
+  test_decompose_crt_basis_isolated.cpp`, `tests/
+  test_moddown_combine_isolated.cpp`. `tests/test_alpha10.cpp` checked
+  and confirmed UNRELATED (no keyswitch involvement at all).
+- **Result**: Full Rust suite **38 passed, 0 failed, 1 ignored** (up
+  from 34/1 at entry #42), identical in `--release` and debug. The two
+  fixed C++ benchmarks and two fixed Rust examples all rebuilt fresh
+  and confirmed working (both C++ benchmarks' own internal correctness
+  gates pass: 0/16384 and 0/14336 mismatches).
+- **The general lesson, now stated as explicit project doctrine**: a
+  passing RNS-level or self-consistency test does NOT prove a
+  parameter configuration satisfies the real ciphertext decryption
+  invariant. `keyswitch.rs`'s invalid fixture passed every one of its
+  own tests for multiple rounds precisely because none of them checked
+  a real decryption invariant — only `keyswitch_device_resident`
+  against `keyswitch_reference`, two implementations of the identical
+  formula.
+- **Not attempted**: a full CMake rebuild (host free memory stayed
+  under the established 6GB gate throughout) — every C++-side claim
+  was verified via direct `nvcc`/`g++` compilation, each confirmed
+  freshly built. No performance claim made for any fixture's corrected
+  `NUM_PART`. Exact equality `P==Q_part_max` remains untested in
+  practice (explained in `include/ks_params_validate.h`'s own honesty
+  note — distinct-prime products make literal equality a measure-zero
+  coincidence this library's prime generation does not produce).
+  `test_polyeval`'s own, separate multi-level noise question remains
+  untouched.

@@ -3,17 +3,16 @@
 ## Current commit
 
 Check `git log -3` on resume. As of this writing, HEAD is a new commit
-on top of entry #41's commit `1f1cf93` (the GOD PROMPT "CKKS PHASE 9"
-round: entry #41's "sizeP=2-specific key-switch reconstruction defect"
-is SUPERSEDED -- `sizeP=2` was never the trigger. The real cause was
-the real Rust fixture's `NUM_PART=2` choosing a digit size (`Q_part`)
-larger than the auxiliary modulus `P`, violating the Hybrid
-key-switch's standard `P>=Q_part_max` requirement. Raising `NUM_PART`
-to 4 fixed it. **The real encrypted EvalMult round trip now PASSES
-end-to-end** -- the first time since this investigation began (Phase
-5). See `EXPERIMENT_LEDGER.md` entry #42 for the full evidence chain).
-Confirm push status -- push again if `git status` shows ahead of
-origin.
+on top of entry #42's commit `405e650` (the GOD PROMPT "CKKS PHASE 10"
+round: repository-wide audit of every hardcoded key-switch parameter
+fixture + centralized, EXACT arbitrary-precision enforcement of the
+`P >= Q_part_max` requirement at `ks_context_create`. Found and fixed
+FOUR more invalid fixtures entry #42 missed (two Rust examples, two
+C++ benchmarks, both registered as auto-run `ctest`s) plus
+`keyswitch.rs`'s own fixture, and gave `keyswitch.rs` its first-ever
+decrypt-based correctness test. See `EXPERIMENT_LEDGER.md` entry #43
+for the full inventory). Confirm push status -- push again if
+`git status` shows ahead of origin.
 
 **Reminder, confirmed the hard way in an earlier round**: this machine
 has (at least) two SEPARATE git clones of this GitHub repo -- the WSL
@@ -24,84 +23,115 @@ an entirely unrelated commit history (raw CUDA-kernel-optimization
 work) and untracked, stale copies of `rust/`/`research/` -- never run
 `git status`/`log`/commit decisions against it for this work.
 
-## READ THIS FIRST if resuming into EvalMult/relin work: the real encrypted EvalMult round trip PASSES. The blocker was a parameter choice, not a code defect, and it is FIXED.
+## READ THIS FIRST if resuming into EvalMult/relin/key-switch work: the real encrypted EvalMult AND key-switch round trips both PASS. Invalid configurations are now REJECTED at construction time, not just avoided by convention.
 
-**The multi-phase EvalMult investigation (Phases 5-9) is RESOLVED.**
-Every prior round's "defect" hypothesis (entry #30/#38's relin
-identity, entry #40's `evalkeygen_host`, entry #41's `sizeP=2`-specific
-key-switch reconstruction) is now understood as either a test
-methodology bug or an incomplete parameter sweep -- NOT a defect in
-`src/` or `kernels/`. The real, final cause: the test fixture
-(`rust/crates/ckks-cuda/src/evalmult.rs`'s `new_ctx`,
-`SIZE_Q=8,SIZE_P=2,NUM_PART=2`) chose `NUM_PART=2` (alpha=4), giving
-each key-switch digit a modulus product (`Q_part`, ~210 bits: one
-60-bit + three 50-bit Q towers) LARGER than the auxiliary modulus `P`
-(2*60-bit = ~120 bits) -- violating the Hybrid key-switch's standard
-`P >= Q_part_max` correctness requirement (the auxiliary modulus must
-be at least as large as the largest digit's own modulus product; a
-property of RNS-CKKS Hybrid key-switching itself, not specific to this
-codebase). **Fix: raised `NUM_PART` from 2 to 4** (alpha=2, `Q_part_max`
-drops to ~110 bits, a +10-bit margin over `P`) -- `SIZE_Q`, `SIZE_P`,
-`n`, and the secret distribution (`h=64`) are ALL UNCHANGED; this is a
-digit-grouping choice with zero security-parameter impact. **Result:
-`real_encrypted_evalmult_matches_expected_product` passes with max abs
-error `2.5896e-11` (tolerance `1e-6`)**; all sibling tests pass too.
-Full Rust suite: 34 passed, 0 failed, 1 ignored (down from 7 ignored).
+**The multi-phase EvalMult/key-switch investigation (Phases 5-10) is
+RESOLVED.** Every prior round's "defect" hypothesis (entry #30/#38's
+relin identity, entry #40's `evalkeygen_host`, entry #41's
+`sizeP=2`-specific key-switch reconstruction) is understood as either a
+test methodology bug or an incomplete parameter sweep -- NOT a defect
+in `src/` or `kernels/`. The real, final cause (entry #42): a key-switch
+digit's own modulus product (`Q_part`) must not exceed the auxiliary
+modulus `P` (`P >= Q_part_max`, the standard RNS-CKKS Hybrid
+key-switch requirement). This round (entry #43) went further:
 
-**Decisive evidence, in case this needs re-deriving**: `tests/
-test_ks_pq_ratio_sweep.cpp` holds `sizeP=2` FIXED and sweeps ONLY
-`numPart` -- `numPart=1,2,3` (deficit -290b/-90b/-40b) all FAIL ~50% of
-q; `numPart=4,8` (surplus +10b/+60b) both PASS ~6e-12% of q. The
-failure flips exactly when `P - Q_part_max` crosses zero, with `sizeP`
-never changing -- this is what overturned entry #41's framing.
+1. **Implemented the EXACT check as code**, not just a derived fact in
+   a research doc: `include/ks_params_validate.h` + `src/
+   ks_params_validate.cpp`'s `check_hybrid_keyswitch_params`, using
+   true arbitrary-precision integer products (a little-endian
+   base-2^64 BigUint), never a bit-length approximation. Cross-checked
+   independently against Python's native bigints
+   (`tools/verify_ks_params_validate.py`) -- byte-for-byte decimal
+   agreement, a completely different implementation stack.
+2. **Enforced it at `ks_context_create`** (`src/keyswitch_resident.cpp`),
+   the single construction-time choke point every real caller passes
+   through (the Rust FFI bridge, hence both `KeySwitchContext::new`
+   and `EvalMultContext::new`; every C++ benchmark/example that builds
+   a usable context directly). Invalid configurations now throw
+   `std::invalid_argument` with the actual `P`/`Q_part_max` decimal
+   values in the message, BEFORE any eval-key generation or GPU
+   context work would otherwise proceed.
+3. **Audited every hardcoded fixture in the repository** and found
+   FOUR MORE invalid ones entry #42's audit missed (it only checked
+   `rust/crates/ckks-cuda/src/`): `examples/bench_evalmult.rs`,
+   `examples/bench_keyswitch.rs` (both `NUM_PART=2`), and `bench/
+   bench_evalmult_cpp_vs_rust.cpp`, `bench/bench_keyswitch_cpp_vs_rust.cpp`
+   (both `numPart=2`, direct C++, registered as auto-run `ctest`s --
+   these would have broken the test suite outright once validation
+   landed, not just produced a misleading benchmark number). All four
+   fixed to `NUM_PART=4`/`numPart=4`, matching `evalmult.rs`'s own
+   Phase 9 fix.
+4. **Fixed `keyswitch.rs`'s own fixture** (the GOD PROMPT's explicitly
+   named target): `NUM_PART` 2->4, plus a NEW decrypt-based correctness
+   test (`real_decrypt_based_relin_round_trip`) that builds a real
+   ciphertext, relinearizes it through this module's real `keyswitch`
+   call, rescales, decrypts, decodes, and compares against the
+   plaintext product computed in the clear -- max abs error `2.23e-11`
+   (tolerance `1e-6`). This module's tests had NEVER done this before;
+   every prior test checked only `keyswitch` against `keyswitch_
+   reference` (self-consistency between two implementations of the
+   SAME formula), which is blind to whether the formula's own
+   precondition holds.
 
-**Do not re-doubt, without new evidence**:
-- `evalkeygen_host`/`evalkeygen_host_sold`/`keygen_host` (proven
-  correct, entry #41, four independent routes).
-- `compute_keyswitch_constants`'s ModDown family (`pHatInv`/
-  `pHatModq`/`mdBMu*`/`pInvModq`) and decompose family (`partQHatInv`/
-  `partQHatModp`/`partComplMod`/`partBMu*`) -- BOTH independently
-  proven correct at every `sizeP` in {1,2,3} via `tests/
-  test_moddown_crt_basis_isolated.cpp` and `tests/
-  test_decompose_crt_basis_isolated.cpp` (entry #42), using CPU
-  references independent of the production algorithm.
-- `LaunchApproxSwitchCRTBasis`, `LaunchModDownCombine`, and the full
-  ModDown chain (INTT->basis-convert->NTT->combine) at real n=1024
-  scale -- proven correct via `tests/test_moddown_combine_isolated.cpp`
-  (entry #42).
-- `keyswitch_core_resident`'s decompose (STAGE 2) and accumulate
-  (STAGE 3a) steps -- proven EXACT (zero tolerance) across the full
-  `sizeQl x sizeP x numPart` matrix via `tests/
-  test_keyswitch_stage_trace.cpp` (entry #42); the ONLY thing that
-  varies with the P/Q_part ratio is the final relin identity (STAGE
-  3b's accumulated noise), never decompose or accumulate correctness.
+Full Rust suite: **38 passed, 0 failed, 1 ignored** (up from 34/1 at
+entry #42), identical in `--release` and debug.
+
+**The general lesson (restate this if the pattern recurs)**: a passing
+RNS-level or self-consistency test does NOT prove a parameter
+configuration satisfies the real ciphertext decryption invariant.
+`keyswitch.rs`'s invalid fixture passed every one of its own tests for
+multiple rounds (entry #36 onward) precisely because none of them
+checked a real decryption invariant.
+
+**Audited and confirmed VALID (no fix needed)**: `tests/
+test_ks_raii.cpp`, `tests/test_ks_context_create_validation.cpp`
+(`n=8192,sizeQ=4,sizeP=2,numPart=2`, alpha=2); `tests/test_hoist_*.cpp`,
+`tests/test_rot_resident.cpp`, `bench/bench_hoist_multi.cpp` (all
+`n=8192,sizeQ=30,sizeP=2,numPart=15`, alpha=2 -- confirmed via the
+exact validator, not assumed); `tests/test_ks_resident.cpp` (OpenFHE's
+own `HYBRID`-technique parameter choice at `n=32768`, re-built fresh
+with validation active, still bit-exact). **Trusted, not
+independently re-derived**: `bench/bench_evalmult.cpp`/`bench_evalmult_
+resident.cpp` (OpenFHE-sourced `GetNumPartQ`/`GetParamsP`). **Note**:
+`tests/test_hoist_stage0.cpp`/`test_hoist_allstages.cpp` carry a STALE
+comment ("P must cover a part (10x50=500 bits), hence sizeP=9x60=540
+bits") describing a different, hypothetical alpha=10 configuration the
+code does NOT actually use (the real `npFor` lambda gives alpha=2) --
+not fixed this round, flagged as a readability issue only, no
+correctness impact.
+
+**Deliberately exempt, never call `ks_context_create`, unaffected by
+this round's enforcement**: `tests/test_evalkeygen_isolated.cpp`,
+`tests/test_ks_pq_ratio_sweep.cpp`, `tests/test_keyswitch_stage_trace.cpp`,
+`tests/test_moddown_crt_basis_isolated.cpp`, `tests/
+test_decompose_crt_basis_isolated.cpp`, `tests/
+test_moddown_combine_isolated.cpp` -- all intentionally drive invalid
+configurations to document the phenomenon, calling `keyswitch_core_
+resident`/lower-level functions directly. Re-ran `test_ks_pq_ratio_
+sweep.cpp` this round: byte-identical to entry #42's own figures.
 
 **If a FUTURE round picks a new `SIZE_Q`/`SIZE_P`/`NUM_PART`
-combination and sees the same "~50% of q" signature again**: compute
-`Q_part_max = max over parts of (sum of bit-lengths of that part's own
-Q towers)` and compare against `P`'s total bit length
-(`sum of bit-lengths of all P towers`) BEFORE suspecting a code
-defect. If `P < Q_part_max`, that is sufficient explanation by itself
--- raise `NUM_PART` (cheapest, no security impact) or `SIZE_P`
-(changes `log2(QP)`, a security-relevant parameter, needs
-re-validating `research/SECURITY_ASSESSMENT.md`).
+combination and sees the "~50% of q" signature again**: call
+`gpufhe::check_hybrid_keyswitch_params(moduliQ, moduliP, numPart)`
+(`include/ks_params_validate.h`) directly rather than re-deriving a
+bit-length estimate by hand -- it is now the single authoritative,
+exact implementation, independently cross-checked against Python.
 
 **Not addressed, deliberately out of scope this round**:
-- `control_a_relin_combine_matches_raw_tensor_num_part_1_test`
-  (forces `numPart=1`) correctly remains `#[ignore]`d -- `numPart=1`
-  at `SIZE_P=2` genuinely violates `P>=Q_part_max` (`Q_part=410b` vs
-  `P=120b`) and would need a much larger `SIZE_P` to fix, which is a
-  security-relevant change.
-- `keyswitch.rs`'s own test fixture (`src/keyswitch.rs`) uses the
-  IDENTICAL `SIZE_Q=8,SIZE_P=2,NUM_PART=2` combo and was never updated
-  -- its tests only check `keyswitch_device_resident` against
-  `keyswitch_reference` (self-consistency between two implementations
-  of the same formula), which is unaffected by the P/Q_part ratio, so
-  nothing there is currently broken. Flagged as a dormant instance of
-  the same pattern for anyone adding a decrypt-based check there later.
-- Whether `NUM_PART=4` is the BEST (fastest) choice for this fixture
-  was not measured -- only that it is correct. Performance work can
-  resume on this operation now that correctness is established.
+- `control_a_relin_combine_matches_raw_tensor_num_part_1_test` and
+  `keyswitch.rs`'s analogous negative case for `numPart=1` correctly
+  remain `#[ignore]`d / untested -- `numPart=1` at `SIZE_P=2`
+  genuinely violates `P>=Q_part_max` (`Q_part=410b` vs `P=120b`) and
+  would need a much larger `SIZE_P` to fix, a security-relevant change.
+- Exact equality `P==Q_part_max` was not independently tested (see
+  `include/ks_params_validate.h`'s own honesty note: `P` and
+  `Q_part_max` are products of disjoint-search-space primes, making
+  literal equality a measure-zero coincidence `native_primes` does not
+  naturally produce).
+- Whether `NUM_PART=4` is the BEST (fastest) choice for any of the
+  fixtures touched this round was not measured -- only that each is
+  correct. Performance work can resume now that correctness and
+  configuration safety are both established.
 - `test_polyeval`'s own, separate multi-level noise question (entry
   #26/#29/#30, never resolved) is untouched by this round.
 

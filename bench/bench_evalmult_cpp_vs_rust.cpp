@@ -2,7 +2,11 @@
 // kernels, host orchestration entirely in C++) of the fair comparison
 // against rust/crates/ckks-cuda::EvalMultContext (Path B). Same native
 // (OpenFHE-free) fixture recipe as bench_keyswitch_cpp_vs_rust.cpp
-// (n=1024, sizeQ=8, sizeP=2, numPart=2), extended with the SAME
+// (n=1024, sizeQ=8, sizeP=2, numPart=4 -- GOD PROMPT "CKKS PHASE 10": was
+// numPart=2, which violates the Hybrid key-switch's required
+// P>=Q_part_max condition and is now rejected at ks_context_create
+// construction time; see research/EXPERIMENT_LEDGER.md entry #42/#43),
+// extended with the SAME
 // tensor+relin+combine+rescale(x2) composition
 // bench/bench_evalmult_resident.cpp already demonstrates at a different
 // (OpenFHE-sourced, N=16-batched, CUDA-graph) scale -- this file is NOT a
@@ -152,7 +156,7 @@ static void report(const char* label, std::vector<double>& per_trial) {
 }
 
 int main(int argc, char** argv) {
-    const uint32_t n = 1024, sizeQ = 8, sizeP = 2, numPart = 2;
+    const uint32_t n = 1024, sizeQ = 8, sizeP = 2, numPart = 4; // see entry #42/#43: numPart=2 violates P>=Q_part_max
     size_t reps = argc > 1 ? (size_t)std::atoi(argv[1]) : 20;
     size_t trials = argc > 2 ? (size_t)std::atoi(argv[2]) : 7;
 

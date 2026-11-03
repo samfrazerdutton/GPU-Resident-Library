@@ -47,12 +47,29 @@ static uint64_t am(uint64_t a,uint64_t b,uint64_t q){uint64_t s=a+b;return s>=q?
 
 int main(int argc, char** argv){
     // Mirror test_polyeval's exact first-level parameters: n=1024, tw=8
-    // (1x60-bit + 7x50-bit), sizeP=2, numPart=2 by default; numPart
+    // (1x60-bit + 7x50-bit), sizeP=2, numPart=4 by default; numPart
     // overridable via argv[1] to isolate whether a failure is specific to
     // multi-part digit decomposition (numPart>1) or present even with a
     // single part (numPart=1, no decomposition at all).
+    //
+    // GOD PROMPT "CKKS PHASE 10": default was numPart=2 until this round.
+    // research/EXPERIMENT_LEDGER.md entry #42 found that combination
+    // violates the Hybrid key-switch's required P>=Q_part_max condition
+    // (Q_part_max~210 bits > P~120 bits at sizeP=2/numPart=2) -- this
+    // test's own worst_frac_of_q check would correctly report ~50% of q
+    // (a real but EXPECTED consequence of an invalid parameter choice,
+    // not a code defect) if invoked with the old default or with argv[1]
+    // explicitly set to an invalid numPart (1, 2, or 3 at this sizeQ/sizeP).
+    // numPart=4 (alpha=2, Q_part_max~110 bits) is the smallest numPart
+    // that satisfies the requirement at this sizeQ/sizeP, matching
+    // evalmult.rs's/keyswitch.rs's corrected default. This test does NOT
+    // call ks_context_create (it calls keyswitch_core_resident directly),
+    // so it is not subject to the new construction-time validation in
+    // src/keyswitch_resident.cpp -- the default is corrected here purely
+    // so running this diagnostic with no arguments reports a clean PASS
+    // rather than a (now understood, not mysterious) "failure".
     const uint32_t n=1024, sizeQ=8, sizeP=2; const uint64_t ns=1;
-    const uint32_t numPart = (argc>1) ? (uint32_t)std::stoul(argv[1]) : 2;
+    const uint32_t numPart = (argc>1) ? (uint32_t)std::stoul(argv[1]) : 4;
     std::vector<uint64_t> mod,modP;
     gpufhe::native_primes(mod,1,60,n,{});
     { std::vector<uint64_t> mids; gpufhe::native_primes(mids,sizeQ-1,50,n,mod); for(auto m:mids) mod.push_back(m); }

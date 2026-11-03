@@ -6,6 +6,7 @@
 #include "moddown.h"
 #include "switch_modulus.h"
 #include "rescale.h"
+#include "ks_params_validate.h"
 #include <cstring>
 #include <stdexcept>
 #include <map>
@@ -48,6 +49,44 @@ DeviceKSContext ks_context_create(const KeySwitchConstants& K, cudaStream_t s){
             " -- call evalkeygen_host (or evalkeygen_host_sold) to populate "
             "K.av/K.bv before ks_context_create; compute_keyswitch_constants "
             "alone does not set them.");
+    }
+    // GOD PROMPT "CKKS PHASE 10": the Hybrid key-switch's required
+    // correctness condition, P >= Q_part_max (research/EXPERIMENT_LEDGER.md
+    // entry #42/#43; full derivation in include/ks_params_validate.h),
+    // enforced HERE -- the single, construction-time choke point every
+    // real caller passes through (the Rust FFI bridge's
+    // gpufhe_ks_fixture_create calls this; every benchmark/example that
+    // builds a usable key-switch context calls this). Deliberately NOT
+    // enforced inside compute_keyswitch_constants itself, which several
+    // permanent diagnostic/regression tests (tests/test_ks_pq_ratio_sweep.cpp,
+    // tests/test_keyswitch_stage_trace.cpp, tests/test_evalkeygen_isolated.cpp)
+    // intentionally drive with INVALID configurations on purpose, to
+    // measure and document the failure -- those tests call
+    // keyswitch_core_resident directly and never reach ks_context_create,
+    // so they are unaffected by this check. Uses K.qMod/K.pMod/K.startIdx/
+    // K.sizePart -- compute_keyswitch_constants's OWN partition output --
+    // so this check can never silently drift out of sync with the actual
+    // partitioning logic. Zero runtime cost in the per-call hot path
+    // (keyswitch_resident/keyswitch_core_resident never call this).
+    {
+        HybridKsValidation pv = check_hybrid_keyswitch_params(K.qMod, K.pMod, K.startIdx, K.sizePart);
+        if(!pv.ok){
+            throw std::invalid_argument(
+                "ks_context_create: invalid Hybrid key-switch parameters -- "
+                "P (product of the "+std::to_string(K.sizeP)+" auxiliary moduli) = "+pv.p_decimal+
+                " is SMALLER than Q_part_max (the largest key-switch digit's own "
+                "modulus product, partition "+std::to_string(pv.worst_part)+" of "+
+                std::to_string(K.numPart)+") = "+pv.q_part_max_decimal+
+                ". The Hybrid key-switch requires P >= Q_part_max; otherwise the "
+                "decompose approximation's bounded error is not fully absorbed by "
+                "ModDown's division by P, and the resulting key-switched ciphertext "
+                "is cryptographically meaningless (measured ~50% of q relin-identity "
+                "error in research/EXPERIMENT_LEDGER.md entry #42). Fix by increasing "
+                "numPart (shrinks each digit's own modulus product, no effect on "
+                "security parameters) or by increasing sizeP (changes log2(QP), a "
+                "security-relevant parameter -- re-validate research/"
+                "SECURITY_ASSESSMENT.md if you do this).");
+        }
     }
     DeviceKSContext C;
     C.n=K.n; C.sizeQl=K.sizeQl; C.sizeP=K.sizeP; C.sizeQlP=K.sizeQl+K.sizeP;

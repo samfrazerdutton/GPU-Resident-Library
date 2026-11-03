@@ -457,13 +457,32 @@ mod tests {
 
     // Same configuration as tests/test_keyswitch_core_native_diff.cpp
     // ("mirror test_polyeval's exact first-level parameters"): n=1024,
-    // sizeQ=8 (1x60-bit + 7x50-bit), sizeP=2, numPart=2 -- a known-working
-    // native parameter set, re-confirmed this round by re-running that
-    // existing test before writing any Rust code against it.
+    // sizeQ=8 (1x60-bit + 7x50-bit), sizeP=2.
+    //
+    // GOD PROMPT "CKKS PHASE 10": NUM_PART was 2 (alpha=4) until this
+    // round -- this exact combination is the one research/EXPERIMENT_
+    // LEDGER.md entry #42 found violates the Hybrid key-switch's required
+    // P>=Q_part_max condition (Q_part_max~210 bits > P~120 bits at
+    // sizeP=2). This module's own tests never caught it because every one
+    // of them checks ONLY `keyswitch` against `keyswitch_reference` --
+    // self-consistency between two implementations of the identical
+    // formula, which agrees regardless of whether P>=Q_part_max holds
+    // (both sides compute the SAME wrong-but-internally-consistent
+    // result). NUM_PART=4 (alpha=2, Q_part_max~110 bits) restores the
+    // required margin, matching evalmult.rs's own corrected default, and
+    // is now enforced at construction time regardless: `KeySwitchContext::
+    // new` (via `gpufhe_ks_fixture_create` -> `ks_context_create`) REJECTS
+    // the old NUM_PART=2 value outright (entry #43) -- `invalid_num_part_
+    // at_old_value_is_now_rejected`, below, pins this down as a permanent
+    // regression test for the rejection itself, and
+    // `real_decrypt_based_relin_round_trip` (below) is the decrypt-based
+    // correctness test this module's own doc comment flagged as missing
+    // ("What they do NOT prove: that either implementation is correct
+    // relative to an independent cryptographic reference").
     const N: u32 = 1024;
     const SIZE_Q: u32 = 8;
     const SIZE_P: u32 = 2;
-    const NUM_PART: u32 = 2;
+    const NUM_PART: u32 = 4;
 
     fn new_ctx(seed: u64) -> KeySwitchContext {
         let n = RingDimension::new(N).unwrap();
@@ -480,6 +499,163 @@ mod tests {
             }
         }
         a
+    }
+
+    fn mulmod(a: u64, b: u64, q: u64) -> u64 {
+        ((a as u128 * b as u128) % q as u128) as u64
+    }
+    fn addmod(a: u64, b: u64, q: u64) -> u64 {
+        let s = a + b;
+        if s >= q { s - q } else { s }
+    }
+
+    // GOD PROMPT "CKKS PHASE 10": the old, invalid NUM_PART=2 combination
+    // (research/EXPERIMENT_LEDGER.md entry #42) must now be REJECTED at
+    // construction time, not merely avoided by this module's own `new_ctx`
+    // default. Pins the enforcement (entry #43,
+    // src/keyswitch_resident.cpp's `ks_context_create`) down as a
+    // permanent regression test, independent of whatever default this
+    // module's own fixture happens to use.
+    #[test]
+    fn invalid_num_part_at_old_value_is_now_rejected() {
+        let n = RingDimension::new(N).unwrap();
+        let result = KeySwitchContext::new(n, SIZE_Q, SIZE_P, 2, 1);
+        let err = match result {
+            Ok(_) => panic!("NUM_PART=2 at SIZE_Q=8/SIZE_P=2 violates P>=Q_part_max and must be rejected"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("Q_part_max") || msg.contains("Hybrid key-switch"),
+            "rejection error should name the actual violated condition, got: {msg}"
+        );
+    }
+
+    // A configuration with a comfortable surplus (NUM_PART=8, alpha=1,
+    // Q_part_max = a single tower, far below P) must still construct
+    // successfully -- confirms the new validation does not over-reject.
+    #[test]
+    fn valid_num_part_with_surplus_still_constructs() {
+        let n = RingDimension::new(N).unwrap();
+        KeySwitchContext::new(n, SIZE_Q, SIZE_P, SIZE_Q, 1)
+            .expect("NUM_PART=SIZE_Q (alpha=1, the smallest possible Q_part_max) must be accepted");
+    }
+
+    // GOD PROMPT "CKKS PHASE 10": the decrypt-based correctness test this
+    // module's own doc comment ("Correctness evidence, and its honest
+    // limits") explicitly flagged as missing. Builds a REAL ciphertext
+    // pair under this fixture's OWN secret/public key (via
+    // `KeySwitchContext::secret_key`/`public_key_a`/`public_key_b`),
+    // forms the degree-2 tensor product via pure host-side schoolbook
+    // arithmetic (entry #37's established from-scratch methodology --
+    // NOT the production `LaunchTensor` kernel, which this module has no
+    // access to; this is a genuinely independent computation), relinearizes
+    // it through THIS context's real `keyswitch` call, rescales via the
+    // independently-proven `RescaleContext`, then decrypts and decodes via
+    // `codec` -- and compares the result against the plaintext product
+    // computed directly in the clear (never touching the crypto pipeline).
+    // This is the first test in this module to check an actual decryption
+    // invariant rather than self-consistency between two implementations
+    // of the same formula.
+    #[test]
+    fn real_decrypt_based_relin_round_trip() {
+        let ctx = new_ctx(2024);
+        let n = ctx.ring_dimension().get();
+        let nn = n as usize;
+        let size_ql = ctx.size_ql() as usize;
+        let mods: Vec<u64> = (0..ctx.size_ql()).map(|t| ctx.modulus_q(t)).collect();
+        let roots: Vec<u64> = mods
+            .iter()
+            .map(|&q| crate::ntt::native_root(ctx.ring_dimension(), ckks_core::Modulus::new(q).unwrap()))
+            .collect();
+        let s = ctx.secret_key();
+        let pk_a = ctx.public_key_a();
+        let pk_b = ctx.public_key_b();
+
+        // Scale comparable to the rescale-dropped tower's modulus, same
+        // reasoning codec.rs's own doc comment requires (keeps the
+        // post-rescale scale close to `delta` instead of collapsing).
+        let delta = mods[size_ql - 1] as f64;
+        let slots_a = [1.0, 2.0, 3.0, 4.0];
+        let slots_b = [5.0, 6.0, 7.0, 8.0];
+        let m_a = crate::codec::encode_real(&slots_a, n, delta).expect("encode a");
+        let m_b = crate::codec::encode_real(&slots_b, n, delta).expect("encode b");
+
+        let (c0a, c1a) = crate::codec::encrypt(&m_a, n, &pk_a, &pk_b, &mods, &roots, 1, 3.19, 9101)
+            .expect("encrypt a");
+        let (c0b, c1b) = crate::codec::encrypt(&m_b, n, &pk_a, &pk_b, &mods, &roots, 1, 3.19, 9102)
+            .expect("encrypt b");
+
+        // Schoolbook tensor product, pure host arithmetic, eval domain,
+        // per-tower independent -- an INDEPENDENT reference, not the
+        // kernel `EvalMultContext` uses.
+        let total = size_ql * nn;
+        let mut t0 = vec![0u64; total];
+        let mut t1 = vec![0u64; total];
+        let mut t2 = vec![0u64; total];
+        for t in 0..size_ql {
+            let q = mods[t];
+            for k in 0..nn {
+                let i = t * nn + k;
+                t0[i] = mulmod(c0a[i], c0b[i], q);
+                t1[i] = addmod(mulmod(c0a[i], c1b[i], q), mulmod(c1a[i], c0b[i], q), q);
+                t2[i] = mulmod(c1a[i], c1b[i], q);
+            }
+        }
+
+        // Relinearize t2 via THIS context's real, production keyswitch call.
+        let mut ba0 = vec![0u64; total];
+        let mut ba1 = vec![0u64; total];
+        ctx.keyswitch(&t2, &mut ba0, &mut ba1).expect("keyswitch failed");
+
+        let mut r0 = vec![0u64; total];
+        let mut r1 = vec![0u64; total];
+        for t in 0..size_ql {
+            let q = mods[t];
+            for k in 0..nn {
+                let i = t * nn + k;
+                r0[i] = addmod(t0[i], ba0[i], q);
+                r1[i] = addmod(t1[i], ba1[i], q);
+            }
+        }
+
+        // Rescale via the independently-proven RescaleContext (entry #35).
+        let resc = crate::rescale::RescaleContext::new(ctx.ring_dimension(), &mods).expect("rescale ctx");
+        let survivor_len = (size_ql - 1) * nn;
+        let mut r0_resc = vec![0u64; survivor_len];
+        let mut r1_resc = vec![0u64; survivor_len];
+        resc.rescale(&r0, &mut r0_resc).expect("rescale r0");
+        resc.rescale(&r1, &mut r1_resc).expect("rescale r1");
+
+        let mods_resc = &mods[..size_ql - 1];
+        let roots_resc = &roots[..size_ql - 1];
+        let s_resc = &s[..survivor_len];
+        let m_dec = crate::codec::decrypt(&r0_resc, &r1_resc, s_resc, n, mods_resc, roots_resc)
+            .expect("decrypt");
+        let delta_post = delta * delta / (mods[size_ql - 1] as f64); // == delta, by construction
+        let (re, im) = crate::codec::decode(&m_dec, n, delta_post).expect("decode");
+
+        // Independently derived expected result: the plaintext product,
+        // computed in the clear, never touching the crypto pipeline.
+        let expected: Vec<f64> = slots_a.iter().zip(slots_b.iter()).map(|(a, b)| a * b).collect();
+
+        const TOL: f64 = 1e-6;
+        let mut max_err = 0.0f64;
+        for i in 0..expected.len() {
+            let err = (re[i] - expected[i]).abs();
+            if err > max_err {
+                max_err = err;
+            }
+            assert!(
+                err < TOL,
+                "slot {i}: got={} expected={} abs_err={err} exceeds tolerance {TOL}",
+                re[i], expected[i]
+            );
+        }
+        for (i, &v) in im[..expected.len()].iter().enumerate() {
+            assert!(v.abs() < TOL, "slot {i}: unexpected imaginary component {v}");
+        }
+        eprintln!("real_decrypt_based_relin_round_trip: max abs error = {max_err:e} (tolerance {TOL:e})");
     }
 
     #[test]

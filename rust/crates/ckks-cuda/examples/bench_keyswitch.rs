@@ -1,7 +1,13 @@
 //! Benchmark for `ckks_cuda::keyswitch::KeySwitchContext`, at the same
-//! n=1024/sizeQ=8/sizeP=2/numPart=2 native configuration as `bench/
+//! n=1024/sizeQ=8/sizeP=2/numPart=4 native configuration as `bench/
 //! bench_keyswitch_cpp_vs_rust.cpp`'s `KeySwitchFixtureCpp`, structured to
 //! mirror it tier-for-tier:
+//!
+//! GOD PROMPT "CKKS PHASE 10": NUM_PART was 2 until this round -- that
+//! combination violates the Hybrid key-switch's required P>=Q_part_max
+//! condition (research/EXPERIMENT_LEDGER.md entry #42) and is now
+//! REJECTED at `KeySwitchContext::new` construction time (entry #43), so
+//! this benchmark would fail to even build a context at the old value.
 //!   1. fixture creation: `KeySwitchContext::new` (modulus chain + keygen +
 //!      evalkeygen + device context/work -- see the crate's `keyswitch`
 //!      module doc comment and the C++ benchmark's header comment for why
@@ -27,7 +33,7 @@ use std::time::Instant;
 const N: u32 = 1024;
 const SIZE_Q: u32 = 8;
 const SIZE_P: u32 = 2;
-const NUM_PART: u32 = 2;
+const NUM_PART: u32 = 4;
 
 fn median(v: &mut [f64]) -> f64 {
     v.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -115,5 +121,5 @@ fn main() {
     report("end-to-end (fresh context + first keyswitch)", &mut e2e_us);
 
     println!("---");
-    println!("ckks-cuda (Rust host + existing CUDA C++ key-switch kernels), n=1024, sizeQ=8, sizeP=2, numPart=2, {trials} trials x {reps} reps/trial for the steady-state tier.");
+    println!("ckks-cuda (Rust host + existing CUDA C++ key-switch kernels), n=1024, sizeQ=8, sizeP=2, numPart=4, {trials} trials x {reps} reps/trial for the steady-state tier.");
 }
