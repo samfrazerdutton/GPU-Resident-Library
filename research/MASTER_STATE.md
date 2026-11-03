@@ -1633,3 +1633,100 @@ Full detail: `EXPERIMENT_LEDGER.md` entry #43. `NEXT_SESSION.md`'s
   coincidence this library's prime generation does not produce).
   `test_polyeval`'s own, separate multi-level noise question remains
   untouched.
+
+## GOD PROMPT "CKKS PHASE 11": first real-world per-stage performance baseline for the complete encode→encrypt→EvalMult→decrypt→decode pipeline — the GPU kernels are NOT the bottleneck (~1% of total latency); two host-side optimizations (parallelized encode/decode, batched encrypt_host) give a verified 2.6x–5.3x total speedup with zero correctness regression
+
+Full detail: `EXPERIMENT_LEDGER.md` entry #44. `NEXT_SESSION.md`'s
+"READ THIS FIRST" section rewritten to point future performance work at
+the clear next experiment (an O(n log n) FFT-based encode/decode).
+
+- **Environment confirmed**: GPU = RTX 2060 Max-Q (6GiB VRAM, driver
+  595.97), CUDA 13.2, `CMAKE_CUDA_FLAGS` empty (no `-G`) in both
+  `CMakeLists.txt` and the cached `build2/CMakeCache.txt`. Real Windows
+  host free RAM 1.15GB at measurement time (well under the 6GB gate —
+  `n=131072` correctly not attempted). Phase 10's `NUM_PART=4` fixes
+  confirmed present in both `evalmult.rs` and `keyswitch.rs`.
+- **New benchmark**: `bench/bench_evalmult_e2e_breakdown.cpp` —
+  per-stage `cudaEvent` + host-clock timing for all 8 pipeline stages
+  (context/eval-key creation, encode, encrypt, tensor, relin/keyswitch,
+  rescale, decrypt, decode) plus end-to-end, with `cudaMemGetInfo`/
+  `getrusage` memory reporting and min/median/p95/max/mean statistics
+  — swept across n=1024/2048/4096/8192, every configuration validated
+  via `check_hybrid_keyswitch_params` BEFORE running (never bypassed),
+  with a correctness gate (RNS-level + real encrypted round trip)
+  before trusting any timing. A first attempt failed with a huge error
+  (`INT64_MIN`-range garbage) — root-caused to a bug in the NEW
+  benchmark itself (calling `encode_host` with an un-padded slot
+  vector, undefined behavior; the Rust FFI bridge normally pads it)
+  — fixed and confirmed via a standalone diagnostic before trusting any
+  further result.
+- **Baseline, n=8192, single real round trip**: Encode (host, O(n²))
+  310406us (59%); Decode (host, O(n²)) 153870us (29%); Encrypt
+  (host+GPU) 50642us (10%); Relin/keyswitch (GPU) 4632us (0.9%);
+  Rescale x2 (GPU) 1568us (0.3%); Decrypt 558us; Tensor 131us; Combine
+  53us. **Total 522890us, of which host-side encode+decode+encrypt =
+  98.5%** — directly confirming the governing directive's own warning
+  not to assume the largest CUDA kernel dominates.
+- **Optimization 1 (KEPT)**: parallelized `encode_host`/`decode_host`'s
+  O(n²) outer loop via `std::thread` (`src/encode.cpp`) — each output
+  element is an independent read-only reduction, so splitting across
+  threads changes NOTHING about any element's arithmetic (same ops,
+  same order, same rounding). Correctness: `tests/
+  test_encode_decode_parallel_matches_sequential.cpp`, an INDEPENDENT
+  fresh single-threaded reimplementation (not src/encode.cpp itself),
+  EXACT bit-identical match required and confirmed across n in
+  {4,...,8192} (both sides of the sequential-fallback threshold), real
+  and complex slots. A/B (3 interleaved runs, n=8192): Encode
+  309-318ms->49-56ms (~5.7-6.4x); Decode 155-157ms->23-26ms
+  (~6.1-6.8x). Negligible memory impact.
+- **Optimization 2 (KEPT)**: batched `encrypt_host`'s per-tower NTTs
+  (`src/encdec.cpp`) — replaced 4*sizeQ separate per-tower-per-buffer
+  GPU round trips (each also rebuilding its own root table from
+  scratch) with ONE upload + ONE `LaunchNTT_CT_Batched` call + ONE
+  download per buffer, root tables cached by `(n,q)` — the SAME pattern
+  `src/evalkeygen.cpp` already uses successfully. Correctness: `tests/
+  test_encrypt_host_fast_matches_sequential.cpp`, an INDEPENDENT fresh
+  reimplementation of the exact pre-Phase-11 unbatched algorithm using
+  the SAME seeded RNG, EXACT bit-identical `(c0,c1)` required and
+  confirmed across n in {1024,2048,4096} x sizeQ in {1,4,8}. A/B (3
+  interleaved runs, n=8192): Encrypt 46-52ms->18-23ms (~2.2-2.8x);
+  real-round-trip error magnitude IDENTICAL in every run
+  (`1.11944e-10`), confirming bit-exact identical final output.
+  Negligible memory impact.
+- **Combined result**: total end-to-end latency 30.5ms->11.8ms (2.6x)
+  at n=1024; 48ms->16.6ms (2.9x) at n=2048; 154.7ms->38.2ms (4.1x) at
+  n=4096; 522.9ms->98.9ms (5.3x) at n=8192 — speedup GROWS with n.
+  Every real encrypted round trip passed at every n with the error
+  magnitude UNCHANGED from before optimization (bit-exact identical
+  cryptographic output). RNS-level checks also passed at every n (0
+  mismatches). GPU memory: workload's own incremental footprint stays
+  tiny (2-10MB) against a large (~1038-1066MB) CUDA-runtime baseline,
+  unaffected by either optimization. Host RSS: 100-121MB, no
+  meaningful change. Full Rust suite: **38 passed, 0 failed, 1
+  ignored**, identical in `--release` and debug — zero regression.
+- **POST-optimization ranked bottleneck, n=8192**: Encode 53.0ms (54%);
+  Decode 23.2ms (23%); Encrypt 17.4ms (18%); Relin/keyswitch (GPU)
+  1.96ms (2%); Rescale (GPU) 1.63ms (1.6%); Decrypt 0.54ms;
+  Tensor+Combine (GPU) ~0.07ms. Host-side encode+decode+encrypt STILL
+  ~95% of total latency even after both optimizations.
+- **Experiments considered and NOT pursued, documented not dropped**:
+  a persistent thread pool for encode/decode (estimated ~1-3% further
+  gain, not worth the added lifecycle complexity); a true O(n log n)
+  FFT-based replacement for encode/decode's O(n²) algorithm — correctly
+  identified as the single largest remaining opportunity (would address
+  the now-dominant ~77% of latency) but requires non-trivial
+  re-derivation of the `r_k=5^k mod 2N` permuted-slot convention against
+  a standard FFT, carrying meaningfully higher correctness risk — NOT
+  attempted this round, recorded as the clear next highest-value
+  experiment. Explicit CUDA-kernel-level optimization (fusion,
+  occupancy, shared memory) was NOT pursued since profiling
+  conclusively showed the GPU kernels are not the bottleneck at any
+  tested n.
+- `CMakeLists.txt` gained `bench_evalmult_e2e_breakdown`, `test_encode_
+  decode_parallel_matches_sequential`, `test_encrypt_host_fast_matches_
+  sequential`, plus `find_package(Threads REQUIRED)`/`Threads::Threads`
+  linked into the `gpufhe` target. `rust/crates/ckks-cuda/build.rs`
+  gained an explicit `pthread` link line. Full CMake rebuild NOT
+  attempted (host free memory 1.15GB, under the 6GB gate) — every claim
+  verified via direct `nvcc`/`g++` compilation, each confirmed freshly
+  built.

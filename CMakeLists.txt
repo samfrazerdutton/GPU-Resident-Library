@@ -62,8 +62,15 @@ add_library(gpufhe STATIC
   kernels/stage_acc.cu
 )
 find_package(CUDAToolkit REQUIRED)
+# GOD PROMPT "CKKS PHASE 11": src/encode.cpp's encode_host/decode_host now
+# use std::thread (parallelizing their O(n^2) host loops across hardware
+# threads -- see research/EXPERIMENT_LEDGER.md entry #44). Modern glibc
+# (>=2.34) folds pthread into libc, so this links fine without it on this
+# machine, but find_package(Threads) + Threads::Threads is the portable,
+# correct way to request it regardless of libc version.
+find_package(Threads REQUIRED)
 target_include_directories(gpufhe PUBLIC include)
-target_link_libraries(gpufhe PUBLIC CUDA::cudart)
+target_link_libraries(gpufhe PUBLIC CUDA::cudart Threads::Threads)
 target_include_directories(gpufhe PUBLIC ${CUDAToolkit_INCLUDE_DIRS} /usr/local/cuda-13.2/include)
 set_target_properties(gpufhe PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
@@ -112,6 +119,14 @@ gpufhe_test(test_ks_constants tests/test_ks_constants.cpp)
 # native arbitrary-precision arithmetic, a different implementation
 # stack).
 gpufhe_test(test_ks_params_validate tests/test_ks_params_validate.cpp)
+# GOD PROMPT "CKKS PHASE 11": correctness tests for the two kept
+# performance optimizations (parallelized encode_host/decode_host,
+# batched encrypt_host) -- each checked bit-exact against an
+# INDEPENDENT, hand-written reimplementation of the exact pre-Phase-11
+# algorithm, never the production code as its own oracle. See
+# research/EXPERIMENT_LEDGER.md entry #44.
+gpufhe_test(test_encode_decode_parallel_matches_sequential tests/test_encode_decode_parallel_matches_sequential.cpp)
+gpufhe_test(test_encrypt_host_fast_matches_sequential tests/test_encrypt_host_fast_matches_sequential.cpp)
 gpufhe_test(test_keygen tests/test_keygen.cpp)
 gpufhe_test(test_evalkeygen tests/test_evalkeygen.cpp)
 # GOD PROMPT "CKKS PHASE 8": fully native (OpenFHE-free) isolation of
@@ -260,6 +275,13 @@ gpufhe_test(bench_keyswitch_cpp_vs_rust bench/bench_keyswitch_cpp_vs_rust.cpp)
 # DeviceKSContext (it only needs plain moduli + cached root tables, never
 # the eval key -- entry #35), so both languages measure the SAME setup.
 gpufhe_test(bench_evalmult_cpp_vs_rust bench/bench_evalmult_cpp_vs_rust.cpp)
+# GOD PROMPT "CKKS PHASE 11": the real-world per-stage performance
+# baseline -- encode/encrypt/tensor/relin/rescale/decrypt/decode, each
+# independently timed, across n=1024/2048/4096/8192, with mandatory
+# P>=Q_part_max validation and a correctness gate (RNS-level +  real
+# encrypted round trip) before any timing is trusted. See research/
+# EXPERIMENT_LEDGER.md entry #44.
+gpufhe_test(bench_evalmult_e2e_breakdown bench/bench_evalmult_e2e_breakdown.cpp)
 gpufhe_test(test_mult_barrett tests/test_mult_barrett.cpp)
 # Directive "VERIFY OOM DIAGNOSIS AND REMOVE THE LARGE-N DIAGONAL
 # BOTTLENECK", Priority 3: proves an O(S*2^RST) analytic replacement for

@@ -177,4 +177,9 @@ fn main() {
     println!("cargo:rustc-link-search=native={}", cuda_lib.display());
     println!("cargo:rustc-link-lib=dylib=cudart");
     println!("cargo:rustc-link-lib=dylib=stdc++");
+    // GOD PROMPT "CKKS PHASE 11": src/encode.cpp's encode_host/decode_host
+    // now use std::thread -- explicit for portability, even though modern
+    // glibc (>=2.34, confirmed on this machine) folds pthread into libc
+    // and links fine without it.
+    println!("cargo:rustc-link-lib=dylib=pthread");
 }

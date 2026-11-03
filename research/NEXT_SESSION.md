@@ -3,16 +3,14 @@
 ## Current commit
 
 Check `git log -3` on resume. As of this writing, HEAD is a new commit
-on top of entry #42's commit `405e650` (the GOD PROMPT "CKKS PHASE 10"
-round: repository-wide audit of every hardcoded key-switch parameter
-fixture + centralized, EXACT arbitrary-precision enforcement of the
-`P >= Q_part_max` requirement at `ks_context_create`. Found and fixed
-FOUR more invalid fixtures entry #42 missed (two Rust examples, two
-C++ benchmarks, both registered as auto-run `ctest`s) plus
-`keyswitch.rs`'s own fixture, and gave `keyswitch.rs` its first-ever
-decrypt-based correctness test. See `EXPERIMENT_LEDGER.md` entry #43
-for the full inventory). Confirm push status -- push again if
-`git status` shows ahead of origin.
+on top of entry #43's commit `653cf6c` (the GOD PROMPT "CKKS PHASE 11"
+round: the first real-world per-stage performance baseline for
+encode->encrypt->EvalMult->decrypt->decode, plus two verified, kept
+optimizations -- parallelized encode/decode and batched encrypt_host
+NTTs -- giving a 2.6x-5.3x total pipeline speedup with zero
+correctness regression. See `EXPERIMENT_LEDGER.md` entry #44 for full
+detail). Confirm push status -- push again if `git status` shows ahead
+of origin.
 
 **Reminder, confirmed the hard way in an earlier round**: this machine
 has (at least) two SEPARATE git clones of this GitHub repo -- the WSL
@@ -23,7 +21,71 @@ an entirely unrelated commit history (raw CUDA-kernel-optimization
 work) and untracked, stale copies of `rust/`/`research/` -- never run
 `git status`/`log`/commit decisions against it for this work.
 
-## READ THIS FIRST if resuming into EvalMult/relin/key-switch work: the real encrypted EvalMult AND key-switch round trips both PASS. Invalid configurations are now REJECTED at construction time, not just avoided by convention.
+## READ THIS FIRST if resuming into performance work: host-side encode/encrypt/decode dominate, NOT the GPU kernels -- the clear next experiment is an O(n log n) FFT-based encode/decode
+
+**Phase 11's core finding**: for a real encode->encrypt->EvalMult->
+decrypt->decode round trip at n=8192, the ENTIRE GPU-resident
+tensor+keyswitch+combine+rescale chain is only ~1% of total latency.
+The dominant cost is three pure-host (or host-orchestrated) stages:
+`encode_host`/`decode_host` (O(n^2) naive canonical-embedding DFT) and
+`encrypt_host` (originally 4*sizeQ unbatched per-tower NTT round
+trips). Two fixes were made this round, BOTH kept, BOTH bit-exact
+verified against independent oracles, BOTH measured via interleaved
+A/B:
+1. `src/encode.cpp`: `encode_host`/`decode_host` parallelized via
+   `std::thread` across the O(n^2) outer loop (each output element is
+   an independent read-only reduction -- zero change to the
+   arithmetic, bit-identical results guaranteed and confirmed).
+   ~5.7-6.8x speedup on encode/decode specifically.
+2. `src/encdec.cpp`: `encrypt_host` batched (one upload + one
+   `LaunchNTT_CT_Batched` call + one download per buffer, across all
+   `sizeQ` towers, with root tables cached by `(n,q)` -- the SAME
+   pattern `src/evalkeygen.cpp` already uses successfully) instead of
+   32 separate per-tower-per-buffer GPU round trips at `sizeQ=8`.
+   ~2.2-2.8x speedup on encrypt specifically.
+
+**Combined result**: total end-to-end latency dropped from
+30.5/48/154.7/522.9ms to 11.8/16.6/38.2/98.9ms at
+n=1024/2048/4096/8192 respectively (2.6x/2.9x/4.1x/5.3x -- the speedup
+GROWS with n). Every real encrypted round trip still passes, with the
+SAME error magnitude as before the optimization at every n (bit-exact
+identical cryptographic output, not merely "close"). Full Rust suite
+unaffected: 38 passed, 0 failed, 1 ignored.
+
+**POST-optimization ranked bottleneck, n=8192** (the next thing to fix
+if performance work continues): Encode 53.0ms (54%); Decode 23.2ms
+(23%); Encrypt 17.4ms (18%); Relin/keyswitch (GPU) 1.96ms (2%); Rescale
+(GPU) 1.63ms (1.6%); Decrypt 0.54ms; Tensor+Combine (GPU) ~0.07ms.
+Host-side encode+decode+encrypt STILL account for ~95% of total
+latency -- the GPU kernels are not, and were never, the bottleneck at
+any tested n.
+
+**The clear next highest-value experiment, NOT attempted this round**:
+replace `encode_host`/`decode_host`'s O(n^2) algorithm with a true
+O(n log n) FFT-based canonical embedding (the standard technique used
+by OpenFHE/SEAL/HElib) -- this would address the now-dominant ~77% of
+remaining latency, far more than parallelizing the O(n^2) loop already
+did. NOT pursued this round because it requires correctly re-deriving
+the existing `r_k=5^k mod 2N` permuted-slot-ordering convention against
+a standard radix-2 FFT -- meaningfully higher correctness risk than
+either of this round's two kept optimizations, and the governing
+directive's own experiment discipline ("do not change several
+independent components... unless the combined effect is the explicit
+subject") argues for tackling it as its own dedicated, carefully-tested
+round rather than folding it into this one. A secondary, lower-value
+candidate also NOT pursued: a persistent (reused-across-calls) thread
+pool for encode/decode to avoid per-call `pthread_create`/`join`
+overhead (estimated ~1-3% of encode's own cost -- not worth the added
+lifecycle complexity given the ALREADY-achieved 6x win from the simple
+per-call thread-spawn approach).
+
+**Do not re-measure the OLD (sequential/unbatched) baseline numbers as
+if they still apply** -- `bench/bench_evalmult_e2e_breakdown.cpp` is
+the current, correct per-stage benchmark; re-run it fresh rather than
+citing this entry's own baseline table, which predates both
+optimizations.
+
+## Phase 10 recap (for key-switch/EvalMult correctness context, superseded as the primary focus by Phase 11's performance work above): the real encrypted EvalMult AND key-switch round trips both PASS. Invalid configurations are REJECTED at construction time, not just avoided by convention.
 
 **The multi-phase EvalMult/key-switch investigation (Phases 5-10) is
 RESOLVED.** Every prior round's "defect" hypothesis (entry #30/#38's
