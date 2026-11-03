@@ -1280,7 +1280,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "BLOCKED: confirmed real defect in evalkeygen_host's own eval key generation for this crate's native (OpenFHE-free) pipeline -- see research/EXPERIMENT_LEDGER.md entry #40. keyswitch_device_resident/keyswitch_reference themselves are proven bit-exact with each other and correct given OpenFHE-sourced eval keys (entry #39); isolated to evalkeygen_host via eval_key_outside_own_part_range_is_near_zero. Root cause within evalkeygen_host NOT yet pinpointed."]
+    #[ignore = "BLOCKED: entry #40's 'evalkeygen_host is broken' diagnosis was WRONG -- it was entry #40's OWN test (eval_key_outside_own_part_range_is_near_zero) that had a sign bug (literally used the source comment's claimed 'bv-av*s', when the true relation is 'bv+av*s'). Phase 8 (entry #41) proved evalkeygen_host correct via a from-scratch isolated C++ test (tests/test_evalkeygen_isolated.cpp, CHECKS 1-3 all pass) and pinpointed the REAL remaining defect to compute_keyswitch_constants/keyswitch_core_resident's own NATIVE decompose+accumulate+moddown reconstruction (src/ks_constants.cpp / src/keyswitch.cpp) -- never independently validated before (entry #39 only validated this algorithm given OpenFHE-SOURCED constants, never its own). See research/EXPERIMENT_LEDGER.md entry #41 and research/NEXT_SESSION.md."]
     fn control_a_relin_combine_matches_raw_tensor_within_keyswitch_noise_test() {
         let ctx = new_ctx(1234);
         let slots_a = [1.0, 2.0, 3.0, 4.0];
@@ -1303,7 +1303,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "BLOCKED: see control_a_relin_combine_matches_raw_tensor_within_keyswitch_noise_test's #[ignore] reason and entry #40 -- this confirms numPart=1 does not change the result (rules out digit decomposition as the cause)"]
+    #[ignore = "BLOCKED: see control_a_relin_combine_matches_raw_tensor_within_keyswitch_noise_test's #[ignore] reason and entry #41 -- this confirms numPart=1 does not change the result (rules out multi-part digit decomposition specifically, pointing at the shared ModDown/complement-basis machinery)"]
     fn control_a_relin_combine_matches_raw_tensor_num_part_1_test() {
         let ctx = new_ctx_num_part(1234, 1);
         let slots_a = [1.0, 2.0, 3.0, 4.0];
@@ -1441,7 +1441,7 @@ mod tests {
     // This directly and meaningfully exercises digit decomposition and
     // the eval key's own P*s^2 term.
     #[test]
-    #[ignore = "BLOCKED: see control_a_relin_combine_matches_raw_tensor_within_keyswitch_noise_test's #[ignore] reason and entry #40 -- confirms the defect reproduces even for the simplest possible CRT-consistent (non-ciphertext) input"]
+    #[ignore = "BLOCKED: see control_a_relin_combine_matches_raw_tensor_within_keyswitch_noise_test's #[ignore] reason and entry #41 -- confirms the defect reproduces even for the simplest possible CRT-consistent (non-ciphertext) input, and was independently reproduced from scratch in isolated C++ (tests/test_evalkeygen_isolated.cpp CHECK 4), ruling out any Rust/FFI-side cause"]
     fn keyswitch_reference_on_constant_crt_consistent_input() {
         let ctx = new_ctx(1234);
         let n = ctx.ring_dimension().get() as usize;
@@ -1504,19 +1504,26 @@ mod tests {
 
     // GOD PROMPT "CKKS PHASE 7": direct check of evalkeygen_host's OWN
     // raw output (K.av[0], K.bv[0]), bypassing keyswitch entirely.
-    // src/evalkeygen.cpp's own doc comment claims
-    // "bv[p]-av[p]*s == (P*s2 in part's range) + small noise" -- but for
-    // TOWERS OUTSIDE part 0's own Q-range (where no P*s2 term is added
-    // at all, per the `if(t>=startIdx && t<endIdx)` guard in
-    // evalkeygen_host_sold), the SAME formula simplifies to
-    // "bv[t]-av[t]*s ~= 0" REGARDLESS of P or sign choice -- since
-    // 0 is 0 either way. This isolates whether the basic
+    // Checks TOWERS OUTSIDE part 0's own Q-range (no P*s2 term added at
+    // all there, per the `if(t>=startIdx && t<endIdx)` guard in
+    // evalkeygen_host_sold), so the result isolates whether the basic
     // "encryption-of-zero" machinery (pkA*u+ns*e1, pkB*u+ns*e0, and
-    // evalkeygen_host_sold's OWN separate ek_dev_tab/build_ek_tab NTT
-    // table cache, distinct from keygen_host's) is sound, with NO
-    // dependency on P, sign convention, or the Ps2 term at all.
+    // evalkeygen_host_sold's OWN private NTT table cache) is sound.
+    //
+    // GOD PROMPT "CKKS PHASE 8": re-examined with the CORRECT sign. This
+    // test originally computed `bv0-av0*s` ("the sign the source comment
+    // claims" -- src/evalkeygen.cpp's own doc comment literally says
+    // "bv[p] - av[p]*s == (P*s2 in part's range) + small noise"), taken
+    // at face value without independently re-deriving it. A fresh,
+    // isolated C++ test (tests/test_evalkeygen_isolated.cpp, new) proved
+    // the TRUE relation is `bv+av*s ~= (P*s2 or 0)` (PLUS, not minus) --
+    // confirmed via a hand-constructed nonzero secret satisfying
+    // pkB+pkA*s_hat=0 exactly, AND via the full real keygen_host+
+    // evalkeygen_host chain with the exact same configuration this test
+    // uses. Entry #40's "confirmed defect" was this test's OWN sign
+    // bug, not a defect in evalkeygen_host -- see research/
+    // EXPERIMENT_LEDGER.md entry #41.
     #[test]
-    #[ignore = "BLOCKED: confirmed real defect in evalkeygen_host's own eval key generation -- see research/EXPERIMENT_LEDGER.md entry #40. This is the MOST isolated reproduction: checks bv[0]-av[0]*s ~= 0 for towers OUTSIDE part 0's own Q-range, where NO P*s2 term is involved at all, so this depends on nothing but the basic pkA*u+ns*e1 / pkB*u+ns*e0 encryption-of-zero machinery. Swapping LaunchNTT_CT_Batched for a per-tower LaunchNTT_CT loop (matching keygen_host's own proven-correct kernel usage) did NOT change the result, ruling out the batched-kernel-launch mechanism; the exact faulty line within evalkeygen_host/evalkeygen_host_sold was not pinpointed this round."]
     fn eval_key_outside_own_part_range_is_near_zero() {
         let ctx = new_ctx(1234); // NUM_PART=2, alpha=4, SIZE_Q=8
         let n = ctx.ring_dimension().get() as usize;
@@ -1549,9 +1556,10 @@ mod tests {
             let mut actual_eval = vec![0u64; n];
             for k in 0..n {
                 let idx = t as usize * n + k;
-                // bv - av*s (the sign the source comment claims)
+                // bv + av*s (CORRECTED sign -- see entry #41; the
+                // literal source comment's "bv - av*s" is wrong)
                 let av_s = mulmod(av0[idx], s_full[idx], q);
-                actual_eval[k] = if bv0[idx] >= av_s { bv0[idx] - av_s } else { bv0[idx] + q - av_s };
+                actual_eval[k] = addmod(bv0[idx], av_s, q);
             }
             let actual_coeff = inverse_ntt(&actual_eval, n as u32, q, root);
             let mut worst = 0u64;
@@ -1562,7 +1570,7 @@ mod tests {
                 }
             }
             let frac = worst as f64 / q as f64;
-            eprintln!("[eval key raw] tower={t} (outside part 0's range) q={q} worst|bv-av*s - 0|={worst} ({:.6e}% of q)", frac * 100.0);
+            eprintln!("[eval key raw] tower={t} (outside part 0's range) q={q} worst|bv+av*s - 0|={worst} ({:.6e}% of q)", frac * 100.0);
             if frac > worst_frac_of_q {
                 worst_frac_of_q = frac;
             }
@@ -1571,9 +1579,9 @@ mod tests {
         eprintln!("[eval key raw] worst fraction of q (outside part 0's range): {:.6e}%", worst_frac_of_q * 100.0);
         assert!(
             worst_frac_of_q < 0.01,
-            "OUTSIDE part 0's own Q-range (no P*s2 term at all), bv[0]-av[0]*s is NOT ~0 -- worst_frac={:.6}% of q. \
+            "OUTSIDE part 0's own Q-range (no P*s2 term at all), bv[0]+av[0]*s is NOT ~0 -- worst_frac={:.6}% of q. \
              This isolates a defect in evalkeygen_host_sold's basic encryption-of-zero machinery itself \
-             (pkA*u+ns*e1 / pkB*u+ns*e0, or its own private NTT table cache), independent of P or sign convention.",
+             (pkA*u+ns*e1 / pkB*u+ns*e0, or its own private NTT table cache).",
             worst_frac_of_q * 100.0
         );
     }
@@ -1695,7 +1703,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "BLOCKED: full multiply_relin_rescale->decrypt->decode still fails with a genuine decode-level error, but the ORIGINAL suspected cause (relin identity ba0+ba1*s=?=t2*s^2) is RESOLVED -- entry #39 proved it holds correctly once checked in the right NTT-vs-coefficient domain; entry #38's theory that LaunchCombine's own formula was broken was a test-methodology artifact. The remaining bug is narrower and unidentified -- see research/EXPERIMENT_LEDGER.md entry #39 and research/NEXT_SESSION.md's READ THIS FIRST section for the next concrete experiment (isolate rescale from combine using multiply_relin_no_rescale_for_test)"]
+    #[ignore = "BLOCKED: full multiply_relin_rescale->decrypt->decode still fails with a genuine decode-level error. Entry #39 proved the relin IDENTITY itself holds (once checked in the right NTT-vs-coefficient domain); entry #40's 'evalkeygen_host is broken' diagnosis was then shown WRONG by entry #41 (a sign bug in entry #40's own test) -- entry #41 pinpoints the actual defect to compute_keyswitch_constants/keyswitch_core_resident's own NATIVE decompose+accumulate+moddown reconstruction (src/ks_constants.cpp / src/keyswitch.cpp), independently reproduced from scratch in isolated C++ (tests/test_evalkeygen_isolated.cpp). See research/EXPERIMENT_LEDGER.md entry #41 and research/NEXT_SESSION.md's READ THIS FIRST section for the next concrete experiment."]
     fn real_encrypted_evalmult_matches_expected_product() {
         let ctx = new_ctx(1234);
         let slots_a = [1.0, 2.0, 3.0, 4.0];
@@ -1717,7 +1725,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "BLOCKED: see real_encrypted_evalmult_matches_expected_product's #[ignore] reason and entry #39"]
+    #[ignore = "BLOCKED: see real_encrypted_evalmult_matches_expected_product's #[ignore] reason and entry #41"]
     fn real_encrypted_evalmult_zero_boundary() {
         // Multiplying by an all-zero ciphertext must decode to all-zero,
         // a deterministic boundary case distinct from random data.
@@ -1731,7 +1739,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "BLOCKED: see real_encrypted_evalmult_matches_expected_product's #[ignore] reason and entry #39"]
+    #[ignore = "BLOCKED: see real_encrypted_evalmult_matches_expected_product's #[ignore] reason and entry #41"]
     fn real_encrypted_evalmult_negative_and_fractional_values() {
         let ctx = new_ctx(4242);
         let slots_a = [-1.5, 2.25, -3.0, 0.5];
@@ -1743,7 +1751,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "BLOCKED: see real_encrypted_evalmult_matches_expected_product's #[ignore] reason and entry #39"]
+    #[ignore = "BLOCKED: see real_encrypted_evalmult_matches_expected_product's #[ignore] reason and entry #41"]
     fn real_encrypted_evalmult_repeated_calls_reused_context() {
         // Several independent real round trips on the SAME context,
         // different plaintexts/seeds each time -- proves the reused

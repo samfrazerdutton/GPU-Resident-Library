@@ -1350,3 +1350,99 @@ Full detail: `EXPERIMENT_LEDGER.md` entry #40. Updated next step:
   entry #39 is deliberately NOT re-investigated until the eval key
   itself is fixed), resolution of `test_polyeval`'s SEPARATE multi-level
   noise question (untouched), or production integration.
+
+## GOD PROMPT "CKKS PHASE 8": entry #40's `evalkeygen_host` diagnosis DISPROVEN (a sign bug in its own test) — the real EvalMult blocker is pinpointed to a `sizeP=2`-specific defect in the native key-switch reconstruction (`compute_keyswitch_constants`+`keyswitch_core_resident`), the exact P-tower count the real Rust fixture uses
+
+Full detail: `EXPERIMENT_LEDGER.md` entry #41. Updated next step:
+`research/NEXT_SESSION.md`'s "READ THIS FIRST" section (entirely
+rewritten this round).
+
+- **The core finding**: entry #40's conclusion that `evalkeygen_host`
+  has a confirmed defect was WRONG. It was entry #40's own test,
+  `eval_key_outside_own_part_range_is_near_zero`, that had a sign bug:
+  it computed `bv0[idx]-av_s`, literally following
+  `src/evalkeygen.cpp`'s own doc comment, which itself states the
+  relation with the wrong sign. The independently re-derived and
+  empirically confirmed TRUE relation is `bv+av*s ~= P*s2` (in a
+  part's own range) / `~=0` (outside it) — PLUS, not MINUS. Derivation:
+  `keygen_host` (`src/keygen.cpp:105`) computes `b=ns*e-a*s`, so
+  `b+a*s=ns*e` (small); substituting into `evalkeygen_host_sold`'s
+  `av=pkA*u+ns*e1`, `bv=pkB*u+ns*e0[+Ps2]` gives
+  `bv+av*s = u*ns*e_keygen + ns*(e0+e1*s) + Ps2 ~= Ps2`.
+- **Four independent confirmations, all built/rebuilt this round**:
+  (1) `tests/test_evalkeygen_isolated.cpp` (new, fully native, no
+  OpenFHE/Rust/FFI dependency): CHECK 1, a hand-constructed nonzero
+  secret (`s_hat=1`, `pkA=7`, `pkB=-7`, giving exact zero-noise
+  cancellation) checked across ALL QP towers including the P range
+  (never covered before) — worst 1.51e-12% of q. CHECK 2, a real
+  `keygen_host` keypair checked for `pkB+pkA*s~=0` across all QP
+  towers — worst 9.77e-13% of q. CHECK 3, the real key through the
+  real `evalkeygen_host` wrapper with real `PModq_QP` — worst
+  3.46e-11% of q. (2) The sign bug in `evalmult.rs`'s
+  `eval_key_outside_own_part_range_is_near_zero` fixed
+  (`bv0[idx]-av_s` → `addmod(bv0[idx],av_s,q)`) and un-ignored — now
+  passes at worst 3.16e-11% of q, where entry #40 reported ~50% using
+  the wrong sign. (3) Two PRE-EXISTING, previously-overlooked July-era
+  tests, rebuilt and re-run this round for the first time in this
+  investigation thread: `tests/test_evalkeygen.cpp` ("Stage 6c",
+  OpenFHE-sourced keypair, already uses the "+" convention) — PASS,
+  maxmag=2924. `tests/test_ks_constants.cpp` ("Stage 6a", bit-exact vs.
+  OpenFHE's own `GetPInvModq`/`GetPHatInvModp`/etc.) — PASS, bit-exact
+  at `sizeQ=5,sizeP=3,numPart=2`.
+- **The real, newly-pinpointed defect**: CHECK 4 of
+  `tests/test_evalkeygen_isolated.cpp` runs the REAL
+  `compute_keyswitch_constants`+`evalkeygen_host`+
+  `keyswitch_core_resident` full reconstruction on a constant
+  CRT-consistent input, at the real Rust fixture's exact configuration
+  (`N=1024,SIZE_Q=8,SIZE_P=2,NUM_PART=2,alpha=4`,
+  `rust/crates/ckks-cuda/src/evalmult.rs`'s `new_ctx`) — **FAILS at
+  ~50% of q across all 8 towers**. Systematically varying the
+  configuration isolated the trigger to **`sizeP=2` specifically**:
+  `sizeP=3` PASSES cleanly (~1e-11% of q) at both `sizeQl=8` and
+  `sizeQl=5` (ruling out `sizeQl`); `numPart=1` still FAILS at
+  `sizeP=2` (ruling out digit decomposition). `K.pInvModq`/`K.pHatInv`
+  individually satisfy their own defining modular-inverse relations
+  exactly even at `sizeP=2` — the constant VALUES are correct, their
+  downstream USE inside `keyswitch_core_resident`'s moddown step is
+  not yet cleared. An unexplained tower-0-vs-towers-1-7 asymmetry
+  (0.096% vs. ~50%) was observed but not understood.
+- **A methodology trap caught and corrected before being reported**:
+  an earlier version of the isolated test hand-reconstructed a known
+  CRT-consistent constant from the P-basis via `K4.pHatInv`/
+  `K4.pHatModq`, expecting EXACT equality, and "failed" by exactly
+  `P` — confirmed via direct arithmetic (`5+1*P`). This is not a
+  defect: `LaunchApproxSwitchCRTBasis` is an APPROXIMATE conversion by
+  design (reconstructs `x+k*P` for bounded `k`), and the surrounding
+  `LaunchModDownCombine` step is specifically designed to cancel this
+  bounded term. Removed from the committed test, replaced with an
+  explanatory comment.
+- **Hypotheses tested and REFUTED this round, do not re-try without
+  new evidence**: `evalkeygen_host`/`evalkeygen_host_sold` having any
+  defect (entry #40's entire diagnosis, see above); digit
+  decomposition/`numPart` as the `sizeP=2` trigger; `K.pInvModq`/
+  `K.pHatInv`'s own modular-inverse correctness; the naive
+  CRT-reconstruction-exactness framing.
+- **Hypotheses NOT yet tested**: `K.pHatModq`'s correct use inside
+  `keyswitch_core_resident`'s `moddown()` lambda specifically for a
+  2-element P basis; an edge case in `LaunchApproxSwitchCRTBasis`'s
+  Barrett/Shoup reduction for small source counts;
+  `LaunchModDownCombine`'s own combine arithmetic; the tower-0
+  asymmetry. See `NEXT_SESSION.md` for full detail.
+- New test file `tests/test_evalkeygen_isolated.cpp`, registered in
+  `CMakeLists.txt`. Rust changes: the sign fix and un-ignore in
+  `eval_key_outside_own_part_range_is_near_zero`, plus 7 corrected
+  `#[ignore]` reason strings pointing from entry #40 to entry #41 with
+  the corrected explanation — the 7 `real_encrypted_evalmult_*`/
+  diagnostic tests blocked by the `sizeP=2` defect correctly REMAIN
+  `#[ignore]`d. Full Rust suite: **28 passed, 7 ignored, 0 failed**
+  (one more pass than entry #40, as expected).
+- No production C++/CUDA source file ends this round modified — a
+  diagnostic NTT-kernel-swap experiment in `src/evalkeygen.cpp`
+  (testing the now-refuted eval-key hypothesis) was tried, gave a
+  bit-identical result, and was reverted (`git checkout --`).
+- **Explicitly NOT claimed**: the exact line/mechanism causing the
+  `sizeP=2`-specific failure (not pinpointed); the full encrypted
+  EvalMult round trip (still blocked, now correctly understood to
+  depend on fixing this reconstruction defect, not `evalkeygen_host`);
+  resolution of `test_polyeval`'s SEPARATE multi-level noise question
+  (untouched).

@@ -3,16 +3,16 @@
 ## Current commit
 
 Check `git log -3` on resume. As of this writing, HEAD is a new commit
-on top of entry #39's commit `19598f9` (the GOD PROMPT "CKKS PHASE 7"
-round: the remaining real-encrypted-EvalMult blocker is ISOLATED to a
-confirmed, reproducible defect in `evalkeygen_host`'s OWN native
-(OpenFHE-free) eval-key generation -- `keyswitch_device_resident`,
-`keyswitch_core_resident`, `LaunchTensor`, and `LaunchCombine` are all
-proven correct this round by new, decisive discriminating experiments.
-The EXACT faulty line within `evalkeygen_host`/`evalkeygen_host_sold`
-was NOT pinpointed. See `EXPERIMENT_LEDGER.md` entry #40 for the full
-elimination). Confirm push status -- push again if `git status` shows
-ahead of origin.
+on top of entry #40's commit (the GOD PROMPT "CKKS PHASE 8" round:
+entry #40's "evalkeygen_host is broken" diagnosis is DISPROVEN -- it
+was entry #40's OWN test that had a sign bug. `evalkeygen_host`/
+`evalkeygen_host_sold`/`keygen_host` are now proven correct by four
+independent routes. The real, still-unresolved defect is pinpointed to
+`compute_keyswitch_constants`+`keyswitch_core_resident`'s own native
+reconstruction, triggered specifically by `sizeP=2` -- the exact
+P-tower count the real Rust fixture uses. See `EXPERIMENT_LEDGER.md`
+entry #41 for the full evidence chain). Confirm push status -- push
+again if `git status` shows ahead of origin.
 
 **Reminder, confirmed the hard way in an earlier round**: this machine
 has (at least) two SEPARATE git clones of this GitHub repo -- the WSL
@@ -23,109 +23,103 @@ an entirely unrelated commit history (raw CUDA-kernel-optimization
 work) and untracked, stale copies of `rust/`/`research/` -- never run
 `git status`/`log`/commit decisions against it for this work.
 
-## READ THIS FIRST if resuming into EvalMult/relin work: the defect is now ISOLATED to `evalkeygen_host` specifically -- do not re-doubt keyswitch/tensor/combine
+## READ THIS FIRST if resuming into EvalMult/relin work: `evalkeygen_host` is PROVEN CORRECT -- the real defect is `sizeP=2`-specific, inside compute_keyswitch_constants/keyswitch_core_resident's own reconstruction
 
-Entry #39 already closed entries #30/#38's `ba0+ba1*s =?= t2*s²`
-methodology mystery. Entry #40 (this round) went further and PROVED,
-via new discriminating experiments, that the Rust native pipeline's
-`LaunchTensor`, `keyswitch_device_resident`/`keyswitch_core_resident`
-(the decompose/accumulate/moddown ALGORITHM), and `LaunchCombine` are
-ALL correct for REAL encrypted ciphertext data -- not just synthetic
-RNS data. **The confirmed defect is narrower than previously thought:
-it is specifically in `evalkeygen_host`'s/`evalkeygen_host_sold`'s own
-native eval-key GENERATION** (`src/evalkeygen.cpp`), which has NEVER
-been independently checked against any reference before this round
-(every prior check of the relin identity -- entries #30, #36, #38, and
-this project's own `tests/test_keyswitch.cpp` -- used OpenFHE-SOURCED
-key material extracted into `KeySwitchConstants`, never this crate's
-own `evalkeygen_host` output). **Do not re-doubt `LaunchTensor`,
-`keyswitch_device_resident`, `keyswitch_core_resident`, or
-`LaunchCombine` without new evidence -- they are proven correct this
-round** (see the decisive tests below, now permanent passing
-regression coverage in `evalmult.rs`).
+**Entry #40's diagnosis ("evalkeygen_host is broken") was WRONG and is
+now DISPROVEN.** It was entry #40's own test
+(`eval_key_outside_own_part_range_is_near_zero`) that had a sign bug:
+it computed `bv0[idx]-av_s`, literally implementing `src/evalkeygen.cpp`'s
+own doc comment, which itself claims the WRONG sign. **The true
+relation is `bv+av*s ~= P*s2` (in a part's own range) / `~=0` (outside
+it) -- PLUS, not MINUS.** Derivation: `keygen_host`
+(`src/keygen.cpp:105`) computes `b=ns*e-a*s`, so `b+a*s=ns*e` (small);
+substituting into `evalkeygen_host_sold`'s `av=pkA*u+ns*e1`,
+`bv=pkB*u+ns*e0[+Ps2]` gives `bv+av*s = u*ns*e_keygen +
+ns*(e0+e1*s) + Ps2 ~= Ps2`. **Do not re-doubt `evalkeygen_host`,
+`evalkeygen_host_sold`, or `keygen_host` without new evidence** -- all
+three are now proven correct by FOUR independent routes (see entry
+#41): a from-scratch isolated C++ test covering Q AND P towers
+(`tests/test_evalkeygen_isolated.cpp`, CHECKS 1-3, worst ~3.5e-11% of
+q); the sign-corrected Rust test (worst 3.16e-11% of q); and two
+PRE-EXISTING, previously-overlooked July-era tests
+(`tests/test_evalkeygen.cpp`, `tests/test_ks_constants.cpp`), both of
+which already used the correct "+" convention and already passed
+when rebuilt.
 
-**The decisive evidence chain, in order**:
-1. `control_a2_raw_tensor_matches_direct_ciphertext_product_exactly`
-   (passing): `t0+t1*s+t2*s^2` EXACTLY equals
-   `(c0a+c1a*s)*(c0b+c1b*s)` computed directly from real ciphertext
-   data -- 0 mismatches across all 8192 positions. `LaunchTensor` is
-   exact.
-2. `fast_keyswitch_matches_reference_keyswitch_on_real_t2` (passing):
-   `keyswitch_device_resident` and `keyswitch_reference`
-   (`keyswitch_core_resident`) agree BIT-EXACT (0/8192 mismatches) on
-   the SAME real `t2`. The key-switch ALGORITHM is not the defect --
-   whatever it computes, both paths compute the identical thing.
-3. Combined with entry #39 (this SAME algorithm, given an
-   OpenFHE-generated eval key, correctly satisfies the relin identity
-   for real data at ~5.5e-11% of q): the defect must be in the eval
-   key itself, i.e. in `evalkeygen_host`.
-4. `keyswitch_reference_on_constant_crt_consistent_input` (ignored,
-   FAILING, ~50% of q): even a trivial CRT-consistent constant value
-   (not a real ciphertext at all) fails the relin identity through
-   this crate's own eval key.
-5. `eval_key_outside_own_part_range_is_near_zero` (ignored, FAILING,
-   ~50% of q): THE most isolated reproduction. For Q-towers outside
-   part 0's own digit range, `evalkeygen_host_sold` adds NO `P*s2`
-   term at all (`if(t>=startIdx && t<endIdx)` guard) -- the expected
-   `bv[0]-av[0]*s ~= 0` depends on NOTHING but the basic
-   `pkA*u+ns*e1`/`pkB*u+ns*e0` "encryption of zero" machinery. Still
-   fails. A C++/Rust cross-check confirmed the raw `pkA`/`pkB`/`av`/`bv`
-   values read by the test exactly match what `evalkeygen_host_sold`
-   computed (ruling out an accessor bug).
+**The real, still-unresolved defect**: CHECK 4 of
+`tests/test_evalkeygen_isolated.cpp` runs the REAL
+`compute_keyswitch_constants`+`evalkeygen_host`+`keyswitch_core_resident`
+full reconstruction (decompose, fast-core accumulate, moddown) on a
+constant CRT-consistent input, at the exact real Rust fixture's
+configuration (`n=1024, sizeQl=8, sizeP=2, numPart=2, alpha=4` --
+`rust/crates/ckks-cuda/src/evalmult.rs`'s `new_ctx`). **It FAILS at
+~50% of q across all 8 towers.** Systematically varying the
+configuration isolated the trigger precisely:
+- `sizeP=2` -> FAILS (both at `sizeQl=8` and `sizeQl=5`).
+- `sizeP=3` -> PASSES cleanly (~1e-11% of q), at both `sizeQl=8` and
+  `sizeQl=5` -- **`sizeQl` is NOT the variable.**
+- `numPart=1` -> STILL FAILS at `sizeP=2` -- **digit
+  decomposition/multi-part effects are NOT the cause.**
+- `K.pInvModq[i]*(P mod q_i)==1 mod q_i` and
+  `K.pHatInv[j]*((P/p_j) mod p_j)==1 mod p_j` both verified to hold
+  EXACTLY even at `sizeP=2` -- these specific modular-inverse
+  CONSTANTS are individually correct; their downstream USE inside
+  `keyswitch_core_resident`'s moddown step is NOT yet cleared.
+- An unexplained asymmetry: tower 0 (the 60-bit prime) shows only
+  0.096% of q; towers 1-7 (50-bit primes) show ~49.94-50.00%. Not yet
+  understood, may be informative.
+
+**This is exactly the configuration the real Rust fixture uses** --
+explaining why the real encrypted-EvalMult round trip has been
+blocked all along, by a cause entirely distinct from entry #40's
+eval-key diagnosis.
+
+**A methodology trap, already hit once this round -- do not repeat
+it**: `LaunchApproxSwitchCRTBasis` is an APPROXIMATE basis conversion
+BY DESIGN (it reconstructs `x+k*P` for some small bounded `k`, not `x`
+exactly). A naive hand-reconstruction test expecting EXACT equality
+from this function ALONE (without the surrounding
+`LaunchModDownCombine` step, which is specifically designed to cancel
+the bounded `k*P` term by dividing by `P`) will show a spurious,
+exactly-explainable-by-`k*P` "failure" that is not a real defect. This
+was tried, understood, and removed from the committed test this
+round -- do not re-add it as evidence.
 
 **Hypotheses tested and REFUTED this round -- do not re-try without new
 evidence**:
-- Digit decomposition / `numPart` (1 and 2 both fail identically via
-  `control_a_relin_combine_matches_raw_tensor_num_part_1_test` and its
-  `_within_keyswitch_noise_test` sibling).
-- The batched-vs-per-tower NTT kernel launch mechanism: temporarily
-  swapped `evalkeygen_host_sold`'s `LaunchNTT_CT_Batched` (used only
-  by this function, for its own private `u`/`e0`/`e1` sampling) for a
-  per-tower loop using `LaunchNTT_CT` (the kernel `keygen_host` uses
-  successfully) -- bit-for-bit IDENTICAL result either way. This
-  change was REVERTED (`git checkout -- src/evalkeygen.cpp`) since it
-  gave no benefit; do not re-attempt without a new reason.
-- An eval-key accessor/FFI/indexing bug: C++ and Rust read the exact
-  same raw `pkA`/`pkB`/`av`/`bv` values for the same (tower,
-  coefficient) -- confirmed via a direct cross-check.
-- A `ks_context_create`-introduced mutation of `K.av`/`K.bv`: it takes
-  `const KeySwitchConstants&`, so this is structurally impossible.
+- `evalkeygen_host`/`evalkeygen_host_sold` having any defect (entry
+  #40's entire diagnosis) -- see above, disproven by four routes.
+- Digit decomposition / `numPart` as the `sizeP=2` trigger (1 and 2
+  both fail identically).
+- `K.pInvModq`/`K.pHatInv`'s own modular-inverse correctness (both
+  individually verified exact even at `sizeP=2`).
+- The naive CRT-reconstruction-exactness framing (methodology error,
+  not a defect -- see above).
 
 **Hypotheses NOT yet tested -- the recommended starting points**:
-- The exact per-coefficient arithmetic of `u`/`e0`/`e1`'s
-  sampling-to-coefficient-embedding step (`src/evalkeygen.cpp`, lines
-  ~98-109) -- add a bounded debug dump (ONE tower, ONE coefficient,
-  not secret material in bulk) INSIDE `evalkeygen_host_sold` and
-  independently verify the FULL per-coefficient arithmetic chain by
-  hand for a tower outside part 0's range, to find the exact
-  divergence point. (A similar one-off debug dump was added and
-  removed this round at `part==0 && t==4 && k==0`; the raw values
-  cross-checked consistently against Rust, but the SINGLE-coordinate
-  hand-verification done at the time incorrectly compared in
-  eval-domain rather than converting the WHOLE tower to coefficient
-  domain first -- repeat this check properly, i.e. over all `k`,
-  INTT'd, not a single eval-domain point, which is exactly the trap
-  entry #39 already warned about.)
-- Whether `PModq_QP`'s computation (`cpp_bridge/keyswitch_bridge.cpp`,
-  lines ~131-136) is correct -- NOT exercised by the "outside range"
-  test, which deliberately avoids needing it.
-- Write a tiny, from-scratch C++ test calling `evalkeygen_host_sold`
-  directly (bypassing the fixture/bridge entirely) with a
-  HAND-CONSTRUCTED, trivial `sQP`/`pkA_QP`/`pkB_QP` (e.g. an all-zero
-  secret, so `pkB=ns*e` trivially and `bv` should equal exactly
-  `ns*e0` with no `s`-dependence at all) to isolate the computation
-  from `keygen_host`'s own output entirely.
+- `K.pHatModq`'s correct USE inside `keyswitch_core_resident`'s
+  `moddown()` lambda (`src/keyswitch.cpp`), specifically for a
+  2-element source (P) basis -- instrument with bounded per-coefficient
+  printouts (ONE or TWO coefficients, not secret material in bulk) and
+  hand-derive the expected value at `sizeP=2`.
+- `LaunchApproxSwitchCRTBasis`/`approx_switch_kernel`
+  (`kernels/basis_convert.cu`)'s Barrett reduction
+  (`barrett_u128_mod_u64`) or Shoup multiplication for small source
+  counts -- test in complete isolation (no surrounding ModDown) with a
+  KNOWN, simple input across source sizes 1/2/3 to find exactly where
+  `sizeP=2` diverges from the passing `sizeP=1`/`sizeP=3` cases.
+- `LaunchModDownCombine`'s own combine arithmetic
+  (`kernels/moddown.cu`).
+- The unexplained tower-0-vs-towers-1-7 asymmetry (0.096% vs ~50%) --
+  may point directly at the mechanism once understood.
 
-**Secondary, not yet resolved either (was the original Phase 6/7 open
-question, still true)**: the full
+**Secondary, not yet resolved either**: the full
 `EvalMultContext::multiply_relin_rescale` -> `codec::decrypt` ->
 `codec::decode` round trip (`real_encrypted_evalmult_matches_expected_
-product` and siblings) still fails -- but this is now EXPECTED, since
-it depends on `evalkeygen_host`'s eval key being correct, which entry
-#40 shows it is not. Fixing `evalkeygen_host` is the PREREQUISITE for
-re-attempting the rescale/composition question (previously the leading
-open item) -- do not investigate rescale further until the eval key
-itself is fixed and `control_a_relin_combine_matches_raw_tensor_within_
+product` and siblings) still fails -- EXPECTED, since it depends on
+the `sizeP=2` reconstruction defect above being fixed. Do not
+investigate rescale/composition further until that defect is
+resolved and `control_a_relin_combine_matches_raw_tensor_within_
 keyswitch_noise_test` passes.
 
 ## `-G` build-flag bug: CLOSED for the four originally-flagged benchmarks; one remaining sweep still open

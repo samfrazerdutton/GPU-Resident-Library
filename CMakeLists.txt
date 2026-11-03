@@ -105,6 +105,12 @@ gpufhe_test(test_evalmult_relin_openfhe_reference tests/test_evalmult_relin_open
 gpufhe_test(test_ks_constants tests/test_ks_constants.cpp)
 gpufhe_test(test_keygen tests/test_keygen.cpp)
 gpufhe_test(test_evalkeygen tests/test_evalkeygen.cpp)
+# GOD PROMPT "CKKS PHASE 8": fully native (OpenFHE-free) isolation of
+# evalkeygen_host/evalkeygen_host_sold + compute_keyswitch_constants +
+# keyswitch_core_resident, pinpointing that sizeP=2 specifically (not
+# sizeQl, not numPart) triggers the real-encrypted-EvalMult blocker --
+# see research/EXPERIMENT_LEDGER.md entry #41.
+gpufhe_test(test_evalkeygen_isolated tests/test_evalkeygen_isolated.cpp)
 gpufhe_test(test_encdec tests/test_encdec.cpp)
 gpufhe_test(test_evalmult tests/test_evalmult.cpp)
 gpufhe_test(test_ks_resident tests/test_ks_resident.cpp)
