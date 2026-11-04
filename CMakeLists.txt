@@ -50,6 +50,7 @@ add_library(gpufhe STATIC
   src/encrypt_host_shoup_pooled_barrett_batched.cpp
   src/encrypt_host_shoup_pooled_barrett_batched_pinned.cpp
   src/encrypt_host_shoup_pooled_barrett_prewarm.cpp
+  src/encrypt_host_shoup_pooled_barrett_batched_registered.cpp
   src/rotate.cpp
   src/ptops.cpp
   src/params.cpp
@@ -449,6 +450,22 @@ gpufhe_benchmark(bench_thp_hint_by_size bench/bench_thp_hint_by_size.cpp)
 # not call into gpufhe:: code. See research/TRANSFER_PROFILING.md's
 # Phase 19 section and research/EXPERIMENT_LEDGER.md entry #52.
 gpufhe_benchmark(bench_alloc_path_comparison bench/bench_alloc_path_comparison.cpp)
+# GOD PROMPT "CKKS PHASE 20": CUDA-registered host memory prototype.
+# RegisteredHostBuffer (include/registered_host_buffer.h) is the new
+# move-only RAII ownership model; its own standalone lifecycle/
+# concurrency audit and the real encrypt_host_shoup_pooled_barrett_
+# batched_registered correctness/concurrency tests are genuine
+# correctness/lifecycle tests -- registered via gpufhe_test (CTest
+# SHOULD run these). The dedicated full-lifecycle timing comparison
+# (bench_encrypt_registered_lifecycle) is a pure timing diagnostic --
+# registered via gpufhe_benchmark (buildable/runnable directly, never
+# auto-picked-up by ctest), per the SAME discipline Phase 19
+# established. See research/TRANSFER_PROFILING.md's Phase 20 section
+# and research/EXPERIMENT_LEDGER.md entry #53.
+gpufhe_test(test_registered_host_buffer tests/test_registered_host_buffer.cpp)
+gpufhe_test(test_encrypt_host_shoup_pooled_barrett_batched_registered_matches_reference tests/test_encrypt_host_shoup_pooled_barrett_batched_registered_matches_reference.cpp)
+gpufhe_test(test_encrypt_host_shoup_pooled_barrett_batched_registered_concurrency_audit tests/test_encrypt_host_shoup_pooled_barrett_batched_registered_concurrency_audit.cpp)
+gpufhe_benchmark(bench_encrypt_registered_lifecycle bench/bench_encrypt_registered_lifecycle.cpp)
 gpufhe_test(test_mult_barrett tests/test_mult_barrett.cpp)
 # Directive "VERIFY OOM DIAGNOSIS AND REMOVE THE LARGE-N DIAGONAL
 # BOTTLENECK", Priority 3: proves an O(S*2^RST) analytic replacement for

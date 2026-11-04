@@ -1485,4 +1485,453 @@ is implementation-focused, not further diagnosis: prototype
 `cudaHostRegister` inside the real pooled/prewarmed production code
 paths, re-verify correctness/concurrency from scratch, and measure the
 full pipeline before deciding whether to ship it.
-API remains exactly as Phases 16/17 left it.
+
+## Phase 20: CUDA-registered host memory prototype -- built, correctness-verified (0 mismatches across 400+ checks), measured against the real encrypt/EvalMult pipeline, and RETAINED AS AN OPT-IN EXPERIMENTAL FEATURE (not promoted)
+
+GOD PROMPT "CKKS PHASE 20". Starting commit `8d6dbe4` (Phase 19 end
+state), confirmed via `git log -1`/`git status`/`origin/main` before
+any change: HEAD and `origin/main` both at `8d6dbe4`, working tree
+clean apart from the same pre-existing unrelated untracked items. This
+is the first phase in this investigation to move from diagnosis to a
+real implementation prototype, per the governing directive's explicit
+framing: "this is not permission to immediately replace the production
+implementation."
+
+### Environment re-verified (not assumed)
+
+NVIDIA GeForce RTX 2060 with Max-Q Design, 6144MiB VRAM, driver
+595.97; CUDA runtime 13.2.0 (`cudaRuntimeGetVersion`=13020); 16
+logical CPUs; `RLIMIT_MEMLOCK`=65536KB (64MB, unchanged, re-measured);
+WSL free RAM ~9.8GB of an 11GB cap; Windows host free RAM 1.4-2.0GB
+throughout this phase (measured via `Get-CimInstance
+Win32_OperatingSystem`) -- the n=131072 >=6GiB gate was never met,
+never attempted.
+
+### Ownership model, designed before implementation (directive Section 2)
+
+A new header-only class, `include/registered_host_buffer.h`'s
+`RegisteredHostBuffer`, is the single explicit owner of a page-aligned
+host allocation registered with CUDA via `cudaHostRegister`. It
+follows the SAME move-only/valid-state/idempotent-`reset()` RAII
+pattern this codebase already established (`include/ks_raii.h`'s
+`ScopedKSContext`/`ScopedKSWork`), extended with an explicit 4-state
+machine (`Empty`/`Allocated`/`Registered`/`Failed`) rather than a
+binary valid flag, because this resource has a genuine THIRD outcome
+(partial success: allocation succeeded, registration did not) the
+existing wrappers' simpler binary model does not need to represent.
+The 8 ownership responsibilities the governing directive's Section 2
+lists map directly onto this class's own methods (allocate via
+`posix_memalign` to the system page size; first-touch via `memset`
+BEFORE registering; register via `cudaHostRegister`; expose via
+`data()`, which returns `nullptr` unless `state()==Registered`;
+prevent use-after-free via move-only semantics and a post-`release()`
+null `data()`; synchronize-before-unregister via `release(stream)`'s
+optional `cudaStreamSynchronize`; unregister and free each exactly
+once via the state check inside `release()`, itself idempotent).
+
+**Two measured facts, verified empirically rather than assumed, that
+directly shaped this design**:
+1. A direct probe (`cudaHostRegister` at 64/70/80/128/200/500MB, each
+   immediately unregistered and freed) found this API is **NOT gated
+   by `RLIMIT_MEMLOCK` at all** on this installed CUDA 13.2/driver
+   595.97/WSL2 stack -- every size up to 500MB succeeded with zero
+   error, despite the 64MB soft/hard limit this process runs under.
+   This means any budget cap this phase's production pool enforces
+   (see below) is a SELF-IMPOSED safety margin against unbounded host
+   RAM growth, not protection against an OS-level wall this API was
+   found to actually respect -- stated explicitly in both the header
+   and the production file's own comments so a future reader does not
+   assume otherwise.
+2. A safe, bounded, real (not mocked) `cudaHostRegister` failure mode
+   exists and was used for failure-path testing: an invalid `flags`
+   value (e.g. `0xFFFFFFFF`) reliably fails with
+   `cudaErrorInvalidValue`, as does a null pointer or a zero-byte
+   request -- these became the real induced failures
+   `tests/test_registered_host_buffer.cpp` exercises, since the
+   originally-planned "exceed `RLIMIT_MEMLOCK`" approach does not
+   actually fail on this system (fact 1 above).
+
+### Standalone lifecycle/concurrency audit (directive Section 4)
+
+`tests/test_registered_host_buffer.cpp`, 10 scenarios covering every
+item the governing directive's Section 4 lists (scenario 9, prewarm
+racing with real encryption, is integration-level and covered
+instead by the encrypt-specific concurrency audit below -- there is
+no "prewarm" concept at the standalone-class layer by itself):
+
+1. Successful alloc/register/use/unregister/release.
+2. 50 repeated fresh alloc/free cycles, 0 registration failures.
+3. 200 reuse cycles on ONE registered buffer, no re-registration.
+4. A REAL induced failure: a raw, bypassing-the-class
+   `cudaHostRegister` call on an ALREADY-registered range fails with
+   `cudaErrorHostMemoryAlreadyRegistered` ("part or all of the
+   requested memory range is already mapped") -- the class's own
+   single successful registration is unaffected, its `release()`
+   still unregisters and frees cleanly, and a fresh, independent
+   registration immediately afterward still succeeds (CUDA context
+   health confirmed, not assumed).
+5. A REAL induced partial-initialization failure: invalid
+   `cudaHostRegister` flags (`0xFFFFFFFF`) -- allocation and
+   first-touch succeed, registration fails with
+   `cudaErrorInvalidValue`, the class correctly reports `Failed`
+   with `data()==nullptr`, and a fresh small registration immediately
+   afterward still succeeds.
+6. A `std::vector<RegisteredHostBuffer>` of 5 live buffers destroyed
+   while still registered -- clean teardown, no crash.
+7. A bounded (`cap=3`) pool evicting older entries as 6 are inserted
+   -- every surviving buffer remains usable after each eviction.
+8. 8 threads x 25 iterations (200 total), each thread owning
+   independent buffers concurrently -- 0 failures.
+10. `release()` called immediately after enqueuing a REAL
+    `cudaMemcpyAsync`, with NO separate explicit synchronize first --
+    `release()`'s own internal `cudaStreamSynchronize` is proven (via
+    a readback of the transferred data afterward) to be what actually
+    waits for the transfer, directly testing the directive's explicit
+    "do not treat a successful enqueue as proof the GPU has finished
+    using the memory" requirement.
+12. A REAL induced async failure (`cudaMemcpyAsync` to a null device
+    pointer) -- the registered buffer's own cleanup proceeds correctly
+    and CUDA remains healthy afterward, unaffected by the unrelated
+    GPU-side error.
+
+**Result (normal, non-sanitized build): 0 check failures across all
+10 scenarios.**
+
+**A genuinely new, honestly-reported finding from this audit**: under
+AddressSanitizer (`-fsanitize=address,undefined`), `cudaHostRegister`
+reliably fails with `cudaErrorMemoryAllocation` ("out of memory") for
+EVERY call, even for a 1MB request -- a real environmental
+incompatibility between ASan's own memory-pressure/shadow-memory
+footprint and this specific CUDA driver call on this WSL2 stack, not
+a defect in `RegisteredHostBuffer`. Crucially, this is exactly the
+kind of failure the class's own design is supposed to survive: after
+adding defensive guards to the TEST code (which initially assumed
+construction would succeed and crashed with a null-pointer
+dereference when it silently didn't -- a real bug in the test, not
+the class), the ASan build ran to completion with **zero crashes,
+zero double-frees, zero corruption across all 27 induced failures**,
+exiting cleanly. This is reported as a validated, honest finding in
+both directions: ASan is NOT usable for testing this registration
+path's SUCCESS cases on this system, but IS usable (and was used) to
+confirm the FAILURE-handling paths are leak-free and crash-free under
+hostile conditions. The normal (non-sanitized) build remains this
+project's established correctness/regression gate, consistent with
+every other phase.
+
+### Production-shaped prototype (directive Section 3)
+
+`src/encrypt_host_shoup_pooled_barrett_batched_registered.cpp` mirrors
+`encrypt_host_shoup_pooled_barrett_batched_pinned.cpp` EXACTLY in
+every respect (same packed `[v|e0|e1|m]` layout, same device buffer
+pool, same kernel launches, same embed/combine arithmetic, same
+RNG/noise generation, same single-mutex serialization) except the
+packed host staging buffer's own allocation mechanism:
+`RegisteredHostBuffer` (posix_memalign + first-touch + cudaHostRegister)
+instead of a raw `cudaMallocHost` pointer. Registration happens ONCE
+per `(n,sizeQ)` key (the pool's first use of that key), exactly
+mirroring the pinned variant's own lazy-once-per-key pattern -- never
+registering/unregistering on every call (the directive's explicit
+"avoid registering and unregistering the same buffer on every
+encryption if the pool is intended to amortize that cost" instruction).
+
+**Safe fallback (directive Section 8)**: a self-imposed, measurable,
+strict cap of 16MiB cumulative registered bytes
+(`kRegisteredBudgetBytes`) across every `(n,sizeQ)` key this pool has
+ever created. If registering a new key would exceed this budget, OR
+if registration itself fails, the pool entry is marked not-ready and
+EVERY call at that key transparently falls back to the existing,
+unmodified, already-production pageable path
+(`encrypt_host_shoup_pooled_barrett_batched`) -- mirroring Phase 16's
+own prewarm-file fallback shape exactly. `RegisteredHostBuffer`'s own
+constructor already guarantees no leak on its own failure, so the
+pool never allocates device buffers for a key whose host buffer
+failed -- nothing partial is ever left reachable.
+
+For symmetry with Phase 16's own API and this phase's Section 3
+"explicitly prewarmed pool" configuration requirement,
+`encrypt_prewarm_registered_buffer(n,sizeQ)` (idempotent, explicit)
+and `encrypt_registered_buffer_is_ready(n,sizeQ)` (query-only) share
+the SAME underlying pool -- prewarming simply forces the pool's
+otherwise-lazy first-creation to happen early.
+
+### Correctness, independently verified (directive Section 5)
+
+`tests/test_encrypt_host_shoup_pooled_barrett_batched_registered_
+matches_reference.cpp` mirrors the pinned variant's own correctness
+test exactly, extended with one more reference implementation:
+bit-exact comparison against the UNTOUCHED `encrypt_host`, Phase 15's
+`encrypt_host_shoup_pooled_barrett_batched`, AND Phase 15's
+`encrypt_host_shoup_pooled_barrett_batched_pinned`, across
+`n in {16,1024,4096,8192}` x `sizeQ in {1,4,8}`, multiple message
+patterns (zero, `LLONG_MIN`/`LLONG_MAX`-adjacent, dense mixed-sign),
+the exact packed-buffer boundary (`n=8192,sizeQ=8`), 10 repeated
+calls at one key (pool-reuse stress), and 3 rounds of interleaved
+calls across 3 distinct keys. **Result: 0 mismatches across every
+case -- `[OVERALL PASS]`.**
+
+**Real encrypted pipeline correctness** (not RNS-level self-consistency
+alone, per the directive's explicit "RNS-only self-consistency is not
+sufficient" instruction): `bench/bench_evalmult_e2e_breakdown.cpp`
+(Phase 11's own established encode->encrypt->EvalMult->decrypt->decode
+harness, extended this phase with a NEW `encryptVariant=5` for the
+registered path, a minimal surgical addition reusing all of its
+existing fixture/validation/correctness-oracle machinery rather than
+duplicating it) ran the real round trip at `n=8192,sizeQ=8,sizeP=2,
+numPart=4` for all three relevant variants:
+
+```
+variant 3 (production, pageable): max abs error = 1.12912e-10 -> [PASS]
+variant 4 (pinned, not shipped):  max abs error = 1.12912e-10 -> [PASS]
+variant 5 (registered, NEW):      max abs error = 1.12912e-10 -> [PASS]
+```
+
+**Identical max error across all three** -- exactly the bit-exact
+equivalence expected, since switching the host staging buffer's own
+allocation mechanism changes nothing about what is computed.
+
+### Concurrency audit (directive Section 4/8)
+
+`tests/test_encrypt_host_shoup_pooled_barrett_batched_registered_
+concurrency_audit.cpp`, 6 scenarios, 436 total checks, **0
+mismatches**:
+
+1. Same key, 8 threads x 8 iterations concurrent -- 0 mismatches.
+2. 8 distinct fresh keys growing the pool concurrently -- 0 mismatches.
+3. 200 sequential reuses at one key -- 0 mismatches.
+4. Mixed shared-key race, 10 threads x 10 iterations -- 0 mismatches.
+5. **Prewarm racing with real encryption at a never-before-seen key**
+   (directive Section 4's point 9) -- 4 threads calling
+   `encrypt_prewarm_registered_buffer` and 4 threads calling the real
+   encrypt function SIMULTANEOUSLY on a fresh key: 0 mismatches
+   regardless of which side won the race for first creation; all 4
+   prewarm calls reported ready, and `is_ready` was true afterward.
+   Correctness, not registration success, is the real gate here -- a
+   fallback-to-pageable outcome would have been an equally valid pass.
+6. **Fallback-path correctness under genuine budget pressure**
+   (directive Section 8's explicit "fail safely... never leave
+   partially registered or leaked buffers" requirement, exercised for
+   real, not assumed): 16 distinct large keys (`n=8192,sizeQ=1..8` +
+   `n=16384,sizeQ=1..8`, summing to ~27MiB, deliberately over the
+   16MiB budget) -- **12 registered successfully, 4 fell back to
+   pageable once the budget bound, 0 mismatches either way.**
+
+### Full lifecycle measurement (directive Section 6)
+
+`bench/bench_encrypt_registered_lifecycle.cpp` (new): compares 5
+DISTINCT configurations, each given its OWN `(n,sizeQ)` key so no
+configuration's pool state contaminates another's first-use
+measurement (A/B: the existing production/pinned pools; C: the
+registered path bypassing the pool entirely, registering and
+unregistering on EVERY call -- intentionally the pattern this phase
+warns against, kept as its own distinct configuration per the
+directive's explicit "keep these as distinct configurations, do not
+combine their results" instruction; D: the real pool-based registered
+path, reused across calls; E: the same pool, explicitly prewarmed
+before the first timed call). A first-use pass (one fixed-order
+sample per configuration) is recorded SEPARATELY from a randomized,
+interleaved, fixed-seed (7654321) steady-state round (15 rounds x 5
+configs = 75 samples), every individual sample preserved to CSV.
+**Honesty note on C**: it intentionally omits the real embed/combine
+CPU arithmetic (it only moves representative bytes) to isolate the
+allocation-lifecycle SHAPE in comparable form to A/B/D/E's transfer
+pattern -- its absolute total is NOT a fair stand-in for real encrypt
+latency, only for comparing its OWN allocation-lifecycle shape across
+runs; this is stated here explicitly rather than left for a reader to
+discover.
+
+**First-use (cold-start) results, at `n=8192,sizeQ=8` (D) vs.
+`sizeQ=9` (E, a deliberately distinct but nearly-identical-size key --
+ONE extra RNS tower, not a different `n`, to keep the comparison fair
+per the directive's "do not use a different test fixture... between
+implementations" instruction)**:
+
+```
+A (production, pageable):      459,655-943,132us  -- CONFOUNDED: this is
+                                the FIRST CUDA call in the whole process,
+                                so it is dominated by one-time CUDA
+                                context initialization (Phase 19's own
+                                371-845ms finding), not anything
+                                intrinsic to the pageable path itself.
+B (pinned, not shipped):        18,908-21,603us    -- cudaMallocHost's
+                                own first-call cost for this key.
+C (registered, fresh-per-call):  5,595-5,852us     -- allocation+register
+                                +transfer only, no embed/combine.
+D (registered, pool-reused):     9,040-9,355us     -- the REAL encrypt
+                                call's first-ever cost at this key.
+E (registered, prewarmed):       3,378-5,195us     -- registration cost
+                                already paid; this measures only the
+                                first ENCRYPT call's remaining cost.
+```
+
+**D's cold-start (~9.0-9.4ms) is roughly 2.1-2.4x CHEAPER than B's
+cold-start (~18.9-21.6ms)** -- a direct, reproducible demonstration
+that the registered path resolves the exact cold-start weakness that
+blocked Phase 15/16's pinned variant from being promoted to production
+in the first place.
+
+**Steady-state results (pool fully warm, 15-round randomized
+interleaved medians), reproduced across 3 independent fresh-process
+invocations**:
+
+```
+                    run1     run2     run3
+A (production)     4043us   4271us   4087us
+B (pinned)          4005us   3914us   3545us
+D (registered)      3704us   3758us   3687us
+E (registered,
+   prewarmed)        3840us   3946us   4031us
+```
+
+**D (registered, pool-reused) consistently beat A (production) in
+EVERY one of 3 independent runs**, by roughly 7-14%, and was
+competitive with B (pinned) -- sometimes slightly ahead, sometimes
+slightly behind, well within the measured run-to-run noise (CVs
+0.08-0.20). This is a real, modest, reproducible improvement, not a
+one-off measurement artifact.
+
+**Unresolved, honestly flagged**: E (explicitly prewarmed) was
+consistently slightly SLOWER than D (lazily created on first use) in
+every run (3840-4031us vs. 3687-3758us), which is counter to a naive
+expectation that prewarming should only help. No root cause was
+investigated this round (plausibly a CUDA-driver memory-layout or
+allocation-ordering effect specific to this measurement's exact
+sequence, not a flaw in the prewarm mechanism itself, which the
+correctness/concurrency audits above both confirm behaves correctly)
+-- flagged here as a genuine open question for a future round, not
+glossed over.
+
+### Nsight Systems confirmation of the actual driver-call reduction (directive Section 6/12, completion criterion 8)
+
+Profiling the REAL production-shaped lifecycle benchmark (not Phase
+19's isolated diagnostic) with `nsys profile` and querying its exported
+SQLite trace (`nsys stats --report cuda_api_sum`) confirms the
+reduction actually happens in this phase's real code, not merely
+assumed to carry over from Phase 19's own finding:
+
+```
+cudaHostAlloc (B's pinned pool, 1 call for its one (n,sizeQ) key): avg 5,129,819ns (5.13ms)
+cudaHostRegister (D+E+C's registrations, 18 calls total):          avg 1,071,521ns (1.07ms)
+cudaHostUnregister (18 calls):                                      avg   459,612ns (0.46ms)
+```
+
+**~4.8x cheaper per call for `cudaHostRegister` vs. `cudaHostAlloc` in
+this phase's REAL production-shaped code** -- closely matching Phase
+19's own isolated-diagnostic finding (~3.1x for registration alone),
+confirming the mechanism carries over into real use, not just a
+microbenchmark artifact. The same `poll`-dominated background-thread
+pattern Phase 19 already identified and correctly excluded (a
+separate, non-blocking NVIDIA driver housekeeping thread) was
+re-observed and handled the same way.
+
+### CMake/CTest integration (directive Section 9)
+
+Following Phase 19's own `gpufhe_test`/`gpufhe_benchmark` distinction:
+the 3 new correctness/lifecycle tests
+(`test_registered_host_buffer`, `test_encrypt_host_shoup_pooled_
+barrett_batched_registered_matches_reference`,
+`test_encrypt_host_shoup_pooled_barrett_batched_registered_
+concurrency_audit`) are registered via `gpufhe_test` (CTest SHOULD
+run these -- they are genuine correctness/lifecycle gates, not timing
+diagnostics). The new pure-timing benchmark
+(`bench_encrypt_registered_lifecycle`) is registered via
+`gpufhe_benchmark` (buildable/runnable directly, never auto-picked-up
+by `ctest`), consistent with Phase 19's own discipline. The new
+production source file (`src/encrypt_host_shoup_pooled_barrett_
+batched_registered.cpp`) was added to the main `gpufhe` library
+target's source list, alongside every other production
+`encrypt_host_shoup_pooled_barrett_*` variant.
+
+**Honest limitation**: a live `cmake .` reconfigure (to run `ctest -N`
+and directly confirm discovery, per the directive's explicit
+instruction) was attempted in the existing `build/` directory this
+round, but was aborted after several minutes with zero progress
+output once Windows host free RAM dropped to ~1.2GB during the
+attempt (consistent with this project's own established, repeatedly-
+documented constraint that a full CMake operation is not safe on this
+machine under memory pressure). This phase's CMake correctness rests
+instead on direct code inspection: `gpufhe_test`/`gpufhe_benchmark`
+are the EXACT, unmodified macros Phase 19 already defined and whose
+`add_test`-vs-no-`add_test` distinction was already verified in that
+phase; this phase only invokes them with new file names, introducing
+no new CMake mechanism to verify. A live `ctest -N` confirmation
+remains a reasonable follow-up whenever host memory allows it.
+
+### Production impact assessment and decision (directive Section 10)
+
+Evaluated against the directive's explicit three-way decision gate:
+
+- **Correctness**: PASS -- 0 mismatches across every correctness test,
+  the real encrypted pipeline, and 436 concurrency-audit checks.
+- **Concurrency/lifetime safety**: PASS -- 6 scenarios including the
+  two this phase specifically added (prewarm-racing, budget-exceeding
+  fallback), 0 mismatches, 0 leaks or crashes (including under the
+  ASan-induced-failure stress above).
+- **Real-world improvement**: PRESENT but MODEST -- a reproducible
+  ~7-14% steady-state win over production across 3 independent runs,
+  and a ~2.1-2.4x cheaper cold-start than the existing (unshipped)
+  pinned alternative. Real, not a microbenchmark artifact (confirmed
+  via `nsys` in the real production-shaped code). Not dramatic.
+- **Safety under the 6GB GPU / constrained WSL2 environment**: PASS --
+  a strict, measurable, self-imposed 16MiB cap with a proven-safe
+  fallback; no allocation in this phase's testing exceeded a few MiB
+  cumulatively; `RLIMIT_MEMLOCK` was never exceeded or stressed
+  (deliberately not relied upon, per the measured fact that it does
+  not actually gate this API on this system).
+- **Open questions**: the D-vs-E prewarm anomaly (above) is
+  unexplained; no Rust/FFI-layer integration exists yet (this phase
+  never wired the new C++ function through `cpp_bridge/
+  encdec_bridge.cpp` or `rust/crates/ckks-cuda`, since the directive's
+  own completion criteria did not require production wiring, only a
+  prototype, measurement, and a decision); only 4 total fresh-process
+  repetitions were measured (3 for steady-state reproducibility, 1
+  additional for cold-start), fewer than this project's own
+  "5+ independent runs" bar for its strongest claims in other phases.
+
+**Decision: Category B -- RETAIN AS AN OPT-IN EXPERIMENTAL FEATURE,
+NOT promoted to production.** The prototype is correct, concurrency-
+safe, and demonstrably resolves the exact cold-start weakness that
+blocked Phase 15/16's pinned variant from promotion, while also
+showing a real, reproducible (if modest) steady-state win. This is
+a STRONGER case than the original pinned variant's own history ever
+achieved. However, per the directive's explicit "do not promote
+solely because `cudaHostRegister` is faster in an isolated allocation
+test" and "the improvement is large enough to justify additional
+complexity" criteria, a ~7-14% steady-state win, an unexplained
+counter-intuitive sub-finding, and the complete absence of any
+Rust/FFI-layer validation make PROMOTE premature this round.
+`encrypt_host_shoup_pooled_barrett_batched` (production, pageable)
+remains entirely unchanged; `encrypt_host_shoup_pooled_barrett_
+batched_pinned` (Phase 15, measured, not shipped) remains entirely
+unchanged. `encrypt_host_shoup_pooled_barrett_batched_registered`
+joins Phase 16's own prewarming API as a second opt-in experimental
+C++ feature, not wired into the Rust API or FFI bridge this round.
+
+**Recommended next experiment, if this is revisited**: investigate
+the D-vs-E anomaly directly (does prewarming interact unfavorably
+with CUDA's own memory-layout decisions for a SPECIFIC key, or is it
+measurement noise that a larger sample would resolve); run 5+
+independent fresh-process repetitions (matching this project's own
+established bar) before trusting the magnitude more firmly; if the
+win holds up, prototype wiring `encrypt_host_shoup_pooled_barrett_
+batched_registered` through `cpp_bridge/encdec_bridge.cpp` and the
+Rust FFI layer, with its own dedicated Rust-side tests, before any
+production promotion decision.
+
+### Regression
+
+Full Rust suite re-confirmed unaffected (no production Rust-reachable
+file touched): **debug -- 4 passed, 38 passed, 0 failed, 1 ignored;
+release -- identical.** The 1 ignored test is the pre-existing
+`control_a_relin_combine_matches_raw_tensor_num_part_1_test`
+(documented since entries #42/#43, unrelated to this phase, status
+unchanged). `git status`/`git diff` confirmed this phase's changes
+are limited to: 2 new files (`include/registered_host_buffer.h`,
+`src/encrypt_host_shoup_pooled_barrett_batched_registered.cpp`), 5 new
+test/bench files, 1 extended existing bench file
+(`bench_evalmult_e2e_breakdown.cpp`, a minimal surgical addition of
+`encryptVariant=5`), `CMakeLists.txt`, and documentation -- no
+existing production `src/*.cpp` file's EXISTING content was modified
+(only the new file was ADDED to the library's source list and to
+`/tmp/build_bench.sh`'s own `CPP_SRCS`, this repo's established
+direct-compilation helper, since a full CMake rebuild remains gated
+by this machine's persistent low free RAM).

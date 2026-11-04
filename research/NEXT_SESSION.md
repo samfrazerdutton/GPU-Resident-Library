@@ -3,7 +3,44 @@
 ## Current commit
 
 Check `git log -3` on resume. As of this writing, HEAD is a new commit
-on top of entry #51's commit `91ae35f` (the GOD PROMPT "CKKS PHASE 19"
+on top of entry #52's commit `8d6dbe4` (the GOD PROMPT "CKKS PHASE 20"
+round: the first phase in this investigation to move from diagnosis to
+a real implementation PROTOTYPE. Built `include/registered_host_
+buffer.h`'s `RegisteredHostBuffer` (move-only RAII, 4-state machine)
+owning a page-aligned host allocation registered via
+`cudaHostRegister`, and `src/encrypt_host_shoup_pooled_barrett_
+batched_registered.cpp` (mirrors Phase 15's pinned variant exactly,
+except the host staging buffer's allocation mechanism; registers ONCE
+per key; self-imposed 16MiB cumulative budget with a safe, leak-free
+fallback to the unmodified production pageable path if exceeded or if
+registration fails). **Correctness**: bit-exact vs. `encrypt_host`,
+Phase 15 batched, AND Phase 15 pinned across every size/boundary/
+repeat/interleave this project tests -- 0 mismatches. Real encrypted
+pipeline (encode/encrypt/EvalMult/decrypt/decode): identical max error
+across production/pinned/registered -- [PASS] for all three.
+**Concurrency**: 6 scenarios, 436 checks, 0 mismatches, including
+prewarm-racing-with-encryption and fallback-under-genuine-budget-
+pressure (12 registered + 4 fell back, both correct). **Performance**:
+the registered path's cold-start (~9.0-9.4ms) is ~2.1-2.4x CHEAPER
+than the pinned path's cold-start (~18.9-21.6ms) -- directly resolving
+the exact cold-start weakness that blocked Phase 15/16's pinned
+variant from production promotion. Steady-state: registered
+consistently beat production by ~7-14% across 3 independent runs, and
+was competitive with pinned. Confirmed via `nsys` in the REAL
+production-shaped code (not just Phase 19's isolated diagnostic):
+`cudaHostRegister` ~4.8x cheaper per call than `cudaHostAlloc`.
+**Unresolved, honestly flagged**: explicitly-prewarmed was
+consistently slightly SLOWER than lazily-created-on-first-use in every
+run -- a genuine open question, not investigated further. **Decision:
+Category B -- RETAIN AS AN OPT-IN EXPERIMENTAL FEATURE, NOT promoted**
+(a real, modest win, but not yet validated at the Rust/FFI layer, and
+one unexplained anomaly). See `EXPERIMENT_LEDGER.md` entry #53 and
+`research/TRANSFER_PROFILING.md`'s Phase 20 section for full detail.
+
+## Earlier commit (Phase 19)
+
+HEAD was previously a commit on top of entry #51's commit `91ae35f`
+(the GOD PROMPT "CKKS PHASE 19"
 round: an INVESTIGATION phase, no production or experimental code
 changed. Mechanistically ISOLATED the cause of Phases 16-18's
 allocation-cost variance using a new comparison diagnostic
@@ -31,41 +68,11 @@ mechanism from the CUDA/`ioctl` cost). Also audited the CMake
 `gpufhe_test` macro (it auto-registers every target with `ctest`,
 including pure timing diagnostics) and added a `gpufhe_benchmark`
 function (same build target, no `add_test`) for the whole Phase
-16-19 pinned-memory/THP diagnostic cluster. **No production or
-experimental code was changed** -- `cudaHostRegister` is a credible,
-well-evidenced alternative, but NOT yet implemented/verified inside
-the real production pooled/prewarmed code paths; that is the
-explicitly recommended next step. See `EXPERIMENT_LEDGER.md` entry
-#52 and `research/TRANSFER_PROFILING.md`'s Phase 19 section for full
-detail.
-
-## Earlier commit (Phase 18)
-
-HEAD was previously a commit on top of entry #50's commit `ff81b97`
-(the GOD PROMPT "CKKS PHASE 18"
-round: a CONTROLLED DIAGNOSTIC experiment, no production or
-experimental code changed. The system-wide THP toggle
-(`/sys/kernel/mm/transparent_hugepage/enabled`) is BLOCKED BY
-PERMISSIONS -- a same-value no-op write returned "Permission denied"
-(no passwordless sudo available); per the user's explicit choice
-("Skip the THP toggle, document the blocker (recommended)"), no
-workaround was attempted and the setting was never changed. Using the
-one THP variable controllable without root (per-call
-`madvise(MADV_HUGEPAGE/NOHUGEPAGE)` hints), found a real, demonstrated,
-but narrow effect: a consistent ~5x `mlock()` slowdown specific to
-EXACTLY 2MiB allocations when the hugepage hint is disabled (absent at
-256KB/512KB/1MB). More importantly, a same-session INTERLEAVED
-re-test directly CONTRADICTED Phase 17's own HIGH-confidence "pure
-Linux `mlock()` reproduces the same variance as `cudaMallocHost`, so
-it's not CUDA-specific" conclusion -- **Phase 19's mechanistic
-`ioctl`-level trace (see "Current commit" above) has since confirmed
-directly why this comparison was never valid: `mlock()` and
-`cudaMallocHost` are not equivalent operations.** Decision at the
-time: category 3 continues -- no production or config change
-justified; Phase 16's opt-in design stands (this decision itself
-still stands). THP settings and `ulimit -l` verified unchanged
-throughout. See `EXPERIMENT_LEDGER.md` entry #51 and `research/
-TRANSFER_PROFILING.md`'s Phase 18 section for full detail.
+16-19 pinned-memory/THP diagnostic cluster -- **this discipline was
+then reused unchanged in Phase 20, see "Current commit" above**.
+No production or experimental code was changed this round. See
+`EXPERIMENT_LEDGER.md` entry #52 and `research/TRANSFER_PROFILING.md`'s
+Phase 19 section for full detail.
 Confirm push status -- push again if `git status` shows ahead of
 origin.
 
@@ -78,7 +85,59 @@ an entirely unrelated commit history (raw CUDA-kernel-optimization
 work) and untracked, stale copies of `rust/`/`research/` -- never run
 `git status`/`log`/commit decisions against it for this work.
 
-## READ THIS FIRST if resuming into pinned-memory work: the root mechanism is now PROVEN (`ioctl()`-bound, every call, via NVIDIA's own tracer) -- `cudaHostRegister` is a credible, well-evidenced, NOT-YET-IMPLEMENTED alternative worth prototyping next
+## READ THIS FIRST if resuming into pinned-memory work: a CUDA-registered host memory PROTOTYPE now exists (`include/registered_host_buffer.h` + `src/encrypt_host_shoup_pooled_barrett_batched_registered.cpp`), correctness/concurrency-verified, measurably resolves the pinned variant's cold-start weakness and wins modestly in steady state -- RETAINED AS OPT-IN, NOT promoted; two concrete follow-ups are open
+
+**Phase 20's core result**: Phase 19 found `cudaHostRegister` on
+pre-touched memory is mechanistically cheaper than `cudaMallocHost`/
+`cudaHostAlloc`. This phase turned that into a real, tested prototype.
+`RegisteredHostBuffer` (move-only RAII, 4-state machine) is the new
+ownership model; `encrypt_host_shoup_pooled_barrett_batched_registered`
+mirrors Phase 15's pinned variant exactly except the host staging
+buffer's allocation mechanism, registering ONCE per `(n,sizeQ)` key
+with a self-imposed 16MiB cumulative budget and a safe, leak-free
+fallback to the unmodified production pageable path if that budget is
+exceeded or registration fails.
+
+**Correctness and concurrency are fully proven**: bit-exact vs.
+`encrypt_host`/Phase 15 batched/Phase 15 pinned across every size/
+boundary/repeat/interleave this project tests (0 mismatches); the real
+encrypted encode/encrypt/EvalMult/decrypt/decode pipeline (identical
+max error across all three implementations, [PASS]); a 6-scenario,
+436-check concurrency audit (0 mismatches), including prewarm racing
+with real encryption and fallback-under-genuine-budget-pressure (12
+registered + 4 correctly fell back, in the same run, both correct).
+
+**Performance, measured not assumed**: the registered path's
+cold-start (~9.0-9.4ms) is ~2.1-2.4x CHEAPER than the pinned path's
+cold-start (~18.9-21.6ms) -- this is the first concrete demonstration
+that the exact cold-start weakness blocking Phase 15/16's pinned
+variant from production (see "READ THIS FOURTH" below) can be
+resolved. In steady state, the registered path consistently beat
+production by ~7-14% across 3 independent fresh-process runs, and was
+competitive with the (unshipped) pinned path. `nsys`, profiling the
+REAL production-shaped code (not just Phase 19's isolated diagnostic),
+confirms `cudaHostRegister` is ~4.8x cheaper per call than
+`cudaHostAlloc` here too.
+
+**Two concrete, unresolved follow-ups, if this is revisited**: (1) an
+explicitly-prewarmed buffer was consistently slightly SLOWER than a
+lazily-created-on-first-use one, every one of 3 runs -- not
+investigated further this round, worth a dedicated look; (2) only 4
+total fresh-process repetitions were measured (fewer than this
+project's own 5+-run bar for its strongest claims), and there is
+ZERO Rust/FFI-layer validation -- `cpp_bridge/encdec_bridge.cpp` and
+`rust/crates/ckks-cuda` were never touched.
+
+**Decision: Category B -- RETAIN AS AN OPT-IN EXPERIMENTAL C++
+FEATURE, NOT promoted to production, NOT wired into the Rust API.**
+This is a stronger case than Phase 15/16's pinned variant ever
+achieved (it resolves pinned's own blocking weakness), but the
+magnitude (~7-14%) and the two open items above make promotion
+premature. `encrypt_host_shoup_pooled_barrett_batched` (production)
+is completely unchanged. Full detail: `research/TRANSFER_PROFILING.md`'s
+Phase 20 section.
+
+## READ THIS SECOND if resuming into pinned-memory work: the root mechanism is now PROVEN (`ioctl()`-bound, every call, via NVIDIA's own tracer) -- this is the finding Phase 20 (above) turned into a working prototype
 
 **Phase 19's core result**: built a new controlled comparison
 (`bench/bench_alloc_path_comparison.cpp`: pageable malloc, pure-Linux
@@ -134,7 +193,7 @@ ordinary anonymous-mapping first-touch at the huge-page boundary (an
 ADDITIVE, separate mechanism from the CUDA/`ioctl` cost). Full
 detail: `research/TRANSFER_PROFILING.md`'s Phase 19 section.
 
-## READ THIS SECOND if resuming into pinned-memory/THP work: the system-wide THP toggle is BLOCKED BY PERMISSIONS (documented, not worked around); a real but narrow ~5x THP-hint effect exists at exactly 2MiB; Phase 17's "not CUDA-specific" conclusion was REVISED -- see Phase 19 above for the mechanistic proof of why
+## READ THIS THIRD if resuming into pinned-memory/THP work: the system-wide THP toggle is BLOCKED BY PERMISSIONS (documented, not worked around); a real but narrow ~5x THP-hint effect exists at exactly 2MiB; Phase 17's "not CUDA-specific" conclusion was REVISED -- see Phase 19/20 above for the mechanistic proof of why
 
 **Phase 18's core result**: attempted the originally-planned
 controlled THP experiment (THP=madvise vs. THP=disabled vs. restored).
@@ -180,7 +239,7 @@ planned system-wide A/B/C THP comparison, or a GPU-passthrough-layer
 trace to test the CUDA/driver hypothesis directly. Full detail:
 `research/TRANSFER_PROFILING.md`'s Phase 18 section.
 
-## READ THIS THIRD if resuming into pinned-memory work: the allocation-cost variance was EXPLORED (Linux kernel mlock() path vs. CUDA/driver overhead -- see Phase 19 above for the mechanistic proof), the Phase 16 decision stands, and a WSL2-ballooning claim from Phase 16 has been downgraded to "not confirmed"
+## READ THIS FOURTH if resuming into pinned-memory work: the allocation-cost variance was EXPLORED (Linux kernel mlock() path vs. CUDA/driver overhead -- see Phase 19/20 above for the mechanistic proof), the Phase 16 decision stands, and a WSL2-ballooning claim from Phase 16 has been downgraded to "not confirmed"
 
 **Phase 17's core result**: Phase 16 found `cudaMallocHost`'s cost
 varies wildly (16us-5.9ms) and guessed, without evidence, that WSL2
@@ -216,7 +275,7 @@ or a controlled, reversible test of disabling Transparent Huge Pages
 to see if that is a necessary ingredient. Full detail: `research/
 TRANSFER_PROFILING.md`'s Phase 17 section.
 
-## READ THIS FOURTH if resuming into performance work: a pinned-memory PREWARMING API exists, fully correct and concurrency-safe, but was NOT promoted because its own allocation cost is unpredictable in this environment
+## READ THIS FIFTH if resuming into performance work: a pinned-memory PREWARMING API exists, fully correct and concurrency-safe, but was NOT promoted because its own allocation cost is unpredictable in this environment -- Phase 20 (top of this file) built a registered-memory alternative that resolves this exact weakness
 
 **Phase 16's core result**: `encrypt_prewarm_pinned_buffer(n,sizeQ)` /
 `encrypt_pinned_buffer_is_ready(n,sizeQ)` / `encrypt_host_shoup_
@@ -250,7 +309,7 @@ accepting the risk explicitly for a specific, named long-lived-service
 deployment where Profile C's unconditional win is what matters.** Full
 detail: `research/TRANSFER_PROFILING.md`'s Phase 16 section.
 
-## READ THIS FIFTH if resuming into performance work on the OLDER (Phase 15) material: transfer batching is DONE and shipped; a pinned-memory follow-up was built, verified, measured FASTER in isolation, then found to be a net loss for real usage and correctly NOT shipped
+## READ THIS SIXTH if resuming into performance work on the OLDER (Phase 15) material: transfer batching is DONE and shipped; a pinned-memory follow-up was built, verified, measured FASTER in isolation, then found to be a net loss for real usage and correctly NOT shipped
 
 **Phase 15's core result**: `encrypt_host_shoup_pooled_barrett_batched`
 (`src/encrypt_host_shoup_pooled_barrett_batched.cpp`) is now the actual

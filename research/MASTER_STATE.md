@@ -2556,3 +2556,114 @@ the governing directive's own framing.
   pinned/prewarmed code paths, re-verify correctness and concurrency
   from scratch, re-run the full-pipeline benchmark, and only then
   decide whether to ship it.
+
+## GOD PROMPT "CKKS PHASE 20": CUDA-registered host memory PROTOTYPE built, correctness-verified (0 mismatches across 400+ checks), measured against the real encrypt/EvalMult pipeline — RETAINED AS AN OPT-IN EXPERIMENTAL FEATURE, NOT promoted to production
+
+Full detail: `research/TRANSFER_PROFILING.md`'s Phase 20 section and
+`EXPERIMENT_LEDGER.md` entry #53. Starting commit `8d6dbe4` (Phase 19
+end state), confirmed via `git log -1`/`git status`/`origin/main`
+before any change. The first phase in this investigation to move from
+diagnosis to a real implementation prototype.
+
+- **New ownership model, designed before implementation**:
+  `include/registered_host_buffer.h`'s `RegisteredHostBuffer` — a
+  move-only RAII class (following this codebase's own established
+  `include/ks_raii.h` pattern) with an explicit 4-state machine
+  (`Empty`/`Allocated`/`Registered`/`Failed`) owning a page-aligned
+  host allocation registered via `cudaHostRegister`. Two measured
+  facts shaped the design: (1) a direct probe found `cudaHostRegister`
+  is NOT gated by `RLIMIT_MEMLOCK` on this system (up to 500MB
+  succeeded with zero error, despite the 64MB limit) — any budget cap
+  this phase enforces is therefore self-imposed, not OS-enforced;
+  (2) an invalid `flags` value (not an oversized request) is the real,
+  safe, bounded way to induce a genuine `cudaHostRegister` failure on
+  this system for testing.
+- **Standalone lifecycle/concurrency audit**
+  (`tests/test_registered_host_buffer.cpp`, 10 scenarios): 0 check
+  failures on the normal build, covering successful lifecycle, 50
+  repeated alloc/free cycles, 200 reuse cycles, 2 REAL induced failures
+  (double-registration, invalid flags), pool destruction/eviction with
+  live buffers, 200 concurrent independent-buffer cycles across 8
+  threads, a REAL async-transfer-completion test (`release()`'s own
+  internal stream sync proven to actually wait, not assumed), and a
+  REAL induced async-failure cleanup test. **Genuinely new finding**:
+  under AddressSanitizer, `cudaHostRegister` reliably fails with
+  "out of memory" for every call on this system (an ASan-vs-CUDA-driver
+  memory-pressure incompatibility, not a code defect) — after fixing a
+  real test bug (assumed success, crashed on null `data()`), the ASan
+  build completed with ZERO crashes/leaks across all 27 induced
+  failures, validating the failure-handling paths specifically.
+- **Production-shaped prototype**
+  (`src/encrypt_host_shoup_pooled_barrett_batched_registered.cpp`):
+  mirrors Phase 15's pinned variant EXACTLY except the host staging
+  buffer's allocation mechanism. Registration happens ONCE per
+  `(n,sizeQ)` key (never per-call). A self-imposed, strict 16MiB
+  cumulative-bytes budget triggers a safe fallback to the unmodified
+  production pageable path if exceeded or if registration fails —
+  mirroring Phase 16's own prewarm-file fallback shape. Symmetric
+  `encrypt_prewarm_registered_buffer`/`encrypt_registered_buffer_is_
+  ready` API added alongside, sharing the same pool.
+- **Correctness**: bit-exact vs. `encrypt_host`, the Phase 15 batched,
+  AND Phase 15 pinned implementations, across every size/boundary/
+  repeat/interleave this project's established test pattern covers —
+  **0 mismatches**. Real encrypted pipeline (encode→encrypt→EvalMult→
+  decrypt→decode, via Phase 11's own harness extended with a NEW
+  `encryptVariant=5`): max abs error identical (`1.12912e-10`) across
+  production/pinned/registered — **[PASS]** for all three.
+- **Concurrency audit** (6 scenarios, 436 checks, **0 mismatches**):
+  the 4 scenarios already established for the pinned variant, PLUS
+  (5) explicit prewarm racing with real encryption at a fresh key
+  (correctness held regardless of which side won the race), and
+  (6) fallback-path correctness under GENUINE budget pressure — 16
+  distinct large keys (~27MiB, deliberately over the 16MiB budget):
+  12 registered, 4 fell back to pageable, 0 mismatches either way.
+- **Full lifecycle measurement** (`bench/bench_encrypt_registered_
+  lifecycle.cpp`, new): 5 distinct configurations (production, pinned,
+  registered-fresh-per-call, registered-pool-reused, registered-
+  prewarmed), first-use recorded separately from a randomized
+  fixed-seed interleaved steady-state round, every sample to CSV.
+  **D's (registered, pool-reused) cold-start (~9.0-9.4ms) is ~2.1-2.4x
+  CHEAPER than B's (pinned) cold-start (~18.9-21.6ms)** — directly
+  resolving the exact cold-start weakness that blocked the pinned
+  variant's own promotion in Phase 15/16. **D consistently beat A
+  (production) in steady-state across all 3 independent fresh-process
+  runs, by ~7-14%**, and was competitive with B (pinned). **Unresolved,
+  honestly flagged**: E (explicitly prewarmed) was consistently
+  slightly SLOWER than D (lazy) in every run — a genuine open question,
+  not investigated further this round.
+- **Nsight Systems confirmation** (in the REAL production-shaped code,
+  not just Phase 19's isolated diagnostic): `cudaHostRegister` averaged
+  1.07ms/call vs. `cudaHostAlloc`'s 5.13ms/call (~4.8x cheaper),
+  closely matching Phase 19's own isolated finding — the driver-call
+  reduction genuinely carries over into real use.
+- **CMake/CTest integration**: 3 new correctness/lifecycle tests via
+  `gpufhe_test` (CTest SHOULD run these); the new timing benchmark via
+  `gpufhe_benchmark` (never auto-run), per Phase 19's own established
+  distinction. A live `ctest -N` reconfigure was attempted but aborted
+  after Windows host free RAM dropped to ~1.2GB mid-attempt — this
+  phase's CMake correctness rests on direct inspection of the
+  (unmodified) macros Phase 19 already verified, not a live run.
+- **Decision: Category B — RETAIN AS AN OPT-IN EXPERIMENTAL FEATURE,
+  NOT promoted to production.** Correct, concurrency-safe, resolves
+  the exact cold-start weakness that blocked Phase 15/16's pinned
+  variant, and shows a real (if modest, ~7-14%) steady-state win — a
+  STRONGER case than the pinned variant ever achieved, but not yet
+  large enough, nor validated at the Rust/FFI layer, to justify
+  promotion this round. `encrypt_host_shoup_pooled_barrett_batched`
+  (production) and `_batched_pinned` (Phase 15, unshipped) remain
+  entirely unchanged; the new registered variant joins Phase 16's
+  prewarming API as a second opt-in experimental C++ feature, not
+  wired into the Rust API or FFI bridge this round.
+- **Regression**: full Rust suite re-confirmed unaffected: 4 passed +
+  38 passed, 0 failed, 1 ignored (pre-existing, unrelated), both debug
+  and release. `git status`/`git diff` confirmed changes limited to 2
+  new production/header files, 5 new test/bench files, 1 minimal
+  surgical extension to an existing bench file, `CMakeLists.txt`, and
+  documentation — no existing production file's content was modified.
+- **Next recommended experiment**: investigate the D-vs-E anomaly
+  directly; run 5+ independent fresh-process repetitions (matching
+  this project's own bar for its strongest claims) before trusting the
+  magnitude more firmly; if the win holds up, prototype wiring the
+  registered path through `cpp_bridge/encdec_bridge.cpp` and the Rust
+  FFI layer, with its own dedicated Rust-side tests, before any
+  production promotion decision.

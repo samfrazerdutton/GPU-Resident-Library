@@ -88,6 +88,16 @@ void encrypt_host_shoup_pooled_barrett_batched(std::vector<uint64_t>&, std::vect
 void encrypt_host_shoup_pooled_barrett_batched_pinned(std::vector<uint64_t>&, std::vector<uint64_t>&, const std::vector<int64_t>&,
                                                         const std::vector<uint64_t>&, const std::vector<uint64_t>&, uint32_t,
                                                         const std::vector<uint64_t>&, const std::vector<uint64_t>&, uint64_t, double, uint64_t);
+// GOD PROMPT "CKKS PHASE 20": encrypt_host_shoup_pooled_barrett_batched_registered
+// (src/encrypt_host_shoup_pooled_barrett_batched_registered.cpp) --
+// CUDA-REGISTERED (cudaHostRegister on pre-touched page-aligned memory,
+// NOT cudaMallocHost-pinned) host staging buffer, built on Phase 19's
+// decisive finding that registration is 1.5x-4x cheaper than
+// cudaMallocHost/cudaHostAlloc for the full allocation lifecycle.
+// encryptVariant 5 measures this real encrypted path end to end.
+void encrypt_host_shoup_pooled_barrett_batched_registered(std::vector<uint64_t>&, std::vector<uint64_t>&, const std::vector<int64_t>&,
+                                                             const std::vector<uint64_t>&, const std::vector<uint64_t>&, uint32_t,
+                                                             const std::vector<uint64_t>&, const std::vector<uint64_t>&, uint64_t, double, uint64_t);
 void decrypt_host(std::vector<int64_t>&, const std::vector<uint64_t>&, const std::vector<uint64_t>&,
                    const std::vector<uint64_t>&, uint32_t, const std::vector<uint64_t>&, const std::vector<uint64_t>&);
 }
@@ -285,7 +295,8 @@ static bool run_config(uint32_t n, uint32_t sizeQ, uint32_t sizeP, uint32_t numP
                           : encryptVariant == 1 ? "Shoup+pooled (Phase 13)"
                           : encryptVariant == 2 ? "Shoup+pooled+Barrett-embed (Phase 14)"
                           : encryptVariant == 3 ? "Shoup+pooled+Barrett+batched-pageable (Phase 15 Exp1, PRODUCTION)"
-                          : "Shoup+pooled+Barrett+batched-pinned (Phase 15 Exp2, measured, NOT promoted -- see research/TRANSFER_PROFILING.md)";
+                          : encryptVariant == 4 ? "Shoup+pooled+Barrett+batched-pinned (Phase 15 Exp2, measured, NOT promoted -- see research/TRANSFER_PROFILING.md)"
+                          : "Shoup+pooled+Barrett+batched-REGISTERED (Phase 20, cudaHostRegister prototype, see research/TRANSFER_PROFILING.md)";
     std::cout << "\n=== Configuration: n=" << n << " sizeQ=" << sizeQ
               << " sizeP=" << sizeP << " numPart=" << numPart
               << " encode/decode=" << (useFft ? "FFT (NEW, O(N log N))" : "parallel O(N^2) (OLD)")
@@ -416,7 +427,10 @@ static bool run_config(uint32_t n, uint32_t sizeQ, uint32_t sizeP, uint32_t numP
 
         std::vector<uint64_t> c0a, c1a, c0b, c1b;
         t0 = std::chrono::steady_clock::now();
-        if (encryptVariant == 4) {
+        if (encryptVariant == 5) {
+            gpufhe::encrypt_host_shoup_pooled_barrett_batched_registered(c0a, c1a, ma, fx.pubKeyA, fx.pubKeyB, n, fx.modQ, fx.rootQ, 1, 3.19, 9001);
+            gpufhe::encrypt_host_shoup_pooled_barrett_batched_registered(c0b, c1b, mb, fx.pubKeyA, fx.pubKeyB, n, fx.modQ, fx.rootQ, 1, 3.19, 9002);
+        } else if (encryptVariant == 4) {
             gpufhe::encrypt_host_shoup_pooled_barrett_batched_pinned(c0a, c1a, ma, fx.pubKeyA, fx.pubKeyB, n, fx.modQ, fx.rootQ, 1, 3.19, 9001);
             gpufhe::encrypt_host_shoup_pooled_barrett_batched_pinned(c0b, c1b, mb, fx.pubKeyA, fx.pubKeyB, n, fx.modQ, fx.rootQ, 1, 3.19, 9002);
         } else if (encryptVariant == 3) {
@@ -552,16 +566,18 @@ int main(int argc, char** argv) {
         int encryptVariant = argc > 8 ? std::atoi(argv[8]) : 3; // default: NEW (production) path -- see run_config's own comment: variant 4 (pinned) was measured and NOT promoted to production, see research/TRANSFER_PROFILING.md
         allPass = run_config(n, sizeQ, sizeP, numPart, reps, trials, useFft, encryptVariant);
     } else {
-        // Full sweep, all five encrypt variants per n, for a direct
-        // old-vs-Phase13-vs-Phase14-vs-Phase15(Exp1)-vs-Phase15(Exp2)
-        // full-pipeline comparison (GOD PROMPT "CKKS PHASE 12" for
-        // encode/decode, "CKKS PHASE 13"/"14"/"15" for encrypt).
+        // Full sweep, all six encrypt variants per n, for a direct
+        // old-vs-Phase13-vs-Phase14-vs-Phase15(Exp1)-vs-Phase15(Exp2)-
+        // vs-Phase20 full-pipeline comparison (GOD PROMPT "CKKS PHASE
+        // 12" for encode/decode, "CKKS PHASE 13"/"14"/"15"/"20" for
+        // encrypt).
         for (uint32_t n : {1024u, 2048u, 4096u, 8192u}) {
             if (!run_config(n, 8, 2, 4, reps, trials, /*useFft=*/true, /*encryptVariant=*/0)) allPass = false;
             if (!run_config(n, 8, 2, 4, reps, trials, /*useFft=*/true, /*encryptVariant=*/1)) allPass = false;
             if (!run_config(n, 8, 2, 4, reps, trials, /*useFft=*/true, /*encryptVariant=*/2)) allPass = false;
             if (!run_config(n, 8, 2, 4, reps, trials, /*useFft=*/true, /*encryptVariant=*/3)) allPass = false;
             if (!run_config(n, 8, 2, 4, reps, trials, /*useFft=*/true, /*encryptVariant=*/4)) allPass = false;
+            if (!run_config(n, 8, 2, 4, reps, trials, /*useFft=*/true, /*encryptVariant=*/5)) allPass = false;
         }
     }
     if (!allPass) { std::cerr << "\n[OVERALL FAIL] at least one configuration's correctness check failed\n"; return 1; }
