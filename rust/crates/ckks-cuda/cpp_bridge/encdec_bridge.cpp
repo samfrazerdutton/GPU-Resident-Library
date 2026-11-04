@@ -20,8 +20,22 @@
 #include <vector>
 
 namespace gpufhe {
-void encode_host(std::vector<int64_t>&, const std::vector<std::complex<double>>&, uint32_t, double);
-void decode_host(std::vector<std::complex<double>>&, const std::vector<int64_t>&, uint32_t, double);
+// GOD PROMPT "CKKS PHASE 12": encode_host/decode_host (src/encode.cpp,
+// Phase 11's std::thread-parallelized O(N^2)) remain fully present and
+// tested, as the reference/fallback the governing directive requires --
+// NOT called from here anymore. This bridge (the actual production call
+// site every Rust caller goes through via codec::encode_real/
+// codec::decode) now calls encode_host_fft/decode_host_fft (src/
+// encode_fft.cpp, the new O(N log N) FFT-based implementation),
+// verified bit-close (see research/FFT_ENCODING_DERIVATION.md and
+// tests/test_encode_fft_matches_reference.cpp) against encode_host/
+// decode_host across every supported dimension and a battery of
+// adversarial inputs, and measured 31-61x (encode) / 40-81x (decode)
+// faster, before this swap was made. encode_host/decode_host are still
+// reachable directly by any test or future caller that explicitly wants
+// the old path.
+void encode_host_fft(std::vector<int64_t>&, const std::vector<std::complex<double>>&, uint32_t, double);
+void decode_host_fft(std::vector<std::complex<double>>&, const std::vector<int64_t>&, uint32_t, double);
 void encrypt_host(std::vector<uint64_t>&, std::vector<uint64_t>&, const std::vector<int64_t>&,
                    const std::vector<uint64_t>&, const std::vector<uint64_t>&, uint32_t,
                    const std::vector<uint64_t>&, const std::vector<uint64_t>&, uint64_t, double, uint64_t);
@@ -40,7 +54,7 @@ void gpufhe_encode(const double* z_re, const double* z_im, uint32_t num_slots,
     std::vector<std::complex<double>> z(n / 2, {0.0, 0.0});
     for (uint32_t k = 0; k < num_slots && k < n / 2; ++k) z[k] = {z_re[k], z_im[k]};
     std::vector<int64_t> m;
-    gpufhe::encode_host(m, z, n, delta);
+    gpufhe::encode_host_fft(m, z, n, delta);
     std::memcpy(m_out, m.data(), (size_t)n * 8);
 }
 
@@ -50,7 +64,7 @@ void gpufhe_decode(const int64_t* m, uint32_t n, double delta, double* z_re_out,
 {
     std::vector<int64_t> mv(m, m + n);
     std::vector<std::complex<double>> z;
-    gpufhe::decode_host(z, mv, n, delta);
+    gpufhe::decode_host_fft(z, mv, n, delta);
     for (size_t k = 0; k < z.size(); ++k) { z_re_out[k] = z[k].real(); z_im_out[k] = z[k].imag(); }
 }
 

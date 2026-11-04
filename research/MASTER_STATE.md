@@ -1730,3 +1730,99 @@ the clear next experiment (an O(n log n) FFT-based encode/decode).
   attempted (host free memory 1.15GB, under the 6GB gate) — every claim
   verified via direct `nvcc`/`g++` compilation, each confirmed freshly
   built.
+
+## GOD PROMPT "CKKS PHASE 12": the O(n log n) FFT-based encode/decode flagged at the end of Phase 11 is derived, independently verified three ways, and now the real production path — 31-87x standalone speedup, 2.2-4.2x additional full-pipeline speedup, zero correctness regression
+
+Full detail: `research/FFT_ENCODING_DERIVATION.md` (the dedicated
+derivation/verification document this phase's directive required) and
+`EXPERIMENT_LEDGER.md` entry #45. Starting commit `a561991` (Phase 11
+end state), confirmed via `git log -1` before any change.
+
+- **Derivation (Section 2 of the directive) done on paper first, then
+  independently checked against numpy — not assumed correct and
+  written straight into C++.** `src/encode.cpp`'s own existing
+  `encode_host`/`decode_host` formula (unchanged, re-derivation target
+  only) reduces to: decode = one bin of a size-`M=2N` forward DFT of
+  the zero-padded coefficient array (`m(ζ^{-t})` for `ζ=e^{iπ/N}`,
+  gathered at `t=(M-r_k)%M`); encode = scatter `z_k`/`conj(z_k)` at
+  `(M-r_k)%M`/`r_k`, take the UNNORMALIZED inverse DFT, scale by
+  `Delta/N` (**not** `2*Delta/N` — the scatter of conjugate pairs
+  already doubles the raw sum; this factor-of-2 subtlety was caught by
+  the numpy prototype on its first run, before any C++ existed, and is
+  the one real mistake this derivation made and fixed in time**).
+  Full mathematical mapping (slot count/conjugate symmetry, the
+  `r_k=5^k mod 2N` generator-group structure, FFT sign convention,
+  every scaling/permutation/conjugation step) recorded in
+  `FFT_ENCODING_DERIVATION.md` §1-§3.
+- **Standalone experiment (Section 3)**: new, separate file
+  `src/encode_fft.cpp` — a standard cached-twiddle iterative radix-2
+  Cooley-Tukey FFT plus the `r_k`/`gidx_k` gather/scatter derived
+  above. `src/encode.cpp` was NOT touched and remains the reference/
+  fallback, exactly as the directive requires.
+- **Numerical correctness (Section 4)**: `tests/
+  test_encode_fft_matches_reference.cpp` compares the new FFT against
+  the UNTOUCHED O(n²) implementation (a genuinely independent oracle —
+  different algorithm, not a different thread count) across n in
+  {16,256,1024,2048,4096,8192} and 9 input categories including
+  deliberately adversarial (alternating ±1, 1000x magnitude-spread)
+  cases. Decode matches to ~1e-22..1e-26 absolute error everywhere.
+  Encode's larger-looking discrepancies (up to 80 units at n=16) were
+  investigated, not dismissed: independently computed via `mpmath` at
+  60-digit precision, which proved the TRUE pre-rounding value is
+  exactly/near zero for the near-cancellation cases and ~5e15 for the
+  magnitude-spread case — both implementations are correct to many
+  more significant figures than CKKS itself ever uses. A principled
+  (not loosened) tolerance, `(N+1000)*DBL_EPSILON*Delta` (combining an
+  N-term accumulation bound with the 1000x magnitude-spread
+  conditioning bound this test's own worst case exercises), passes
+  every case — this is ~1e-10 RELATIVE to Delta, far below the
+  project's own 1e-6 real-round-trip tolerance.
+- **Real cryptographic correctness (Section 5)**: `cpp_bridge/
+  encdec_bridge.cpp`'s `gpufhe_encode`/`gpufhe_decode` — the actual
+  production call site every Rust caller (`codec::encode_real`/
+  `codec::decode`) reaches — now call `encode_host_fft`/
+  `decode_host_fft`; `encode_host`/`decode_host` remain fully present
+  and directly callable as reference/fallback. Full Rust suite after
+  the swap: **38 passed, 0 failed, 1 ignored**, identical in
+  `--release` and debug — zero regression, including every
+  `real_encrypted_evalmult_*` test. Decoded error magnitude essentially
+  unchanged (`2.60e-11` after vs. `2.59e-11` before).
+- **Benchmarks (Section 6), interleaved A/B, old implementation kept
+  runnable throughout**: standalone (`bench/
+  bench_encode_fft_vs_parallel.cpp`, no GPU/encryption, 15 trials/N) —
+  encode 31.4x(n=2048)-61.2x(n=8192), decode 29.6x(n=2048)-81.2x
+  (n=8192); n=1024: encode 42.1x, decode 53.0x; n=4096: encode 43.2x,
+  decode 54.3x. Full real-encrypted pipeline (`bench/
+  bench_evalmult_e2e_breakdown.cpp`, extended this round with a
+  `useFft` A/B flag) — total latency 2.19x(n=1024)-4.15x(n=8192) faster
+  on top of Phase 11's already-applied optimizations. **Cumulative
+  speedup since the pre-Phase-11 original baseline: 21.5x at n=8192**
+  (522890us -> 24335us).
+- **Implementation choice (Section 7)**: deliberately the SIMPLEST
+  correct construction — zero-pad to `M=2N`, one standard FFT,
+  gather/scatter half — accepting a ~2x constant-factor overhead vs. a
+  tighter N-point negacyclic-twisted FFT in exchange for needing no
+  mathematical object beyond a textbook DFT and the SAME `r_k` array
+  the existing code already computes. The O(n log n) vs. O(n²) win
+  dominates this constant factor at every n tested (31-87x, far more
+  than a 2x loss could ever cost). Deliberately NOT thread-parallelized
+  (a single FFT is an inherently sequential dependent-stage pipeline;
+  marginal gain not worth the complexity when already 31-61x faster
+  than the parallelized O(n²) baseline) — no interaction with Phase
+  11's `std::thread` pool in the untouched `src/encode.cpp`.
+- `CMakeLists.txt` gained `src/encode_fft.cpp` in the main library's
+  source list, `test_encode_fft_matches_reference`, and
+  `bench_encode_fft_vs_parallel`. `rust/crates/ckks-cuda/build.rs`
+  gained compilation of `src/encode_fft.cpp`. Full CMake rebuild NOT
+  attempted this round either (host free memory still well under the
+  6GB gate) — every claim verified via direct `nvcc`/`g++` compilation
+  to standalone binaries, each confirmed freshly built, plus the full
+  `cargo test` suite (which DOES build and link everything through
+  `build.rs`).
+- **Post-Phase-12 bottleneck, n=8192**: `encrypt_host` (17.0ms) is now
+  the single largest contributor to the real round trip, followed by
+  GPU keyswitch (2.0ms) and rescale (1.9ms). Encode (1.16ms) and decode
+  (0.29ms) are no longer meaningful contributors — the clear next
+  highest-value experiment is profiling `encrypt_host`'s own internal
+  cost breakdown (NTT vs. embedding/combine loops), not another pass
+  over encode/decode.

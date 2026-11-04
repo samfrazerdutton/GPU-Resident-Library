@@ -3,14 +3,16 @@
 ## Current commit
 
 Check `git log -3` on resume. As of this writing, HEAD is a new commit
-on top of entry #43's commit `653cf6c` (the GOD PROMPT "CKKS PHASE 11"
-round: the first real-world per-stage performance baseline for
-encode->encrypt->EvalMult->decrypt->decode, plus two verified, kept
-optimizations -- parallelized encode/decode and batched encrypt_host
-NTTs -- giving a 2.6x-5.3x total pipeline speedup with zero
-correctness regression. See `EXPERIMENT_LEDGER.md` entry #44 for full
-detail). Confirm push status -- push again if `git status` shows ahead
-of origin.
+on top of entry #44's commit `a561991` (the GOD PROMPT "CKKS PHASE 12"
+round: `encode_host`/`decode_host`'s O(n^2) canonical-embedding
+transform replaced, on the production path only, with a verified
+O(n log n) FFT-based implementation -- 31-87x standalone speedup,
+2.2-4.2x additional full real-encrypted-pipeline speedup on top of
+Phase 11's own gains, zero correctness regression. The old O(n^2)
+implementation remains fully present, tested, and reachable as
+reference/fallback. See `EXPERIMENT_LEDGER.md` entry #45 and
+`research/FFT_ENCODING_DERIVATION.md` for full detail). Confirm push
+status -- push again if `git status` shows ahead of origin.
 
 **Reminder, confirmed the hard way in an earlier round**: this machine
 has (at least) two SEPARATE git clones of this GitHub repo -- the WSL
@@ -21,69 +23,53 @@ an entirely unrelated commit history (raw CUDA-kernel-optimization
 work) and untracked, stale copies of `rust/`/`research/` -- never run
 `git status`/`log`/commit decisions against it for this work.
 
-## READ THIS FIRST if resuming into performance work: host-side encode/encrypt/decode dominate, NOT the GPU kernels -- the clear next experiment is an O(n log n) FFT-based encode/decode
+## READ THIS FIRST if resuming into performance work: encode/decode are no longer the bottleneck -- `encrypt_host` is now the dominant host-side cost, and the GPU chain is still only ~1% of latency
 
-**Phase 11's core finding**: for a real encode->encrypt->EvalMult->
-decrypt->decode round trip at n=8192, the ENTIRE GPU-resident
-tensor+keyswitch+combine+rescale chain is only ~1% of total latency.
-The dominant cost is three pure-host (or host-orchestrated) stages:
-`encode_host`/`decode_host` (O(n^2) naive canonical-embedding DFT) and
-`encrypt_host` (originally 4*sizeQ unbatched per-tower NTT round
-trips). Two fixes were made this round, BOTH kept, BOTH bit-exact
-verified against independent oracles, BOTH measured via interleaved
-A/B:
-1. `src/encode.cpp`: `encode_host`/`decode_host` parallelized via
-   `std::thread` across the O(n^2) outer loop (each output element is
-   an independent read-only reduction -- zero change to the
-   arithmetic, bit-identical results guaranteed and confirmed).
-   ~5.7-6.8x speedup on encode/decode specifically.
-2. `src/encdec.cpp`: `encrypt_host` batched (one upload + one
-   `LaunchNTT_CT_Batched` call + one download per buffer, across all
-   `sizeQ` towers, with root tables cached by `(n,q)` -- the SAME
-   pattern `src/evalkeygen.cpp` already uses successfully) instead of
-   32 separate per-tower-per-buffer GPU round trips at `sizeQ=8`.
-   ~2.2-2.8x speedup on encrypt specifically.
+**Phase 12's core result**: the O(n log n) FFT-based `encode_host_fft`/
+`decode_host_fft` (`src/encode_fft.cpp`, derived and independently
+verified in `research/FFT_ENCODING_DERIVATION.md`) is now the actual
+production path (`cpp_bridge/encdec_bridge.cpp`'s `gpufhe_encode`/
+`gpufhe_decode` call it) -- Phase 11's own "clear next experiment" is
+DONE. The old `encode_host`/`decode_host` (`src/encode.cpp`, Phase
+11's parallelized O(n^2)) are UNCHANGED and remain fully present,
+tested, and directly callable as reference/fallback. Standalone
+speedup over the old implementation: encode 31.4x(n=2048)-61.2x
+(n=8192), decode 29.6x(n=2048)-81.2x(n=8192). Full real-encrypted-
+pipeline speedup on top of Phase 11's own gains: 2.19x(n=1024)-4.15x
+(n=8192). **Cumulative speedup since the pre-Phase-11 original
+baseline: 21.5x at n=8192** (522890us -> 24335us). Full Rust suite
+unaffected: 38 passed, 0 failed, 1 ignored; real-round-trip decoded
+error magnitude essentially unchanged (`2.60e-11` vs. `2.59e-11`
+pre-swap).
 
-**Combined result**: total end-to-end latency dropped from
-30.5/48/154.7/522.9ms to 11.8/16.6/38.2/98.9ms at
-n=1024/2048/4096/8192 respectively (2.6x/2.9x/4.1x/5.3x -- the speedup
-GROWS with n). Every real encrypted round trip still passes, with the
-SAME error magnitude as before the optimization at every n (bit-exact
-identical cryptographic output, not merely "close"). Full Rust suite
-unaffected: 38 passed, 0 failed, 1 ignored.
-
-**POST-optimization ranked bottleneck, n=8192** (the next thing to fix
-if performance work continues): Encode 53.0ms (54%); Decode 23.2ms
-(23%); Encrypt 17.4ms (18%); Relin/keyswitch (GPU) 1.96ms (2%); Rescale
-(GPU) 1.63ms (1.6%); Decrypt 0.54ms; Tensor+Combine (GPU) ~0.07ms.
-Host-side encode+decode+encrypt STILL account for ~95% of total
-latency -- the GPU kernels are not, and were never, the bottleneck at
-any tested n.
+**POST-Phase-12 ranked bottleneck, n=8192** (the next thing to fix if
+performance work continues): `encrypt_host` 17.0ms is now the single
+largest contributor, followed by GPU keyswitch 2.0ms and GPU rescale
+1.9ms. Encode (1.16ms) and decode (0.29ms) are no longer meaningful
+contributors -- they dropped out of the critical path entirely. The
+GPU-resident tensor+keyswitch+combine+rescale chain is still only
+~1% of total latency, same conclusion as Phase 11, just a smaller
+absolute number now.
 
 **The clear next highest-value experiment, NOT attempted this round**:
-replace `encode_host`/`decode_host`'s O(n^2) algorithm with a true
-O(n log n) FFT-based canonical embedding (the standard technique used
-by OpenFHE/SEAL/HElib) -- this would address the now-dominant ~77% of
-remaining latency, far more than parallelizing the O(n^2) loop already
-did. NOT pursued this round because it requires correctly re-deriving
-the existing `r_k=5^k mod 2N` permuted-slot-ordering convention against
-a standard radix-2 FFT -- meaningfully higher correctness risk than
-either of this round's two kept optimizations, and the governing
-directive's own experiment discipline ("do not change several
-independent components... unless the combined effect is the explicit
-subject") argues for tackling it as its own dedicated, carefully-tested
-round rather than folding it into this one. A secondary, lower-value
-candidate also NOT pursued: a persistent (reused-across-calls) thread
-pool for encode/decode to avoid per-call `pthread_create`/`join`
-overhead (estimated ~1-3% of encode's own cost -- not worth the added
-lifecycle complexity given the ALREADY-achieved 6x win from the simple
-per-call thread-spawn approach).
+profile `encrypt_host`'s own internal cost breakdown (its NTT calls vs.
+its embedding/combine loops) to find what WITHIN encrypt is actually
+expensive, now that it is the dominant single stage. A secondary,
+lower-value candidate also NOT pursued: tightening the FFT's own
+constant factor by replacing the current "zero-pad to 2N, gather/
+scatter half" construction (deliberately the simplest correct approach,
+per this phase's directive) with a true N-point negacyclic-twisted FFT
+-- would only shave encode/decode's own ~1.45ms total, which is already
+far from the bottleneck; not worth the added derivation/correctness
+risk unless a future round specifically needs that last constant
+factor.
 
-**Do not re-measure the OLD (sequential/unbatched) baseline numbers as
-if they still apply** -- `bench/bench_evalmult_e2e_breakdown.cpp` is
-the current, correct per-stage benchmark; re-run it fresh rather than
-citing this entry's own baseline table, which predates both
-optimizations.
+**Do not re-measure the Phase-11-era baseline numbers (53.0/23.2/17.4ms
+for encode/decode/encrypt at n=8192) as if they still apply** --
+`bench/bench_evalmult_e2e_breakdown.cpp` (now extended with a `useFft`
+A/B flag; default sweep mode runs both old and new per n) is the
+current, correct per-stage benchmark; re-run it fresh rather than
+citing either this entry's or entry #44's own tables.
 
 ## Phase 10 recap (for key-switch/EvalMult correctness context, superseded as the primary focus by Phase 11's performance work above): the real encrypted EvalMult AND key-switch round trips both PASS. Invalid configurations are REJECTED at construction time, not just avoided by convention.
 

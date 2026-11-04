@@ -43,6 +43,7 @@ add_library(gpufhe STATIC
   src/evalkeygen.cpp
   src/encdec.cpp
   src/encode.cpp
+  src/encode_fft.cpp
   src/rotate.cpp
   src/ptops.cpp
   src/params.cpp
@@ -127,6 +128,12 @@ gpufhe_test(test_ks_params_validate tests/test_ks_params_validate.cpp)
 # research/EXPERIMENT_LEDGER.md entry #44.
 gpufhe_test(test_encode_decode_parallel_matches_sequential tests/test_encode_decode_parallel_matches_sequential.cpp)
 gpufhe_test(test_encrypt_host_fast_matches_sequential tests/test_encrypt_host_fast_matches_sequential.cpp)
+# GOD PROMPT "CKKS PHASE 12": correctness test for the new O(N log N)
+# FFT-based encode_host_fft/decode_host_fft (src/encode_fft.cpp) against
+# the EXISTING, untouched, algorithmically DIFFERENT O(N^2) encode_host/
+# decode_host -- see research/FFT_ENCODING_DERIVATION.md and research/
+# EXPERIMENT_LEDGER.md entry #45.
+gpufhe_test(test_encode_fft_matches_reference tests/test_encode_fft_matches_reference.cpp)
 gpufhe_test(test_keygen tests/test_keygen.cpp)
 gpufhe_test(test_evalkeygen tests/test_evalkeygen.cpp)
 # GOD PROMPT "CKKS PHASE 8": fully native (OpenFHE-free) isolation of
@@ -282,6 +289,10 @@ gpufhe_test(bench_evalmult_cpp_vs_rust bench/bench_evalmult_cpp_vs_rust.cpp)
 # encrypted round trip) before any timing is trusted. See research/
 # EXPERIMENT_LEDGER.md entry #44.
 gpufhe_test(bench_evalmult_e2e_breakdown bench/bench_evalmult_e2e_breakdown.cpp)
+# GOD PROMPT "CKKS PHASE 12": standalone (no GPU, no encryption) A/B
+# benchmark isolating exactly the OLD (parallel O(N^2)) vs NEW (FFT,
+# O(N log N)) encode_host/decode_host algorithmic change.
+gpufhe_test(bench_encode_fft_vs_parallel bench/bench_encode_fft_vs_parallel.cpp)
 gpufhe_test(test_mult_barrett tests/test_mult_barrett.cpp)
 # Directive "VERIFY OOM DIAGNOSIS AND REMOVE THE LARGE-N DIAGONAL
 # BOTTLENECK", Priority 3: proves an O(S*2^RST) analytic replacement for

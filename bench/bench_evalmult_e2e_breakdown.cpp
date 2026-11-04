@@ -38,6 +38,13 @@ void native_rescale_consts(std::vector<uint64_t>&, std::vector<uint64_t>&,
                             const std::vector<uint64_t>&, uint32_t);
 void encode_host(std::vector<int64_t>&, const std::vector<std::complex<double>>&, uint32_t, double);
 void decode_host(std::vector<std::complex<double>>&, const std::vector<int64_t>&, uint32_t, double);
+// GOD PROMPT "CKKS PHASE 12": the new O(N log N) FFT-based encode/decode
+// (src/encode_fft.cpp) -- now the actual production path (cpp_bridge/
+// encdec_bridge.cpp calls these, not encode_host/decode_host above).
+// This benchmark can measure EITHER path (see run_config's useFft
+// parameter) for a direct old-vs-new full-pipeline comparison.
+void encode_host_fft(std::vector<int64_t>&, const std::vector<std::complex<double>>&, uint32_t, double);
+void decode_host_fft(std::vector<std::complex<double>>&, const std::vector<int64_t>&, uint32_t, double);
 void encrypt_host(std::vector<uint64_t>&, std::vector<uint64_t>&, const std::vector<int64_t>&,
                    const std::vector<uint64_t>&, const std::vector<uint64_t>&, uint32_t,
                    const std::vector<uint64_t>&, const std::vector<uint64_t>&, uint64_t, double, uint64_t);
@@ -229,10 +236,11 @@ struct EvalMultFixtureCpp {
 // this so a correctness regression actually fails the exit code, not
 // just prints a warning that a CI/ctest run would silently ignore.
 static bool run_config(uint32_t n, uint32_t sizeQ, uint32_t sizeP, uint32_t numPart,
-                        size_t reps, size_t trials)
+                        size_t reps, size_t trials, bool useFft)
 {
     std::cout << "\n=== Configuration: n=" << n << " sizeQ=" << sizeQ
-              << " sizeP=" << sizeP << " numPart=" << numPart << " ===\n";
+              << " sizeP=" << sizeP << " numPart=" << numPart
+              << " encode/decode=" << (useFft ? "FFT (NEW, O(N log N))" : "parallel O(N^2) (OLD)") << " ===\n";
 
     // --- Mandatory validation BEFORE building anything. Never bypassed. ---
     std::vector<uint64_t> mod, modP;
@@ -347,8 +355,13 @@ static bool run_config(uint32_t n, uint32_t sizeQ, uint32_t sizeP, uint32_t numP
 
         std::vector<int64_t> ma, mb;
         auto t0 = std::chrono::steady_clock::now();
-        gpufhe::encode_host(ma, za, n, delta);
-        gpufhe::encode_host(mb, zb, n, delta);
+        if (useFft) {
+            gpufhe::encode_host_fft(ma, za, n, delta);
+            gpufhe::encode_host_fft(mb, zb, n, delta);
+        } else {
+            gpufhe::encode_host(ma, za, n, delta);
+            gpufhe::encode_host(mb, zb, n, delta);
+        }
         auto t1 = std::chrono::steady_clock::now();
         double encode_us = std::chrono::duration<double, std::micro>(t1 - t0).count();
 
@@ -376,7 +389,8 @@ static bool run_config(uint32_t n, uint32_t sizeQ, uint32_t sizeP, uint32_t numP
         double delta_post = delta * delta / (double)fx.modQ[sizeQ - 1];
         std::vector<std::complex<double>> zdec;
         t0 = std::chrono::steady_clock::now();
-        gpufhe::decode_host(zdec, mdec, n, delta_post);
+        if (useFft) gpufhe::decode_host_fft(zdec, mdec, n, delta_post);
+        else gpufhe::decode_host(zdec, mdec, n, delta_post);
         t1 = std::chrono::steady_clock::now();
         double decode_us = std::chrono::duration<double, std::micro>(t1 - t0).count();
 
@@ -471,10 +485,14 @@ int main(int argc, char** argv) {
         uint32_t sizeQ = argc > 4 ? (uint32_t)std::atoi(argv[4]) : 8;
         uint32_t sizeP = argc > 5 ? (uint32_t)std::atoi(argv[5]) : 2;
         uint32_t numPart = argc > 6 ? (uint32_t)std::atoi(argv[6]) : 4;
-        allPass = run_config(n, sizeQ, sizeP, numPart, reps, trials);
+        bool useFft = argc > 7 ? (std::atoi(argv[7]) != 0) : true; // default: NEW (production) path
+        allPass = run_config(n, sizeQ, sizeP, numPart, reps, trials, useFft);
     } else {
+        // Full sweep, BOTH paths per n, for a direct old-vs-new
+        // full-pipeline comparison (GOD PROMPT "CKKS PHASE 12").
         for (uint32_t n : {1024u, 2048u, 4096u, 8192u}) {
-            if (!run_config(n, 8, 2, 4, reps, trials)) allPass = false;
+            if (!run_config(n, 8, 2, 4, reps, trials, /*useFft=*/false)) allPass = false;
+            if (!run_config(n, 8, 2, 4, reps, trials, /*useFft=*/true)) allPass = false;
         }
     }
     if (!allPass) { std::cerr << "\n[OVERALL FAIL] at least one configuration's correctness check failed\n"; return 1; }

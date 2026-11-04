@@ -154,6 +154,13 @@ fn main() {
     // Both confirmed pure-host, no device state retained across calls.
     objs.push(compile_cpp(&root.join("src/encode.cpp"), &out_dir, &include_dir, &cuda_include));
     objs.push(compile_cpp(&root.join("src/encdec.cpp"), &out_dir, &include_dir, &cuda_include));
+    // GOD PROMPT "CKKS PHASE 12": the new O(N log N) FFT-based encode/
+    // decode (encode_host_fft/decode_host_fft), now the actual
+    // production path (cpp_bridge/encdec_bridge.cpp's gpufhe_encode/
+    // gpufhe_decode call these, not encode_host/decode_host above,
+    // which remain as the tested reference/fallback). See research/
+    // FFT_ENCODING_DERIVATION.md.
+    objs.push(compile_cpp(&root.join("src/encode_fft.cpp"), &out_dir, &include_dir, &cuda_include));
     objs.push(compile_cpp(
         &manifest_dir.join("cpp_bridge/native_root_bridge.cpp"),
         &out_dir, &include_dir, &cuda_include,
