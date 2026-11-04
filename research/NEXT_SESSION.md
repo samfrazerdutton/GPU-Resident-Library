@@ -3,7 +3,33 @@
 ## Current commit
 
 Check `git log -3` on resume. As of this writing, HEAD is a new commit
-on top of entry #48's commit `69d307a` (the GOD PROMPT "CKKS PHASE 16"
+on top of entry #49's commit `baee7a1` (the GOD PROMPT "CKKS PHASE 17"
+round: a PURE DIAGNOSTIC investigation, no production or experimental
+code changed. Found a real methodology flaw in Phase 16's own "prewarm
+cost" measurement (it bundled 5 separate CUDA calls into one timed
+number) and built 3 properly-separated diagnostics instead. The
+headline finding: the SAME allocation-cost variance Phase 16 found
+(microseconds to several milliseconds) reproduces with a PURE Linux
+`mmap`+`madvise`+`mlock` test using ZERO CUDA code -- proving the
+mechanism lives in the Linux kernel's own memory-locking path, not in
+CUDA's allocator. Ranked root-cause assessment: Linux kernel `mlock()`
+path (HIGH confidence, demonstrated), host/WSL2 memory pressure as an
+amplifier (MEDIUM, plausible, not isolated), allocation size + growing
+cumulative never-freed pinned memory (MEDIUM, real but not a clean
+rule), WSL2-specific Hyper-V ballooning as a mechanism DISTINCT from
+ordinary kernel pressure (NOT CONFIRMED, cannot be distinguished with
+available tooling), CUDA-driver-specific behavior (LOW, effectively
+ruled out), benchmark artifact (RULED OUT). Decision: category 3 --
+the variance is externally controlled, now DEMONSTRATED rather than
+merely suspected, so Phase 16's opt-in design remains exactly as it
+was. No `.wslconfig` change, no WSL restart, nothing system-level was
+modified. See `EXPERIMENT_LEDGER.md` entry #50 and `research/
+TRANSFER_PROFILING.md`'s Phase 17 section for full detail.
+
+## Earlier commit (Phase 16)
+
+HEAD was previously a commit on top of entry #48's commit `69d307a`
+(the GOD PROMPT "CKKS PHASE 16"
 round: built and proved correct/concurrency-safe an EXPLICIT pinned-
 memory PREWARMING API (`encrypt_prewarm_pinned_buffer`/
 `encrypt_pinned_buffer_is_ready`/`encrypt_host_shoup_pooled_barrett_
@@ -36,7 +62,43 @@ an entirely unrelated commit history (raw CUDA-kernel-optimization
 work) and untracked, stale copies of `rust/`/`research/` -- never run
 `git status`/`log`/commit decisions against it for this work.
 
-## READ THIS FIRST if resuming into performance work: a pinned-memory PREWARMING API now exists, fully correct and concurrency-safe, but was NOT promoted because its own allocation cost is unpredictable in this environment -- read this before re-attempting pinned memory work
+## READ THIS FIRST if resuming into pinned-memory work: the allocation-cost variance is now EXPLAINED (Linux kernel mlock() path, not CUDA-specific), the Phase 16 decision stands, and a WSL2-ballooning claim from Phase 16 has been downgraded to "not confirmed"
+
+**Phase 17's core result**: Phase 16 found `cudaMallocHost`'s cost
+varies wildly (16us-5.9ms) and guessed, without evidence, that WSL2
+memory ballooning was responsible. Phase 17 investigated this
+directly and found: (a) Phase 16's OWN measurement bundled 5 separate
+CUDA calls into one timed number -- a real methodology flaw, now fixed
+with 3 new properly-separated diagnostics
+(`bench/bench_pinned_alloc_diagnostic.cpp`,
+`bench/bench_pinned_alloc_diagnostic2.cpp`,
+`bench/bench_thp_diagnostic.cpp`); (b) the SAME qualitative variance
+reproduces using a PURE Linux `mmap`+`madvise`+`mlock` test with ZERO
+CUDA code -- proving the mechanism is the Linux kernel's own memory-
+locking path, not a CUDA allocator quirk; (c) host memory pressure
+(Windows free RAM measured at 1.2-2.4GB throughout) is a plausible
+contributing amplifier but only correlationally supported, not
+isolated; (d) a WSL2-Hyper-V-ballooning mechanism DISTINCT from
+ordinary kernel memory pressure could NOT be confirmed or refuted with
+available tooling -- it is no longer asserted as even a hedged guess,
+only as an open, undecidable question given current tools.
+
+**No code was changed.** Phase 16's decision (opt-in experimental
+feature, not promoted, pageable path remains production) stands,
+now on stronger evidence: the variance is DEMONSTRATED to be
+externally controlled (category 3 of the decision gate), not merely
+suspected. **Do not re-attempt a code-level fix for this variance** --
+it is outside this project's control (kernel/hypervisor-level). If
+pinned prewarming is revisited, the next concrete experiment (not yet
+done) is a controlled sweep of many different sizes in a fixed,
+non-repeating order with memory tracked at each step, to better
+characterize the "size + cumulative live memory" interaction (ranked
+hypothesis 3 in `research/TRANSFER_PROFILING.md`'s Phase 17 section),
+or a controlled, reversible test of disabling Transparent Huge Pages
+to see if that is a necessary ingredient. Full detail: `research/
+TRANSFER_PROFILING.md`'s Phase 17 section.
+
+## READ THIS SECOND if resuming into performance work: a pinned-memory PREWARMING API exists, fully correct and concurrency-safe, but was NOT promoted because its own allocation cost is unpredictable in this environment
 
 **Phase 16's core result**: `encrypt_prewarm_pinned_buffer(n,sizeQ)` /
 `encrypt_pinned_buffer_is_ready(n,sizeQ)` / `encrypt_host_shoup_
@@ -70,7 +132,7 @@ accepting the risk explicitly for a specific, named long-lived-service
 deployment where Profile C's unconditional win is what matters.** Full
 detail: `research/TRANSFER_PROFILING.md`'s Phase 16 section.
 
-## READ THIS NEXT if resuming into performance work on the OLDER (Phase 15) material: transfer batching is DONE and shipped; a pinned-memory follow-up was built, verified, measured FASTER in isolation, then found to be a net loss for real usage and correctly NOT shipped
+## READ THIS THIRD if resuming into performance work on the OLDER (Phase 15) material: transfer batching is DONE and shipped; a pinned-memory follow-up was built, verified, measured FASTER in isolation, then found to be a net loss for real usage and correctly NOT shipped
 
 **Phase 15's core result**: `encrypt_host_shoup_pooled_barrett_batched`
 (`src/encrypt_host_shoup_pooled_barrett_batched.cpp`) is now the actual

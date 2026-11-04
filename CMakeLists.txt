@@ -377,6 +377,18 @@ gpufhe_test(bench_encrypt_phase15_pinned_vs_batched bench/bench_encrypt_phase15_
 # (cold-start/typical/long-lived) the decision in research/
 # TRANSFER_PROFILING.md's Phase 16 section is based on.
 gpufhe_test(bench_encrypt_prewarm_workloads bench/bench_encrypt_prewarm_workloads.cpp)
+# GOD PROMPT "CKKS PHASE 17": pure diagnostic instruments for the
+# allocation-cost variance Phase 16 found but could not explain. None
+# of these call into gpufhe:: code at all (pure CUDA/Linux allocator
+# timing) -- registered here purely for ctest discoverability and
+# reproducibility, matching this project's established convention of
+# registering every bench/test file. See research/
+# TRANSFER_PROFILING.md's Phase 17 section and research/
+# EXPERIMENT_LEDGER.md entry #50 for the full investigation and
+# ranked root-cause assessment.
+gpufhe_test(bench_pinned_alloc_diagnostic bench/bench_pinned_alloc_diagnostic.cpp)
+gpufhe_test(bench_pinned_alloc_diagnostic2 bench/bench_pinned_alloc_diagnostic2.cpp)
+gpufhe_test(bench_thp_diagnostic bench/bench_thp_diagnostic.cpp)
 gpufhe_test(test_mult_barrett tests/test_mult_barrett.cpp)
 # Directive "VERIFY OOM DIAGNOSIS AND REMOVE THE LARGE-N DIAGONAL
 # BOTTLENECK", Priority 3: proves an O(S*2^RST) analytic replacement for

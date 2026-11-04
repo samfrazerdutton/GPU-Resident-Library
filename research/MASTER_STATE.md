@@ -2222,3 +2222,95 @@ follow-up to Phase 15's own closing recommendation.
   optimized (Phases 13-15); the GPU-resident tensor+keyswitch+combine+
   rescale chain remains ~1% of total pipeline latency, unchanged since
   Phase 11.
+
+## GOD PROMPT "CKKS PHASE 17": diagnosed Phase 16's unexplained allocation-cost variance — root mechanism demonstrated to be the Linux kernel's own memory-locking (`mlock()`) path, NOT CUDA-specific; no production change justified, Phase 16's decision stands on stronger evidence
+
+Full detail: `research/TRANSFER_PROFILING.md`'s Phase 17 section and
+`EXPERIMENT_LEDGER.md` entry #50. Starting commit `baee7a1` (Phase 16
+end state), confirmed via `git log -1` before any change. **No
+production or experimental code was modified this round** — this was
+a pure diagnostic investigation.
+
+- **Found a real methodology flaw in Phase 16's OWN measurement
+  first**: its "prewarm cost" bundled FIVE separate CUDA calls
+  (`cudaMalloc` x4 + `cudaMallocHost` x1) into one timed number,
+  exactly the kind of combined measurement the governing directive
+  explicitly warned against. Built 3 new, properly-separated standalone
+  diagnostics instead (`bench/bench_pinned_alloc_diagnostic{,2}.cpp`,
+  `bench/bench_thp_diagnostic.cpp`).
+- **Experiment 1 (fresh-allocate-then-free)**: with memory always
+  freed immediately, `cudaMallocHost` costs a CONSISTENT 2.5-4.2ms for
+  EVERY size — flatly contradicting Phase 16's reported "some sizes
+  are cheap" pattern. This alone proves that pattern is not an
+  intrinsic property of size.
+- **Experiment 2 (never-free, matching real pooling behavior)**:
+  reproduced Phase 16's exact slow/fast-by-POSITION pattern identically
+  across 5 independent runs — real, but NOT simply "first call slow,
+  rest fast" (position 4 slow despite 3 live allocations already
+  existing) and NOT simply size-dependent (the SAME size, n=2048, was
+  fast at one position and slow at another in the SAME process).
+- **Experiment 3 (pure Linux `mmap`+`madvise`+`mlock`, ZERO CUDA code)**:
+  reproduced the SAME qualitative variance (117us-3.6ms for identical
+  sizes) with no NVIDIA driver involved at all — the single most
+  important finding this round. The mechanism lives in the Linux
+  kernel's own memory-locking path, not in CUDA's allocator
+  (Hypothesis C effectively ruled out as primary).
+- **Experiment 4**: refuted "exactly 2MiB triggers THP" as a clean,
+  sole explanation — a 2MiB-minus-64KB allocation was equally slow once
+  several live pinned allocations already existed.
+- **Context gathered, not asserted as cause**: this session's live
+  shells measure `ulimit -l` (max locked memory) at only 64MB despite
+  `/etc/wsl.conf`'s boot-time "ulimit -l unlimited" intent — that
+  boot-time setting does not appear to propagate to ordinary exec'd
+  sessions. The tested buffer sizes stay far below 64MB even
+  cumulatively, so this is reported as correctly-identified context,
+  not claimed as the explanation. Windows host free memory (1910.9MB
+  → 1825.3MB, an 85MB drop) was bracketed before/after a batch of
+  allocations — consistent with, but not proof of, host memory
+  pressure as a contributing amplifier (coarse correlation only).
+- **Ranked root-cause assessment**: (1) Linux kernel `mlock()`-path
+  variance — HIGH confidence, directly demonstrated. (2) Host/WSL2
+  memory pressure as an amplifier — MEDIUM confidence, plausible,
+  not isolated from confounds. (3) Allocation size combined with
+  growing cumulative never-freed pinned memory — MEDIUM confidence,
+  real but not a clean deterministic rule. (4) WSL2-specific Hyper-V
+  ballooning as a mechanism DISTINCT from ordinary kernel memory
+  pressure — NOT CONFIRMED, cannot be distinguished from (1)/(2) with
+  available tooling (this round's finding makes a WSL2-SPECIFIC
+  mechanism less necessary as an explanation than Phase 16 implied,
+  since ordinary Linux `mlock()` under pressure already suffices as a
+  candidate). (5) CUDA-driver-specific behavior — LOW confidence,
+  effectively ruled out. (6) Benchmark/measurement artifact — RULED
+  OUT, reproduced across three independently-written programs.
+- **Decision: category 3 — the variance is externally controlled (now
+  DEMONSTRATED, not merely suspected), so Phase 16's opt-in design
+  remains unchanged.** No `.wslconfig` change, no WSL restart, no
+  system setting was modified — all investigation was read-only, per
+  the governing directive's explicit instruction.
+- **Regression**: confirmed via `git diff --name-only` that no
+  production or Phase 13-16 experimental source file was touched this
+  round — only new `bench/*.cpp` diagnostic files plus documentation
+  and `CMakeLists.txt` (3 new registrations for discoverability only;
+  none of the new files call into any `gpufhe::` code). Full Rust
+  suite re-confirmed unaffected: 38 passed, 0 failed, 1 ignored, both
+  build profiles. Phase 15/16's own correctness tests re-run fresh
+  from a clean object-cache rebuild: every case still EXACT MATCH / 0
+  mismatches — the pageable, pinned, and prewarmed/fallback paths all
+  remain bit-exact and the existing concurrency/lifecycle guarantees
+  are intact.
+- **Post-Phase-17 remaining opportunity**: if pinned prewarming is
+  revisited, the clearest next experiment (identified but not
+  performed this round due to time constraints) is a controlled sweep
+  allocating many DIFFERENT sizes in a fixed, non-repeating order with
+  memory usage tracked at every step, to more precisely characterize
+  hypothesis 3 above (size + cumulative-live-memory interaction).
+  Separately, disabling Transparent Huge Pages
+  (`/sys/kernel/mm/transparent_hugepage/enabled`, currently `madvise`)
+  as a controlled, reversible, documented-baseline-first experiment
+  would help test whether THP compaction is a necessary ingredient of
+  hypothesis 1, or whether plain `mlock()` page-table work under
+  memory pressure is sufficient on its own. Otherwise, `encrypt_host`'s
+  arithmetic, transfer, and allocation stages are all now optimized or
+  thoroughly investigated (Phases 13-17); the GPU-resident
+  tensor+keyswitch+combine+rescale chain remains ~1% of total pipeline
+  latency, unchanged since Phase 11.

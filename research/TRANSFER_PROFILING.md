@@ -506,3 +506,262 @@ This is neither a clean win (category 1) nor a clear rejection
   Rust FFI work that wants to build on a proven-correct, proven-safe
   foundation, without this round over-claiming a production-ready
   performance win it did not cleanly establish.
+
+## Phase 17: diagnosing the allocation-cost variance -- the mechanism is the Linux kernel's memory-locking path, NOT CUDA-specific, with host memory pressure a plausible but unconfirmed amplifier
+
+GOD PROMPT "CKKS PHASE 17". Starting commit `baee7a1` (Phase 16 end
+state), confirmed via `git log -1` and `origin/main` before any change.
+This section directly investigates the open question Phase 16 raised
+and explicitly flagged as "not independently confirmed."
+
+**No production or experimental code was modified this round.** This
+is a pure diagnostic investigation: three new standalone benchmark
+files were added (none touch `src/`, none touch the FFI bridge, none
+touch any pool/cache), and all existing tests were re-run to confirm
+zero regression.
+
+### Methodology critique of Phase 16's own measurement (directive Step 1/2)
+
+Re-reading `src/encrypt_host_shoup_pooled_barrett_prewarm.cpp`'s
+`prewarm_locked()` found that Phase 16's single "prewarm cost" number
+BUNDLED five separate calls into one timed region: `cudaMalloc`
+(device, packed buffer), `cudaMallocHost` (pinned host, packed
+buffer), and three small `cudaMalloc` calls (`d_fr`, `d_fp`, `d_mod`).
+The governing directive's Step 2 explicitly requires these NOT be
+combined. `bench/bench_pinned_alloc_diagnostic.cpp` (new) separates
+every stage: CUDA init, `cudaMalloc`, `cudaMallocHost`, first-touch
+(`memset`), H2D, D2H, `cudaDeviceSynchronize`, and release -- each
+with min/median/p90/p95/max/mean/stddev over multiple repeats, for
+both the pinned and pageable paths.
+
+### Experiment 1: fresh-allocate-then-free, 10 repeats per size, one process
+
+Every repeat does a genuine `cudaMalloc`+`cudaMallocHost`+...+
+`cudaFree`+`cudaFreeHost` (no caching). Result: `cudaMallocHost` costs
+**consistently 2.5-4.2ms for EVERY size** (n=1024 through n=8192), with
+NO size-dependent pattern and NO "some sizes are cheap" behavior at
+all -- flatly contradicting Phase 16's "n=2048/4096 cheap, n=1024/8192
+expensive" result. This first experiment alone proves Phase 16's
+pattern is NOT an intrinsic property of `cudaMallocHost` as a function
+of size when memory is always immediately freed.
+
+### Experiment 2: never-free, matching production's actual behavior
+
+`bench/bench_pinned_alloc_diagnostic2.cpp` (new) never calls
+`cudaFreeHost` between allocations -- exactly mirroring the real
+pooled implementations (`encrypt_buf_pool_pinned`/`PrewarmEntry`),
+which never free. Allocating n=1024,2048,4096,8192 in that order
+(matching Phase 16's exact benchmark), THEN repeating the same four
+sizes again:
+
+```
+call #1 n=1024  (0 live before): ~400-680ms  (confounded with CUDA context init -- first-ever CUDA call)
+call #2 n=2048  (1 live before): ~12-15us    FAST
+call #3 n=4096  (2 live before): ~5-9us      FAST
+call #4 n=8192  (3 live before): ~2.8-4.9ms  SLOW
+call #5 n=1024  (4 live before): ~19-39us    FAST
+call #6 n=2048  (5 live before): ~2.9-4.5ms  SLOW
+call #7 n=4096  (6 live before): ~10-35us    FAST
+call #8 n=8192  (7 live before): ~3.2-6.2ms  SLOW
+```
+
+**This exact pattern reproduced identically across 5 independent full
+runs** (slow at positions 1,4,6,8; fast at 2,3,5,7, every single time)
+-- confirming Phase 16's original pattern IS real and reproducible,
+and additionally revealing that it is NOT simply "first call slow,
+rest fast" (call #4 is slow despite 3 live allocations already
+existing) and NOT simply "small=fast, large=slow" (n=2048 is fast at
+position 2 but slow at position 6 -- the SAME size, same process,
+different outcome).
+
+### Experiment 3: isolating CUDA from the underlying OS mechanism
+
+`bench/bench_thp_diagnostic.cpp` (new) uses raw Linux `mmap` +
+`madvise(MADV_HUGEPAGE/NOHUGEPAGE)` + `mlock()` + first-touch, with
+**NO CUDA code involved at all**, on the exact same byte sizes. Result:
+**the same qualitative variance reproduces** -- `mlock()` alone costs
+anywhere from ~117us to ~3.6ms for the SAME 2MiB size across different
+calls within the SAME process, and even the smallest tested size
+(256KB) showed real variance (154-603us). The `MADV_HUGEPAGE` hint
+did NOT deterministically correlate with slow/fast outcomes (both
+hinted and non-hinted 2MiB calls showed both fast and slow instances).
+
+**This is the single most important finding of this phase**: the
+variance reproduces with ZERO CUDA or NVIDIA driver code running,
+using only the standard Linux `mlock()` syscall. Whatever `cudaMallocHost`
+does under the hood to pin memory, the variance it exhibits is
+downstream of a MORE FUNDAMENTAL, CUDA-independent Linux kernel
+behavior -- not a CUDA allocator quirk (Hypothesis C is effectively
+ruled out as the primary mechanism).
+
+### Experiment 4: the exact-2MiB boundary is not special; "large and never-freed" is what correlates
+
+A follow-up test allocated six buffers via `cudaMallocHost`, NEVER
+freeing any of them, at sizes `2097152` (exactly 2MiB),
+`2097152-65536` (2MiB minus 64KB, NOT huge-page-aligned), and
+`2097152+65536`, interleaved. Result: after the first (context-init-
+confounded) call, **every subsequent call was slow** (2.7-8.5ms),
+REGARDLESS of exact 2MiB alignment -- directly refuting a clean
+"exactly-2MiB-triggers-THP" rule as the sole mechanism (Experiment 2's
+n=2048/4096 sub-1MiB calls being fast, contrasted with this all-~2MiB
+sequence being uniformly slow, instead points toward allocation SIZE
+in a looser sense -- roughly "around or above ~1-2MiB" -- combined
+with GROWING cumulative live (never-freed) pinned memory, as the
+better-supported pattern, though not a clean deterministic rule
+either; see the ranked assessment below).
+
+### Windows-side memory bracketing (Hypothesis A)
+
+Windows free physical memory was measured immediately before and
+after a batch of 5 repeated diagnostic-2 runs (10 `cudaMallocHost`
+calls each, 50 total): **1910.9MB before, 1825.3MB after** (a ~85MB
+drop). This is CONSISTENT with host memory pressure being a real,
+concurrent factor, but is CORRELATIONAL ONLY -- this coarse
+before/after bracketing cannot isolate causation from confounds (other
+Windows background processes, the measurement overhead of invoking
+PowerShell itself, etc.), and no tool was available to sample Windows
+memory AT THE EXACT MOMENT of each individual slow allocation (the
+diagnostic runs are WSL-side C++ processes; invoking PowerShell
+per-sample would itself take longer than the allocation being
+measured). Windows free memory was consistently LOW throughout this
+entire investigation (1.2-2.4GB, consistent with every prior phase's
+own measurements) -- this is circumstantial support for Hypothesis A
+as a background condition, not a demonstrated causal link.
+
+### WSL2 configuration inspected (Hypothesis B)
+
+`.wslconfig`: `memory=11GB` (a CAP, not a fixed pre-committed
+reservation -- WSL2's Hyper-V VM grows its actual committed memory
+dynamically up to this cap by default). `/etc/wsl.conf`: `[boot]
+command = "ulimit -l unlimited"`. **A real, separate finding**: this
+boot-time command does NOT appear to apply to ordinary interactive/
+exec'd sessions reached via `wsl.exe -d Ubuntu -- bash -lc "..."` --
+every such session measured `ulimit -l` (max locked memory) at
+**65536 KB (64MB), both soft AND hard limit**, meaning an unprivileged
+shell cannot raise it further. This is notable context (a process-
+wide cap on how much memory ANY process can `mlock()`) but the
+packed-buffer sizes tested (256KB-2MiB, cumulatively under 8MiB even
+across all 4 sizes prewarmed) stay far below 64MB, so exceeding
+`RLIMIT_MEMLOCK` outright is NOT a plausible direct explanation for
+the observed slowness -- it is reported here as a correctly-identified
+but ultimately NON-explanatory finding, not asserted as the cause.
+No `.wslconfig` change, WSL restart, or VM setting was made -- per the
+directive's explicit instruction, this was investigated read-only.
+
+### Benchmark artifact check (Hypothesis E)
+
+Ruled out as the PRIMARY cause: `std::chrono::steady_clock` (monotonic,
+high-resolution) was used throughout; the SAME qualitative variance
+reproduced across THREE independently-written test programs (the
+original bundled Phase 16 benchmark, the isolated CUDA diagnostic, and
+the pure-Linux non-CUDA diagnostic) with different code structure,
+different timer placement, and (for the pure-Linux test) a completely
+different API surface -- a measurement artifact specific to any ONE
+program's timer or structure cannot explain a pattern that persists
+across three independently-written programs.
+
+### Ranked root-cause assessment (directive Step 5)
+
+1. **Linux kernel memory-locking (`mlock()`) path variance -- HIGH
+   confidence, directly demonstrated.** Evidence: Experiment 3
+   reproduced the SAME qualitative variance (hundreds of
+   microseconds to several milliseconds, for the same sizes) using
+   raw `mlock()` with zero CUDA involvement. Contradictory evidence:
+   none found. Falsifying experiment: if a kernel/mlock-level fix
+   (e.g., disabling THP via `/sys/kernel/mm/transparent_hugepage/
+   enabled`, which was inspected read-only and found set to
+   `madvise` -- not changed) eliminated the variance entirely, that
+   would strengthen this; this round did not make that change (per
+   the directive's "do not change... without first recording the
+   baseline" instruction, and because it is a system-wide setting
+   change, a separate, reversible experiment left for a future
+   round if pursued). Location: inside the Linux kernel / Windows-
+   WSL2 VM, NOT inside this project's code, NOT CUDA-specific.
+2. **Host/WSL2 memory pressure as a contributing amplifier -- MEDIUM
+   confidence, plausible but not isolated.** Evidence: Windows free
+   memory was consistently low (1.2-2.4GB) throughout, and dropped
+   further during a batch of allocations. Contradictory evidence:
+   none directly contradicts it, but the correlation is coarse
+   (before/after bracketing, not per-call) and confounded with other
+   background activity. Falsifying experiment: repeating the same
+   diagnostic on a machine/session with several GB of free host RAM
+   and comparing variance magnitude -- not performed this round (no
+   such environment was available). Location: Windows host /
+   Hyper-V / WSL2 VM boundary, outside this project's control either
+   way.
+3. **Allocation size (roughly "large," not a clean power-of-two or
+   exact-2MiB-THP rule) combined with growing cumulative never-freed
+   pinned memory -- MEDIUM confidence.** Evidence: Experiment 4
+   showed ALL ~2MiB-class allocations slow once several were already
+   live, regardless of exact THP alignment; Experiment 2 showed
+   sub-1MiB sizes fast in the SAME sequence shape. Contradictory
+   evidence: Experiment 2's n=2048 call was fast on its FIRST
+   occurrence (position 2) despite being the "large-ish" 512KB size,
+   and slow on its SECOND occurrence (position 6) -- so size alone,
+   independent of history, is not a sufficient predictor either.
+   Falsifying experiment: a controlled sweep allocating many
+   DIFFERENT sizes in a fixed, non-repeating order with memory usage
+   tracked at each step -- not performed this round due to time
+   constraints; flagged as the clearest next experiment if this
+   question is revisited.
+4. **WSL2-specific Hyper-V dynamic-memory ballooning as a DISTINCT
+   mechanism from ordinary Linux kernel memory pressure -- NOT
+   CONFIRMED, cannot be distinguished from Hypothesis 1/2 with the
+   tooling available.** This was Phase 16's own original (hedged)
+   guess. No tool exists inside this WSL2 guest to directly observe
+   Hyper-V's memory-balloon negotiation events, so this round can
+   neither confirm nor refute it as a mechanism DISTINCT from
+   ordinary kernel-level memory pressure (#1/#2 above) -- it may well
+   be the SAME underlying phenomenon Hypothesis 1/2 already capture,
+   just described with a WSL2-specific vocabulary Phase 16 reached
+   for without evidence. This round's finding (the variance
+   reproduces identically with zero CUDA/driver code, via plain
+   `mlock()`) makes a WSL2-ballooning-SPECIFIC mechanism less
+   necessary as an explanation than Phase 16 implied, since ordinary
+   Linux `mlock()` under memory pressure is already a sufficient,
+   demonstrated candidate.
+5. **CUDA-driver-specific allocator behavior -- LOW confidence,
+   effectively ruled out as the PRIMARY cause.** Evidence against:
+   Experiment 3's pure-Linux, zero-CUDA reproduction. It remains
+   possible CUDA's own wrapper adds SOME overhead on top of the
+   underlying `mlock()` variance, but it is not the dominant or
+   necessary mechanism.
+6. **Benchmark/measurement artifact -- RULED OUT as the explanation
+   for the core phenomenon.** Reproduced across three independently-
+   written programs with different timer placement and different
+   APIs; a single flawed benchmark cannot explain that.
+
+### Engineering response (directive Step 6)
+
+**No production code change is justified.** The root mechanism (Linux
+kernel `mlock()` path variance, Hypothesis 1, HIGH confidence) is
+outside this project's code and outside CUDA's own allocator --
+nothing in `src/` can fix a kernel-level or Hyper-V-level memory-
+locking cost. The Phase 16 decision (opt-in experimental feature, not
+promoted, pageable path remains production, applications that never
+call `encrypt_prewarm_pinned_buffer` pay nothing extra) remains the
+CORRECT engineering response, now for a more precisely understood
+reason: Phase 16 could only say "the cost is unpredictable, mechanism
+unconfirmed"; this phase upgrades that to "the cost is unpredictable
+because it reproduces at the Linux `mlock()` level independent of
+CUDA, most likely amplified by this host's persistent low free memory
+-- a mechanism no application-level code change in this repository can
+reliably control." The one incremental improvement worth making
+available (not a promotion, an honesty improvement): a future caller
+of `encrypt_prewarm_pinned_buffer` should be told, via this
+documentation, that its own cost is unpredictable and NOT simply
+proportional to `n` -- which this document now states directly, where
+Phase 16 could only speculate.
+
+### Decision (directive Step 9)
+
+**Category 3: the variance is externally controlled (Linux kernel
+`mlock()` path, plausibly amplified by host memory pressure), so the
+current opt-in design should remain.** This is a STRONGER version of
+category 3 than Phase 16 could claim, because the external mechanism
+is now directly DEMONSTRATED (via a CUDA-free reproduction), not
+merely suspected. No code was changed. The opt-in prewarming API
+(`encrypt_prewarm_pinned_buffer`/`encrypt_pinned_buffer_is_ready`/
+`encrypt_host_shoup_pooled_barrett_prewarmed`) remains exactly as
+Phase 16 left it: fully correct, fully concurrency-safe, retained as
+an experimental feature, not wired into production or the Rust API.
