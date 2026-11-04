@@ -3,53 +3,56 @@
 ## Current commit
 
 Check `git log -3` on resume. As of this writing, HEAD is a new commit
-on top of entry #49's commit `baee7a1` (the GOD PROMPT "CKKS PHASE 17"
+on top of entry #50's commit `ff81b97` (the GOD PROMPT "CKKS PHASE 18"
+round: a CONTROLLED DIAGNOSTIC experiment, no production or
+experimental code changed. The system-wide THP toggle
+(`/sys/kernel/mm/transparent_hugepage/enabled`) is BLOCKED BY
+PERMISSIONS -- a same-value no-op write returned "Permission denied"
+(no passwordless sudo available); per the user's explicit choice
+("Skip the THP toggle, document the blocker (recommended)"), no
+workaround was attempted and the setting was never changed. Using the
+one THP variable controllable without root (per-call
+`madvise(MADV_HUGEPAGE/NOHUGEPAGE)` hints), found a real, demonstrated,
+but narrow effect: a consistent ~5x `mlock()` slowdown specific to
+EXACTLY 2MiB allocations when the hugepage hint is disabled (absent at
+256KB/512KB/1MB). More importantly, a same-session INTERLEAVED
+re-test directly CONTRADICTS Phase 17's own HIGH-confidence "pure
+Linux `mlock()` reproduces the same variance as `cudaMallocHost`, so
+it's not CUDA-specific" conclusion -- pure Linux `mlock()` was clean
+and fast (174-1613us) while `cudaMallocHost`, interleaved in the same
+window for the identical size, remained consistently 2984-5079us.
+Phase 17's conclusion is now explicitly REVISED: CUDA/WSL2-driver-
+passthrough overhead is promoted to the leading hypothesis
+(MEDIUM-HIGH confidence); the pure-kernel-`mlock()` explanation is
+downgraded to MEDIUM (demonstrated once, not reproduced under matched
+conditions this phase). Decision: category 3 continues -- no
+production or config change justified; Phase 16's opt-in design
+stands, now on a partially revised rationale. THP settings and
+`ulimit -l` verified unchanged throughout (trivially, since no write
+ever succeeded). See `EXPERIMENT_LEDGER.md` entry #51 and `research/
+TRANSFER_PROFILING.md`'s Phase 18 section for full detail.
+
+## Earlier commit (Phase 17)
+
+HEAD was previously a commit on top of entry #49's commit `baee7a1`
+(the GOD PROMPT "CKKS PHASE 17"
 round: a PURE DIAGNOSTIC investigation, no production or experimental
 code changed. Found a real methodology flaw in Phase 16's own "prewarm
 cost" measurement (it bundled 5 separate CUDA calls into one timed
 number) and built 3 properly-separated diagnostics instead. The
-headline finding: the SAME allocation-cost variance Phase 16 found
-(microseconds to several milliseconds) reproduces with a PURE Linux
-`mmap`+`madvise`+`mlock` test using ZERO CUDA code -- proving the
-mechanism lives in the Linux kernel's own memory-locking path, not in
-CUDA's allocator. Ranked root-cause assessment: Linux kernel `mlock()`
-path (HIGH confidence, demonstrated), host/WSL2 memory pressure as an
-amplifier (MEDIUM, plausible, not isolated), allocation size + growing
-cumulative never-freed pinned memory (MEDIUM, real but not a clean
-rule), WSL2-specific Hyper-V ballooning as a mechanism DISTINCT from
-ordinary kernel pressure (NOT CONFIRMED, cannot be distinguished with
-available tooling), CUDA-driver-specific behavior (LOW, effectively
-ruled out), benchmark artifact (RULED OUT). Decision: category 3 --
-the variance is externally controlled, now DEMONSTRATED rather than
-merely suspected, so Phase 16's opt-in design remains exactly as it
-was. No `.wslconfig` change, no WSL restart, nothing system-level was
-modified. See `EXPERIMENT_LEDGER.md` entry #50 and `research/
-TRANSFER_PROFILING.md`'s Phase 17 section for full detail.
-
-## Earlier commit (Phase 16)
-
-HEAD was previously a commit on top of entry #48's commit `69d307a`
-(the GOD PROMPT "CKKS PHASE 16"
-round: built and proved correct/concurrency-safe an EXPLICIT pinned-
-memory PREWARMING API (`encrypt_prewarm_pinned_buffer`/
-`encrypt_pinned_buffer_is_ready`/`encrypt_host_shoup_pooled_barrett_
-prewarmed`), directly following up on Phase 15's closing
-recommendation. Found a genuinely unexpected, reproducible result: the
-one-time `cudaMallocHost` cost is NOT simply a function of buffer size
-in this environment -- it ranged from 16us to 5.9ms depending on `n`,
-consistently, across two independent full runs -- making the break-
-even point for prewarming unpredictable for short workloads. Profile C
-(long-lived, many repeated calls) wins unconditionally; Profiles A/B
-(cold-start/typical) are mixed. Per the decision gate, this was
-RETAINED AS AN OPT-IN EXPERIMENTAL C++ FEATURE, NOT promoted to
-production and NOT wired into the Rust API or FFI bridge this round --
-the implementation is fully correct and concurrency-safe (0/372
-mismatches across 5 runs, 6 lifecycle scenarios), but its performance
-benefit depends on allocation-cost variance the library cannot predict
-or control. `encrypt_host_shoup_pooled_barrett_batched` (Phase 15,
-pageable, production) and every earlier phase's implementation remain
-completely unchanged. See `EXPERIMENT_LEDGER.md` entry #49 and
-`research/TRANSFER_PROFILING.md`'s Phase 16 section for full detail).
+headline finding at the time: the SAME allocation-cost variance Phase
+16 found (microseconds to several milliseconds) appeared to reproduce
+with a PURE Linux `mmap`+`madvise`+`mlock` test using ZERO CUDA code --
+**this specific conclusion was REVISED by Phase 18's same-session
+interleaved re-test; see the "Current commit" section above and
+`research/TRANSFER_PROFILING.md`'s Phase 18 section**. Decision at the
+time: category 3 -- the variance is externally controlled, now
+DEMONSTRATED rather than merely suspected, so Phase 16's opt-in design
+remains exactly as it was (this decision itself still stands, only the
+"not CUDA-specific" framing was revised). No `.wslconfig` change, no
+WSL restart, nothing system-level was modified. See
+`EXPERIMENT_LEDGER.md` entry #50 and `research/TRANSFER_PROFILING.md`'s
+Phase 17 section for full detail.
 Confirm push status -- push again if `git status` shows ahead of
 origin.
 
@@ -62,7 +65,53 @@ an entirely unrelated commit history (raw CUDA-kernel-optimization
 work) and untracked, stale copies of `rust/`/`research/` -- never run
 `git status`/`log`/commit decisions against it for this work.
 
-## READ THIS FIRST if resuming into pinned-memory work: the allocation-cost variance is now EXPLAINED (Linux kernel mlock() path, not CUDA-specific), the Phase 16 decision stands, and a WSL2-ballooning claim from Phase 16 has been downgraded to "not confirmed"
+## READ THIS FIRST if resuming into pinned-memory/THP work: the system-wide THP toggle is BLOCKED BY PERMISSIONS (documented, not worked around); a real but narrow ~5x THP-hint effect exists at exactly 2MiB; Phase 17's "not CUDA-specific" conclusion is REVISED -- CUDA/WSL2-driver overhead is now the leading hypothesis
+
+**Phase 18's core result**: attempted the originally-planned
+controlled THP experiment (THP=madvise vs. THP=disabled vs. restored).
+The system-wide toggle (`/sys/kernel/mm/transparent_hugepage/enabled`)
+requires root; a same-value no-op write returned "Permission denied"
+and no passwordless sudo is available. **Per the user's explicit
+choice ("Skip the THP toggle, document the blocker (recommended)"),
+no workaround was attempted and the setting was never changed** --
+verified identical to baseline (`madvise`) both immediately after the
+denied attempt and at phase end.
+
+Substituted the one THP variable controllable without root: per-call
+`madvise(MADV_HUGEPAGE/NOHUGEPAGE)` hints
+(`bench/bench_thp_hint_by_size.cpp`). Result: NO meaningful effect at
+256KB/512KB/1MB, but a consistent, reproducible **~5x slowdown at
+EXACTLY 2MiB** when the hint is disabled (≈230-247us →
+≈1217-1270us, reproduced across 2 independent runs) -- the first
+DEMONSTRATED, mechanistic THP effect this project has found. Its
+magnitude is still far too small to explain Phase 16/17's multi-
+millisecond `cudaMallocHost` variance.
+
+**More importantly, this phase REVISES Phase 17's own conclusion.**
+A same-session, INTERLEAVED re-test of "does pure Linux `mlock()`
+reproduce the same variance as `cudaMallocHost`" directly contradicts
+Phase 17's HIGH-confidence "yes, so it's not CUDA-specific" finding:
+pure Linux `mlock()` was clean and fast (174-1613us) while
+`cudaMallocHost`, interleaved in the same short window for the
+identical size, remained consistently 2984-5079us -- an order of
+magnitude slower. Phase 17's finding was most likely a coincidental
+same-window timing artifact, not a robust equivalence. The updated
+ranked assessment PROMOTES CUDA/WSL2-driver-passthrough overhead to
+the leading hypothesis (MEDIUM-HIGH confidence) and DOWNGRADES the
+pure-kernel-`mlock()` explanation to MEDIUM.
+
+**No code was changed.** Phase 16's decision (opt-in experimental
+feature, not promoted, pageable path remains production) still
+stands -- category 3 of the decision gate still applies, just with a
+more precisely (and partially differently) understood external
+mechanism. **Do not re-attempt a code-level fix.** If this is
+revisited, the clearest next step is obtaining passwordless sudo (or
+running the toggle manually) to finally exercise the originally-
+planned system-wide A/B/C THP comparison, or a GPU-passthrough-layer
+trace to test the CUDA/driver hypothesis directly. Full detail:
+`research/TRANSFER_PROFILING.md`'s Phase 18 section.
+
+## READ THIS SECOND if resuming into pinned-memory work: the allocation-cost variance was EXPLORED (Linux kernel mlock() path vs. CUDA/driver overhead -- see Phase 18 above for the revision), the Phase 16 decision stands, and a WSL2-ballooning claim from Phase 16 has been downgraded to "not confirmed"
 
 **Phase 17's core result**: Phase 16 found `cudaMallocHost`'s cost
 varies wildly (16us-5.9ms) and guessed, without evidence, that WSL2
@@ -98,7 +147,7 @@ or a controlled, reversible test of disabling Transparent Huge Pages
 to see if that is a necessary ingredient. Full detail: `research/
 TRANSFER_PROFILING.md`'s Phase 17 section.
 
-## READ THIS SECOND if resuming into performance work: a pinned-memory PREWARMING API exists, fully correct and concurrency-safe, but was NOT promoted because its own allocation cost is unpredictable in this environment
+## READ THIS THIRD if resuming into performance work: a pinned-memory PREWARMING API exists, fully correct and concurrency-safe, but was NOT promoted because its own allocation cost is unpredictable in this environment
 
 **Phase 16's core result**: `encrypt_prewarm_pinned_buffer(n,sizeQ)` /
 `encrypt_pinned_buffer_is_ready(n,sizeQ)` / `encrypt_host_shoup_
@@ -132,7 +181,7 @@ accepting the risk explicitly for a specific, named long-lived-service
 deployment where Profile C's unconditional win is what matters.** Full
 detail: `research/TRANSFER_PROFILING.md`'s Phase 16 section.
 
-## READ THIS THIRD if resuming into performance work on the OLDER (Phase 15) material: transfer batching is DONE and shipped; a pinned-memory follow-up was built, verified, measured FASTER in isolation, then found to be a net loss for real usage and correctly NOT shipped
+## READ THIS FOURTH if resuming into performance work on the OLDER (Phase 15) material: transfer batching is DONE and shipped; a pinned-memory follow-up was built, verified, measured FASTER in isolation, then found to be a net loss for real usage and correctly NOT shipped
 
 **Phase 15's core result**: `encrypt_host_shoup_pooled_barrett_batched`
 (`src/encrypt_host_shoup_pooled_barrett_batched.cpp`) is now the actual

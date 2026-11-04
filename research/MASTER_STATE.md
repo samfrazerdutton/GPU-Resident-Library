@@ -2314,3 +2314,107 @@ a pure diagnostic investigation.
   thoroughly investigated (Phases 13-17); the GPU-resident
   tensor+keyswitch+combine+rescale chain remains ~1% of total pipeline
   latency, unchanged since Phase 11.
+
+## GOD PROMPT "CKKS PHASE 18": controlled THP experiment — the system-wide toggle is blocked by permissions (correctly NOT worked around, per explicit user choice); a real but narrow ~5x THP-hint effect found at exactly 2MiB; Phase 17's "not CUDA-specific, HIGH confidence" conclusion REVISED to MEDIUM after same-session interleaved re-testing contradicted it
+
+Full detail: `research/TRANSFER_PROFILING.md`'s Phase 18 section and
+`EXPERIMENT_LEDGER.md` entry #51. Starting commit `ff81b97` (Phase 17
+end state), confirmed via `git log -1`, `git status`, and
+`origin/main` before any change. **No production or experimental
+code was modified this round** — this was a pure diagnostic
+investigation, per the directive's explicit framing ("a controlled
+diagnostic experiment, not a production optimization").
+
+- **Baseline recorded (Step 1)**: THP `enabled`=`madvise`,
+  `defrag`=`madvise`; kernel `6.6.87.2-microsoft-standard-WSL2+`; page
+  size 4096; `ulimit -l`=65536KB (64MB, both soft/hard, unchanged from
+  Phase 17, kept deliberately untouched as a separate confound);
+  swap 8GB mostly free; Windows host free RAM ~2.3GB at phase start,
+  ~1.93GB at phase end (measured via `Get-CimInstance
+  Win32_OperatingSystem`, not WSL `free -h`, per the directive's
+  explicit requirement) — the n=131072 ≥6GiB gate was never met, so
+  that size was never attempted.
+- **The system-wide THP toggle is blocked by permissions**: a
+  same-value no-op write (`echo madvise >
+  .../transparent_hugepage/enabled`) returned `Permission denied`;
+  confirmed no passwordless sudo is available (`sudo -n true`/`sudo
+  -n -l` both require a password). This is exactly the blocker the
+  directive's Step 3/safety constraint #5 anticipated. **No
+  workaround was attempted.** `AskUserQuestion` was used to let the
+  user decide; **the user explicitly chose "Skip the THP toggle,
+  document the blocker (recommended)."** The system-wide setting was
+  never changed, confirmed identical to baseline both immediately
+  after the denied attempt and again at phase end.
+- **Substituted the one THP variable controllable without root**:
+  per-allocation `madvise(MADV_HUGEPAGE/MADV_NOHUGEPAGE)` hints (new
+  diagnostics `bench/bench_pinned_alloc_diagnostic3.cpp`,
+  `bench/bench_thp_hint_by_size.cpp` — pure Linux `mmap`+`mlock`,
+  zero CUDA).
+- **`bench_thp_hint_by_size.cpp` — the decisive, demonstrated
+  result**: interleaved HUGEPAGE vs. NOHUGEPAGE hints across all four
+  packed sizes, 8 repeats each, run twice independently. 256KB/512KB/
+  1MB showed NO meaningful difference (ratios 0.90-1.01, i.e. noise).
+  **Exactly 2MiB (2097152 bytes, the exact x86-64 huge-page size)
+  showed a consistent, reproducible ~5x slowdown with the hint
+  disabled** (HUGEPAGE median≈230-247us vs. NOHUGEPAGE
+  median≈1217-1270us, ratio≈4.93-5.51, both runs). This is the first
+  time this project has DEMONSTRATED (not merely correlated) a
+  specific, mechanistic THP effect — but its magnitude (≈1ms worst
+  case, one size only) is far too small to explain the multi-
+  millisecond-to-hundreds-of-milliseconds variance Phase 16/17
+  observed in `cudaMallocHost`.
+- **`bench_pinned_alloc_diagnostic3.cpp`**: full per-sample data
+  (timestamp, size, order, live-before count, `/proc/meminfo`
+  snapshot, separately-timed mlock/touch/release) under the unchanged
+  THP=madvise setting. Clean, monotonic-in-size `mlock()` latency —
+  256KB≈150-310us, 512KB≈280-480us, 1MB≈550-840us, 2MB≈1100-1450us —
+  with NO multi-millisecond outliers, across 5 runs and all live-count
+  buckets (0, 1-3, 4-7, 8+).
+- **Self-correction (the most important finding this round)**: Phase
+  17 concluded HIGH confidence that pure Linux `mlock()` reproduces
+  the SAME variance as `cudaMallocHost`, proving the mechanism is
+  NOT CUDA-specific. This phase re-ran that comparison more
+  rigorously — SAME session, INTERLEAVED, back-to-back for the
+  identical size — and it does NOT hold up: pure Linux `mlock()` was
+  clean and fast (174-1613us) while `cudaMallocHost`, interleaved in
+  the same short window, remained consistently 2984-5079us — an
+  order of magnitude slower. **Phase 17's "pure Linux reproduces the
+  same variance" finding was most likely a coincidental timing
+  artifact from that one investigation window, not a robust
+  equivalence.** Reported here as an honest, explicit revision,
+  following this project's own precedent (Phase 12's correctness-
+  breakthrough reversal).
+- **Updated ranked root-cause assessment**: (1) CUDA/WSL2-driver-
+  passthrough overhead — PROMOTED to leading hypothesis, MEDIUM-HIGH
+  confidence (this phase's interleaved same-session comparison).
+  (2) Linux kernel `mlock()`-path variance — DOWNGRADED from Phase
+  17's HIGH to MEDIUM (demonstrated once, not reproduced under
+  matched conditions this phase; itself intermittent). (3) THP
+  per-call hint effect — CONFIRMED, MEDIUM confidence, narrow (~5x,
+  exactly-2MiB-only). (4) System-wide THP enabled/defrag setting —
+  UNTESTED, blocked by permissions. (5) Host/WSL2 memory pressure —
+  MEDIUM, unchanged from Phase 17. (6) WSL2-specific Hyper-V
+  ballooning distinct from (1)/(2)/(5) — still NOT CONFIRMED.
+  (7) Benchmark/measurement artifact — still RULED OUT (same two
+  previously-validated binaries, interleaved, same gap).
+- **Decision: category 3 continues — no production code or config
+  change justified.** Phase 16's opt-in prewarming API design stands,
+  now on a partially revised rationale (CUDA/driver overhead promoted
+  over pure-kernel `mlock()` as the likely dominant mechanism, plus a
+  real but narrow THP-hint contributor). No `.wslconfig`/kernel/
+  Windows setting was changed; the system-wide THP setting was never
+  successfully written to at all.
+- **Regression**: confirmed via `git status`/`git diff` that no
+  production or experimental source file was touched this round —
+  only the 2 new standalone `bench/*.cpp` diagnostics plus
+  documentation and `CMakeLists.txt` (2 new registrations for
+  discoverability only). Full Rust suite re-confirmed unaffected: 4
+  passed + 38 passed, 0 failed, 1 ignored, both debug and release.
+- **Post-Phase-18 remaining opportunity**: if root-causing this
+  further is revisited, the clearest next experiment is obtaining
+  passwordless sudo (or running the toggle manually, as the user was
+  offered this round) to finally exercise the originally-planned
+  A/B/C system-wide THP comparison; separately, a GPU-passthrough-
+  layer trace or a non-WSL2 Linux host with a directly-attached GPU
+  would let hypothesis 1 (CUDA/driver overhead) be tested directly
+  rather than inferred from an interleaved comparison.

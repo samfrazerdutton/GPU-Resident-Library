@@ -765,3 +765,296 @@ merely suspected. No code was changed. The opt-in prewarming API
 `encrypt_host_shoup_pooled_barrett_prewarmed`) remains exactly as
 Phase 16 left it: fully correct, fully concurrency-safe, retained as
 an experimental feature, not wired into production or the Rust API.
+
+## Phase 18: controlled THP experiment -- the system-wide toggle is blocked by permissions (correctly not worked around); a real but small THP-hint effect found at exactly 2MiB; Phase 17's "not CUDA-specific" conclusion is REVISED based on same-session interleaved re-testing
+
+GOD PROMPT "CKKS PHASE 18". Starting commit `ff81b97` (Phase 17 end
+state), confirmed via `git log -1`, `git status`, and `origin/main`
+before any change: HEAD and `origin/main` both at `ff81b97`, working
+tree clean apart from pre-existing unrelated untracked items
+(`.claude/`, `.scrum-orchestrator/`, `CLAUDE.md`, `build2/`,
+`tools/__pycache__/`), none of which belong to this project's tracked
+history and none of which were touched this round.
+
+**This is a controlled diagnostic experiment, not a production
+optimization. No production or experimental encryption code was
+modified.** Two new standalone diagnostic files were added
+(`bench/bench_pinned_alloc_diagnostic3.cpp`,
+`bench/bench_thp_hint_by_size.cpp`); none touch `src/`, the FFI
+bridge, or any pool/cache. Direct inspection confirmed
+`src/encrypt_host_shoup_pooled_barrett_batched.cpp`,
+`src/encrypt_host_shoup_pooled_barrett_batched_pinned.cpp`,
+`src/encrypt_host_shoup_pooled_barrett_prewarm.cpp`,
+`rust/crates/ckks-cuda/build.rs`, and
+`rust/crates/ckks-cuda/cpp_bridge/encdec_bridge.cpp` were never
+written to this phase.
+
+### Step 1: baseline environment (read-only)
+
+Recorded before any experiment, and re-verified identical afterward:
+
+- `/sys/kernel/mm/transparent_hugepage/enabled`: `always [madvise]
+  never` (madvise active, selected).
+- `/sys/kernel/mm/transparent_hugepage/defrag`: `madvise` (selected).
+- Kernel: `6.6.87.2-microsoft-standard-WSL2+`.
+- Page size: 4096 bytes (standard 4KB base page; THP would promote to
+  2MiB = 2097152 bytes, matching the n=8192 packed-buffer size
+  exactly).
+- `ulimit -l` (both soft and hard): 65536 KB (64MB) -- unchanged from
+  Phase 17's own finding; kept as a separate, untouched confound per
+  the directive's explicit Step 5 instruction.
+- Swap: 8GB configured, mostly free throughout.
+- `/proc/meminfo`: `MemFree`/`MemAvailable`/`AnonHugePages`/
+  `SwapFree` all sampled per-allocation by the new diagnostics (see
+  below); no anomalous reading at baseline.
+- Windows host free RAM (`(Get-CimInstance
+  Win32_OperatingSystem).FreePhysicalMemory`, NOT WSL's own `free
+  -h`, per the directive's explicit requirement): approximately
+  2.3GB at the start of this phase, approximately 1.93GB at the end
+  -- consistent with every prior phase's own low-free-memory
+  readings, and confirming the constraint #13 gate (≥6GiB required
+  for any n=131072 run) was never met, so no such run was attempted.
+
+### Step 2/3: the system-wide THP toggle is blocked by permissions -- correctly NOT worked around
+
+Attempted the least invasive possible change: a same-value,
+effectively no-op write, `echo madvise >
+/sys/kernel/mm/transparent_hugepage/enabled`. Result: `bash:
+/sys/kernel/mm/transparent_hugepage/enabled: Permission denied`.
+Confirmed via `id` that the session user (`samfrazerdutton`) is in
+the `sudo` group, but `sudo -n true` and `sudo -n -l` both report "a
+password is required" -- there is no passwordless sudo available
+non-interactively. This is exactly the blocker the governing
+directive's Step 3 and safety constraint #5 anticipated ("If
+permissions do not permit a reversible runtime change, stop and
+report the blocker. Do not work around it using destructive system
+modifications").
+
+No workaround was attempted (no password guessing, no alternative
+privilege escalation, no editing of sudoers, no attempt to disable
+the permission check). `AskUserQuestion` was used to let the user
+decide between documenting the blocker or providing sudo credentials
+themselves. **The user explicitly chose "Skip the THP toggle, document
+the blocker (recommended)."** Per that decision, the system-wide THP
+setting was NEVER changed at any point in this phase -- confirmed by
+re-reading `/sys/kernel/mm/transparent_hugepage/enabled` both
+immediately after the denied write attempt and again at the end of
+the phase: both readings identical to the original baseline
+(`madvise` selected, unchanged).
+
+Because the system-wide toggle could not be exercised, Step 2's
+three-condition (A/B/C) design as originally specified could not be
+run. Instead, the investigation used the ONE THP-related variable
+that IS controllable without root: the per-allocation
+`madvise(addr, len, MADV_HUGEPAGE | MADV_NOHUGEPAGE)` hint, which
+requires no special privilege on memory a process has mapped itself.
+This substitution is reported here explicitly rather than silently
+presented as equivalent to the originally planned experiment --it
+tests whether THP participation on a per-allocation basis changes
+cost, not whether disabling THP system-wide does.
+
+### Step 4/5: `bench_pinned_alloc_diagnostic3.cpp` -- per-sample methodology under the unchanged THP=madvise setting
+
+This diagnostic fulfills the directive's per-sample data
+requirements (timestamp, allocation index, size, order, live-before
+count, full `/proc/meminfo` snapshot, separately-timed
+mlock/first-touch/release stages) using pure `mmap`+`mlock`, zero
+CUDA, run with ascending/descending/randomized order and both
+never-free and free-immediately modes. Representative run (`asc
+neverfree 3`, 12 samples, packed sizes 256KB/512KB/1MB/2MB): `mlock()`
+latency was clean and monotonic in size --
+256KB≈150-310us, 512KB≈280-480us, 1MB≈550-840us, 2MB≈1100-1450us --
+with **no multi-millisecond outliers of the kind Phase 17's own
+`bench_pinned_alloc_diagnostic2.cpp` (CUDA path) and
+`bench_thp_diagnostic.cpp` (pure-Linux path) both reported**.
+Reproduced identically across 5 total runs this session, across all
+tested orders and live-count buckets (0, 1-3, 4-7, 8+ concurrently
+live allocations) -- no bucket showed the multi-millisecond spikes
+Phase 17 recorded for pure Linux `mlock()`.
+
+### Step 4: `bench_thp_hint_by_size.cpp` -- the decisive, demonstrated THP-hint effect
+
+This diagnostic interleaves `MADV_HUGEPAGE` and `MADV_NOHUGEPAGE`
+calls, 8 repeats each, across all four packed-buffer sizes, reporting
+median latency and the NOHUGEPAGE/HUGEPAGE ratio per size. Run twice
+independently, both runs highly consistent:
+
+```
+n=1024 (256KB):  HUGEPAGE median~124-125us   NOHUGEPAGE median~121-125us   ratio~0.96-1.01  (no meaningful difference)
+n=2048 (512KB):  HUGEPAGE median~252-262us   NOHUGEPAGE median~243-255us   ratio~0.93-1.01  (no meaningful difference)
+n=4096 (1MB):    HUGEPAGE median~518-589us   NOHUGEPAGE median~518-532us   ratio~0.90-1.00  (no meaningful difference)
+n=8192 (2MB):    HUGEPAGE median~230-247us   NOHUGEPAGE median~1217-1270us ratio~4.93-5.51  (CONSISTENT ~5x SLOWDOWN)
+```
+
+**A real, demonstrated, reproducible THP-hint effect exists, but it
+is narrowly specific to allocations of exactly 2097152 bytes (2MiB --
+the exact x86-64 huge-page size)**: disabling the per-call hugepage
+hint makes `mlock()` on an exactly-2MiB region roughly 5x slower
+(≈230-247us → ≈1217-1270us), reproduced across both independent runs.
+No such effect exists at 256KB, 512KB, or 1MB -- at those sizes the
+hint makes no meaningful difference either way (ratios within
+0.90-1.01 of each other, i.e. noise). This is the first time this
+project has DEMONSTRATED (not merely correlated) a specific,
+mechanistic, reproducible THP effect, rather than a generic
+"variance exists" observation.
+
+Critically, this effect's magnitude (≈1ms worst case, at exactly one
+size) is far too small to explain the multi-millisecond-to-several-
+hundred-millisecond variance Phase 16/17 observed in
+`cudaMallocHost`. THP participation is a real but minor factor, not
+the dominant driver of the originally observed variance.
+
+### Step 6/self-correction: Phase 17's "not CUDA-specific" conclusion does NOT hold up under same-session interleaved re-testing -- REVISED
+
+Phase 17 concluded (HIGH confidence): "the variance reproduces
+identically with zero CUDA code, via plain `mlock()`, proving the
+mechanism is the Linux kernel's own memory-locking path, NOT
+CUDA-specific." This phase re-ran that comparison more rigorously --
+in the SAME session, INTERLEAVED, back-to-back for the identical
+size -- and the result directly contradicts it:
+
+- Pure Linux `mlock()`, re-run fresh this phase via both
+  `bench_pinned_alloc_diagnostic3.cpp` and a fresh re-run of Phase
+  17's own `bench_thp_diagnostic.cpp`: clean, fast, largely
+  size-proportional, sub-2ms for every sample, NO multi-hundred-
+  millisecond outliers.
+- `cudaMallocHost`, re-run in the SAME session via Phase 17's own
+  `bench_pinned_alloc_diagnostic2.cpp`, interleaved in the same short
+  time window with the pure-Linux tests above: consistently
+  **2984-5079us**, and in earlier Phase 16/17 runs, occasionally
+  several hundred milliseconds for the very first call -- an order of
+  magnitude slower than the worst pure-Linux `mlock()` sample
+  measured in the identical window (174-1613us for the same size).
+
+**This means Phase 17's "pure Linux reproduces the same variance"
+finding was most likely a coincidental timing artifact -- both test
+types happened to be slow during that one investigation window, not
+a robust, repeatable equivalence.** This is an honest revision, not a
+hidden one, following this project's own established precedent (e.g.
+Phase 12's correctness-breakthrough round reversing an earlier
+library-bug claim). The correct reading of the combined Phase
+17+18 evidence is: plain Linux `mlock()` CAN exhibit variance (Phase
+17 observed it once; this phase did not reproduce it under otherwise-
+identical conditions, suggesting it is itself environment/timing-
+dependent rather than deterministic), but `cudaMallocHost` carries
+its OWN, additional, consistently-reproducible overhead ON TOP of
+whatever the underlying `mlock()` call costs -- an overhead this
+phase's interleaved testing shows is NOT explained by the pure-Linux
+path alone.
+
+### Updated ranked root-cause assessment (supersedes Phase 17's Step 5 ranking)
+
+1. **CUDA/driver-specific overhead, most plausibly WSL2's
+   paravirtualized GPU-passthrough layer forwarding `cudaMallocHost`
+   to the Windows host driver -- PROMOTED to the leading hypothesis,
+   MEDIUM-HIGH confidence.** Evidence: this phase's same-session,
+   interleaved comparison showed `cudaMallocHost` consistently
+   2-20x slower than pure-Linux `mlock()` for the identical size,
+   measured back-to-back in the same short window where confounds
+   (host memory state, time-of-day load, kernel state) are held
+   maximally constant. Contradictory evidence: Phase 17 itself once
+   observed pure-Linux `mlock()` variance of a similar order of
+   magnitude, so a CUDA/driver-only explanation is not yet airtight.
+   Falsifying experiment: capturing a GPU-passthrough-layer trace (no
+   tool for this was available in this WSL2 guest) or testing on a
+   non-WSL2 Linux host with a directly-attached GPU to see if the gap
+   vanishes -- not performed this round, no such environment
+   available.
+2. **Linux kernel `mlock()` path variance -- DOWNGRADED from Phase
+   17's HIGH to MEDIUM confidence; demonstrated to occur at least
+   once, but NOT reproduced under otherwise-matched same-session
+   conditions this phase.** Evidence: Phase 17's own `bench_thp_
+   diagnostic.cpp` showed multi-millisecond `mlock()` outliers in its
+   original run; this phase's fresh re-run of the SAME binary showed
+   clean sub-2ms behavior throughout. This is not a contradiction of
+   Phase 17's raw data (the outliers were real when they happened),
+   but it means the mechanism is not a deterministic, always-present
+   property of plain `mlock()` on this system -- it is itself
+   intermittent, and its intermittency has not been isolated from
+   host-level load at the time of each specific run.
+3. **THP per-call hint effect, demonstrated, narrow -- CONFIRMED,
+   MEDIUM confidence, but minor in magnitude.** A real ~5x effect at
+   exactly 2MiB (≈230us → ≈1217us), absent at other sizes. Too small
+   (≈1ms worst case) to be the dominant driver of the multi-
+   millisecond-to-hundreds-of-milliseconds `cudaMallocHost` variance,
+   but a real, now-demonstrated contributor specifically for
+   exactly-2MiB-sized allocations when the hugepage hint is unset or
+   defeated.
+4. **System-wide THP enabled/defrag setting as a contributor --
+   UNTESTED, blocked by permissions.** Cannot be confirmed or refuted
+   this phase; the per-call hint test above is the closest available
+   substitute and shows a real but narrow effect, suggesting (but not
+   proving) that toggling the system-wide setting would show a
+   similarly narrow, size-specific effect rather than a broad one.
+5. **Host/WSL2 memory pressure as a contributing amplifier -- MEDIUM
+   confidence, unchanged from Phase 17; still plausible, still not
+   isolated.** Windows free RAM remained consistently low (1.93-2.3GB)
+   throughout this phase, consistent with Phase 16/17's own readings.
+6. **WSL2-specific Hyper-V ballooning as a mechanism DISTINCT from
+   ordinary kernel memory pressure or CUDA/driver passthrough -- still
+   NOT CONFIRMED,** unchanged from Phase 17; no new tooling was found
+   to distinguish it from hypotheses 1/2/5 above.
+7. **Benchmark/measurement artifact -- still effectively RULED OUT**
+   for the core `cudaMallocHost`-vs-`mlock()` gap: the SAME two
+   binaries (`bench_pinned_alloc_diagnostic2.cpp` for CUDA,
+   `bench_thp_diagnostic.cpp`/`bench_pinned_alloc_diagnostic3.cpp` for
+   pure Linux) were used in both Phase 17 and this phase, with
+   identical timer code (`std::chrono::steady_clock`), yet produced
+   a consistent, reproducible, order-of-magnitude gap when run
+   interleaved -- a single benchmark's artifact cannot explain a gap
+   between two independently-written, previously-validated programs
+   measured side by side.
+
+### Step 7: production implications
+
+**No production code or configuration change is justified by this
+phase's findings.** The Phase 16 decision (opt-in experimental
+pinned-prewarming API, not promoted, pageable path remains
+production) remains correct, and is now supported by a MORE
+PRECISELY understood (if partially revised) picture: `cudaMallocHost`
+carries a consistently-reproducible overhead over plain Linux
+`mlock()` for the same size, most plausibly rooted in WSL2's GPU-
+passthrough layer, with a real but narrow (~5x, ~1ms-scale, exactly-
+2MiB-specific) additional THP-hint contribution layered on top. None
+of this is controllable from `src/` or the Rust API. The one
+documentation-level improvement made here (not a code or config
+change): this section itself, recommending that a future WSL2 CKKS
+deployment on a host with persistently low free RAM should expect
+`cudaMallocHost` costs in the low-single-digit-millisecond range as
+a NORMAL floor (not a bug), with the opt-in prewarming API existing
+specifically to absorb that cost once, off the hot path, for
+applications that choose to pay it.
+
+### Step 8: regression confirmation
+
+Full Rust suite re-run from the current working tree (no production
+file touched): **debug -- 4 passed, 38 passed, 0 failed, 1 ignored
+(two empty 0-test crates); release -- identical: 4 passed, 38 passed,
+0 failed, 1 ignored.** Zero regression, as expected since no
+production or experimental source file was modified this phase.
+
+### Step 9: THP/ulimit restoration verification
+
+Trivial by construction: no system setting was ever successfully
+changed (the one write attempted was denied by the kernel itself), so
+there is nothing to restore. Final verification re-read of
+`/sys/kernel/mm/transparent_hugepage/enabled` and `/sys/kernel/mm/
+transparent_hugepage/defrag` at the end of this phase matched the
+Step 1 baseline exactly (`madvise` selected for both). `ulimit -l`
+was never touched, per the directive's explicit instruction to treat
+it as a separate confound; still 65536 KB (64MB), both soft and hard,
+unchanged.
+
+### Decision
+
+**Category 3 continues to apply, now with a partially revised
+rationale.** The dominant externally-controlled mechanism is most
+plausibly CUDA/WSL2-driver-passthrough overhead (promoted this
+phase), not purely the Linux kernel `mlock()` path (as Phase 17
+concluded with HIGH confidence -- now downgraded to MEDIUM, since
+this phase could not reproduce Phase 17's own pure-Linux variance
+under matched, interleaved, same-session conditions). A real,
+demonstrated, but narrow THP-hint effect (~5x, ~1ms-scale, exactly-
+2MiB-specific) was found and is reported as a genuine new result. No
+production or experimental code was changed. The opt-in prewarming
+API remains exactly as Phases 16/17 left it.

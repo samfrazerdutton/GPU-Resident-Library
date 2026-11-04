@@ -389,6 +389,18 @@ gpufhe_test(bench_encrypt_prewarm_workloads bench/bench_encrypt_prewarm_workload
 gpufhe_test(bench_pinned_alloc_diagnostic bench/bench_pinned_alloc_diagnostic.cpp)
 gpufhe_test(bench_pinned_alloc_diagnostic2 bench/bench_pinned_alloc_diagnostic2.cpp)
 gpufhe_test(bench_thp_diagnostic bench/bench_thp_diagnostic.cpp)
+# GOD PROMPT "CKKS PHASE 18": controlled THP experiment diagnostics.
+# The system-wide THP toggle was blocked by permissions (documented,
+# not worked around); these two standalone files instead investigate
+# the per-sample allocation-cost variables under the unchanged THP
+# setting, and the one THP-related variable controllable without
+# root (per-call madvise(MADV_HUGEPAGE/NOHUGEPAGE) hints). Neither
+# calls into gpufhe:: code -- registered purely for ctest
+# discoverability, matching this project's convention. See research/
+# TRANSFER_PROFILING.md's Phase 18 section and research/
+# EXPERIMENT_LEDGER.md entry #51.
+gpufhe_test(bench_pinned_alloc_diagnostic3 bench/bench_pinned_alloc_diagnostic3.cpp)
+gpufhe_test(bench_thp_hint_by_size bench/bench_thp_hint_by_size.cpp)
 gpufhe_test(test_mult_barrett tests/test_mult_barrett.cpp)
 # Directive "VERIFY OOM DIAGNOSIS AND REMOVE THE LARGE-N DIAGONAL
 # BOTTLENECK", Priority 3: proves an O(S*2^RST) analytic replacement for
