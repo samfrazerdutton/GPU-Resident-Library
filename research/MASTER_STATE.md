@@ -2418,3 +2418,141 @@ diagnostic experiment, not a production optimization").
   layer trace or a non-WSL2 Linux host with a directly-attached GPU
   would let hypothesis 1 (CUDA/driver overhead) be tested directly
   rather than inferred from an interleaved comparison.
+
+## GOD PROMPT "CKKS PHASE 19": mechanistically ISOLATED CUDA pinned-allocation overhead -- proven, via NVIDIA's own tracer (not comparative timing), to be dominated by `ioctl()` calls into the driver on EVERY call, not a one-time cost; `cudaHostRegister` found 1.5x-4x cheaper than `cudaMallocHost`/`cudaHostAlloc` for the full lifecycle, reproduced across 4 independent process runs
+
+Full detail: `research/TRANSFER_PROFILING.md`'s Phase 19 section and
+`EXPERIMENT_LEDGER.md` entry #52. Starting commit `91ae35f` (Phase 18
+end state), confirmed via `git log -1`/`git status`/`origin/main`
+before any change. **No production or experimental code was
+modified this round** — a pure diagnostic/investigation phase, per
+the governing directive's own framing.
+
+- **Methodology gap found in Phases 16-18's own measurements**: none
+  of them separated CUDA context initialization from the allocation
+  call being timed; none tested `cudaHostAlloc` with explicit flags
+  or `cudaHostRegister`; and critically, Phase 17/18's plain-`mlock()`-
+  vs-`cudaMallocHost` comparison compared two OPERATIONS WITH
+  DIFFERENT SEMANTICS — `mlock()` only prevents swapping, while
+  `cudaMallocHost` ALSO registers the page for GPU DMA with the
+  NVIDIA driver. Confirmed via `cudaPointerGetAttributes`: plain
+  `malloc`+`mlock()` memory reports `cudaMemoryTypeUnregistered`
+  (CUDA genuinely does not see it as pinned), while every
+  `cudaMallocHost`/`cudaHostAlloc`/`cudaHostRegister` buffer reports
+  `cudaMemoryTypeHost`. This retroactively explains why Phase 17's
+  "pure Linux reproduces the same variance" claim was unreliable
+  independent of any timing confound.
+- **New diagnostic (`bench/bench_alloc_path_comparison.cpp`)**:
+  isolates CUDA context init as its OWN Stage 0 (`cudaFree(0)`,
+  371-845ms, measured once, never leaking into any other path's
+  numbers), then compares 5 allocation paths (A: pageable malloc;
+  B: malloc+mlock pure Linux; C: `cudaMallocHost`; D:
+  `cudaHostAlloc(cudaHostAllocDefault)`; D2:
+  `cudaHostAlloc(cudaHostAllocWriteCombined)`; E: malloc+touch+
+  `cudaHostRegister`) at 4 sizes, via a fixed-order first-use pass, a
+  FIXED-SEED randomized interleaved steady-state round (10 rounds x
+  6 paths x 4 sizes = 240 samples), 20-repeat tight-loop cycles, and
+  a retained-vs-short-lived comparison — 425 individual samples per
+  run, all written to raw CSV, none discarded.
+- **Finding 1 — C and D are the SAME operation, empirically
+  confirmed**: `cudaMallocHost` and `cudaHostAlloc(cudaHostAllocDefault)`
+  are statistically indistinguishable at every size across 4
+  independent fresh-process runs, confirming CUDA's documentation
+  claim empirically rather than assuming it. `cudaHostAllocWriteCombined`
+  (D2) is ALSO indistinguishable — the flag does not change pinning
+  cost.
+- **Finding 2 — the cost is syscall-level and mechanistic, confirmed
+  by NVIDIA's own tracer (`nsys`, installed and usable WITHOUT root
+  on this system — not previously known/used in Phases 16-18)**:
+  the first `cudaMalloc` (context init) spent 86.1% of its 797ms in
+  `ioctl()` calls on the SAME calling thread (many calls, the
+  largest 122.6ms, consistent with a retry/poll pattern during
+  paravirtualized GPU-channel setup). Every subsequent
+  `cudaHostAlloc`/`cudaMallocHost` call is consistently 92-97%
+  `ioctl`-bound via exactly 4 `ioctl` calls per call. `cudaHostRegister`
+  shows the SAME structural profile (4 `ioctl` calls, 87-91% bound)
+  but each call is ~3-4x faster, yielding ~3.1x cheaper total
+  registration cost (aggregated via `nsys stats --report
+  cuda_api_sum`: `cudaHostAlloc`/`cudaMallocHost` avg 3.2ms/call vs.
+  `cudaHostRegister` avg 1.03ms/call). Release is asymmetric:
+  `cudaFreeHost` is only 26-39% `ioctl`-bound (most cost is other
+  CPU-side work), while `cudaHostUnregister` is both cheaper AND more
+  `ioctl`-bound. **This is the most mechanistically decisive finding
+  across Phases 16-19 — read directly from syscall-level trace data
+  on the same thread/window, not inferred from comparative wall-clock
+  timing.**
+- **Finding 3 — `cudaHostRegister` on pre-touched memory is 1.5x-4x
+  cheaper than `cudaMallocHost`/`cudaHostAlloc` for the FULL
+  lifecycle**, reproduced across 4 independent fresh-process runs at
+  2MiB (`cudaMallocHost`≈4822-5374us, `cudaHostAlloc`≈5094-5205us,
+  `cudaHostRegister`≈3323-3475us) and with a LARGER gap at smaller
+  sizes (256KB: `cudaHostAlloc`≈4700-5500us vs.
+  `cudaHostRegister`≈1250-2400us, 2-4x cheaper).
+- **New, unexplained-until-now finding**: plain pageable
+  `malloc`+`memset` (path A, zero pinning, zero CUDA) ALSO jumps
+  sharply at exactly 2MiB (20-66us at smaller sizes → ~1601-1650us at
+  2MiB) — demonstrating Phase 18's THP-hint effect is not specific to
+  `mlock()`/pinning at all, but a property of ordinary anonymous-
+  mapping first-touch at this kernel's huge-page size boundary. This
+  is a SEPARATE, ADDITIVE mechanism from the CUDA/`ioctl` cost (which
+  is present at EVERY size, not just 2MiB) — the two should not be
+  conflated.
+- **Tracing capability assessed honestly (directive Section 5)**:
+  `nsys` works without root; `strace`/`ltrace`/`nvprof`/`ncu` are NOT
+  installed (checked, not installed to keep this phase read-only).
+  `perf_event_paranoid=2` would likely block CPU-sampling traces, not
+  tested since CUPTI-based API/OS-runtime tracing answered the
+  question without needing it. Honesty note: the trace proves the
+  cost is `ioctl`-bound; it does NOT by itself prove WSL2
+  paravirtualization specifically (vs. ordinary native-Linux NVIDIA
+  driver `ioctl` handling) is why — no tool available here can trace
+  inside the driver or across the VM boundary. WSL2-passthrough
+  remains the best-supported hypothesis, not a directly observed
+  fact.
+- **`cudaHostRegister` evaluated as a production alternative,
+  honestly (directive Section 6/8)**: credible full-lifecycle win,
+  but NOT yet justified to ship — not tested inside the real pooled/
+  prewarmed production paths, not re-verified for correctness/
+  concurrency, not re-measured on the full pipeline, repeated-
+  registration behavior not tested, large-retained-pool behavior near
+  the 64MB `RLIMIT_MEMLOCK` cap not stress-tested. Recommended next
+  phase: prototype the substitution inside `src/encrypt_host_shoup_
+  pooled_barrett_batched_pinned.cpp`/the Phase 16 prewarming API,
+  re-verify from scratch, re-run the full-pipeline benchmark, THEN
+  decide.
+- **CMake/CTest registration audit (directive Section 7)**: found
+  `gpufhe_test`'s `add_test(...)` call means every Phase 16-18
+  pinned-memory/THP diagnostic (6 targets) is auto-picked-up by a
+  plain `ctest` run, indistinguishable from a real correctness test —
+  not yet a real incident (this project's regression gate has been
+  `cargo test`, not `ctest`, throughout), but a latent landmine.
+  **Fix**: new `gpufhe_benchmark(name src)` CMake function (same
+  build target, no `add_test`) — still buildable/runnable directly,
+  never auto-run by `ctest`. Applied to all 6 Phase 16-18 targets plus
+  this phase's new `bench_alloc_path_comparison`. Deliberately NOT
+  applied to other pre-existing `bench_*` targets elsewhere in the
+  file (same latent characteristic likely applies, but auditing the
+  entire project's benchmark history is out of this investigation's
+  scope — flagged, not fixed, consistent with this project's Phase 10
+  precedent).
+- **Decision: no production or experimental code change this phase,
+  by design.** The dominant mechanism is now mechanistically
+  demonstrated (syscall-level, every call, not one-time). A credible
+  alternative (`cudaHostRegister`) was identified but not implemented.
+  THP/driver/`ulimit -l`/`.wslconfig` settings were never read-write
+  touched — only already-established values re-read. Windows host
+  free RAM 1.41-1.53GB throughout (measured via `Get-CimInstance`),
+  n=131072's ≥6GiB gate never met, never attempted; no allocation
+  exceeded 2MiB, no retained total exceeded ~3.75MB.
+- **Regression**: confirmed via `git status`/`git diff` that only the
+  new `bench/bench_alloc_path_comparison.cpp` file and `CMakeLists.txt`
+  (the new function plus 7 registrations switched to it) changed —
+  no production or experimental source file touched. Full Rust suite
+  re-confirmed unaffected: 4 passed + 38 passed, 0 failed, 1 ignored
+  (pre-existing `control_a_relin_combine_matches_raw_tensor_num_part_1_test`,
+  unrelated, status unchanged), both debug and release.
+- **Next recommended experiment**: implementation-focused, not further
+  diagnosis — prototype `cudaHostRegister` inside the real production
+  pinned/prewarmed code paths, re-verify correctness and concurrency
+  from scratch, re-run the full-pipeline benchmark, and only then
+  decide whether to ship it.

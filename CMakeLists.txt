@@ -99,6 +99,38 @@ function(gpufhe_test name src)
   add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
+# GOD PROMPT "CKKS PHASE 19": `gpufhe_test`'s `add_test(...)` call means
+# EVERY target registered with it -- including pure timing/benchmark
+# diagnostics, not just pass/fail correctness tests -- is automatically
+# picked up by a plain `ctest` run. In practice this project's actual
+# regression gate has been the Rust suite (`cargo test`), not a full
+# `ctest` run (gated out by this machine's persistent host-memory
+# constraint; see research/TRANSFER_PROFILING.md), so this has not yet
+# caused a real "ctest reports noise as a failure" incident. But it is
+# a real latent landmine: a future `ctest` run would silently execute
+# every pinned-memory/THP timing diagnostic (several seconds each,
+# none of them a correctness check) as if it were an ordinary test.
+# `gpufhe_benchmark` is the SAME build-target setup as `gpufhe_test`,
+# minus the `add_test(...)` call -- the binary still builds normally
+# and can still be run directly or via `cmake --build . --target
+# <name>`, it simply is not registered with CTest at all, so it can
+# never be silently absorbed into a `ctest` regression run. This is
+# deliberately NOT applied retroactively to every other `bench_*`
+# target in this file (several pre-date this phase and are out of this
+# investigation's scope); see research/TRANSFER_PROFILING.md's Phase
+# 19 section for the full audit and why the fix is scoped this way.
+function(gpufhe_benchmark name src)
+  add_executable(${name} ${src})
+  find_package(CUDAToolkit REQUIRED)
+  target_link_libraries(${name} PRIVATE gpufhe CUDA::cudart)
+  target_include_directories(${name} PRIVATE
+    /usr/local/include/openfhe
+    /usr/local/include/openfhe/pke
+    /usr/local/include/openfhe/core
+    /usr/local/include/openfhe/binfhe)
+  target_link_libraries(${name} PRIVATE OPENFHEpke OPENFHEcore)
+endfunction()
+
 gpufhe_test(test_ntt_resident tests/test_ntt_resident.cpp)
 gpufhe_test(test_ntt_towers tests/test_ntt_towers.cpp)
 gpufhe_test(test_intt_towers tests/test_intt_towers.cpp)
@@ -376,31 +408,47 @@ gpufhe_test(bench_encrypt_phase15_pinned_vs_batched bench/bench_encrypt_phase15_
 # steady-state latency, and the three workload-profile comparisons
 # (cold-start/typical/long-lived) the decision in research/
 # TRANSFER_PROFILING.md's Phase 16 section is based on.
-gpufhe_test(bench_encrypt_prewarm_workloads bench/bench_encrypt_prewarm_workloads.cpp)
+# GOD PROMPT "CKKS PHASE 19" audited this whole pinned-memory/THP
+# diagnostic cluster (Phases 16-19) and found every one of them was
+# registered via `gpufhe_test`, which calls `add_test(...)` -- meaning
+# a plain `ctest` run would silently execute these multi-second timing
+# benchmarks as if they were pass/fail correctness tests. Switched
+# the whole cluster to `gpufhe_benchmark` (same build target, no
+# `add_test`): still buildable and runnable directly or via `cmake
+# --build . --target <name>`, but never picked up by `ctest`. See
+# research/TRANSFER_PROFILING.md's Phase 19 section for the full audit
+# (this fix is deliberately scoped to this cluster only -- other
+# pre-existing `bench_*` targets elsewhere in this file are left
+# unchanged, out of this investigation's scope).
+gpufhe_benchmark(bench_encrypt_prewarm_workloads bench/bench_encrypt_prewarm_workloads.cpp)
 # GOD PROMPT "CKKS PHASE 17": pure diagnostic instruments for the
 # allocation-cost variance Phase 16 found but could not explain. None
 # of these call into gpufhe:: code at all (pure CUDA/Linux allocator
-# timing) -- registered here purely for ctest discoverability and
-# reproducibility, matching this project's established convention of
-# registering every bench/test file. See research/
+# timing). See research/
 # TRANSFER_PROFILING.md's Phase 17 section and research/
 # EXPERIMENT_LEDGER.md entry #50 for the full investigation and
 # ranked root-cause assessment.
-gpufhe_test(bench_pinned_alloc_diagnostic bench/bench_pinned_alloc_diagnostic.cpp)
-gpufhe_test(bench_pinned_alloc_diagnostic2 bench/bench_pinned_alloc_diagnostic2.cpp)
-gpufhe_test(bench_thp_diagnostic bench/bench_thp_diagnostic.cpp)
+gpufhe_benchmark(bench_pinned_alloc_diagnostic bench/bench_pinned_alloc_diagnostic.cpp)
+gpufhe_benchmark(bench_pinned_alloc_diagnostic2 bench/bench_pinned_alloc_diagnostic2.cpp)
+gpufhe_benchmark(bench_thp_diagnostic bench/bench_thp_diagnostic.cpp)
 # GOD PROMPT "CKKS PHASE 18": controlled THP experiment diagnostics.
 # The system-wide THP toggle was blocked by permissions (documented,
 # not worked around); these two standalone files instead investigate
 # the per-sample allocation-cost variables under the unchanged THP
 # setting, and the one THP-related variable controllable without
 # root (per-call madvise(MADV_HUGEPAGE/NOHUGEPAGE) hints). Neither
-# calls into gpufhe:: code -- registered purely for ctest
-# discoverability, matching this project's convention. See research/
+# calls into gpufhe:: code. See research/
 # TRANSFER_PROFILING.md's Phase 18 section and research/
 # EXPERIMENT_LEDGER.md entry #51.
-gpufhe_test(bench_pinned_alloc_diagnostic3 bench/bench_pinned_alloc_diagnostic3.cpp)
-gpufhe_test(bench_thp_hint_by_size bench/bench_thp_hint_by_size.cpp)
+gpufhe_benchmark(bench_pinned_alloc_diagnostic3 bench/bench_pinned_alloc_diagnostic3.cpp)
+gpufhe_benchmark(bench_thp_hint_by_size bench/bench_thp_hint_by_size.cpp)
+# GOD PROMPT "CKKS PHASE 19": controlled A-E host-allocation-path
+# comparison (pageable malloc, pure-Linux mlock, cudaMallocHost,
+# cudaHostAlloc with two documented flag variants, cudaHostRegister),
+# with CUDA context initialization isolated as its own stage. Does
+# not call into gpufhe:: code. See research/TRANSFER_PROFILING.md's
+# Phase 19 section and research/EXPERIMENT_LEDGER.md entry #52.
+gpufhe_benchmark(bench_alloc_path_comparison bench/bench_alloc_path_comparison.cpp)
 gpufhe_test(test_mult_barrett tests/test_mult_barrett.cpp)
 # Directive "VERIFY OOM DIAGNOSIS AND REMOVE THE LARGE-N DIAGONAL
 # BOTTLENECK", Priority 3: proves an O(S*2^RST) analytic replacement for

@@ -3,7 +3,46 @@
 ## Current commit
 
 Check `git log -3` on resume. As of this writing, HEAD is a new commit
-on top of entry #50's commit `ff81b97` (the GOD PROMPT "CKKS PHASE 18"
+on top of entry #51's commit `91ae35f` (the GOD PROMPT "CKKS PHASE 19"
+round: an INVESTIGATION phase, no production or experimental code
+changed. Mechanistically ISOLATED the cause of Phases 16-18's
+allocation-cost variance using a new comparison diagnostic
+(`bench/bench_alloc_path_comparison.cpp`, 5 allocation paths x 4
+sizes, CUDA context init isolated as its own stage, randomized
+fixed-seed interleaved steady-state rounds, 425 samples/run, raw CSV)
+plus `nsys` (NVIDIA Nsight Systems, installed and usable WITHOUT root
+on this system -- not previously known/used). **Decisive finding**:
+87-97% of every `cudaHostAlloc`/`cudaMallocHost` call's wall-clock
+time is spent inside `ioctl()` syscalls into the NVIDIA driver, on
+the SAME calling thread, confirmed by querying `nsys`'s own exported
+SQLite trace directly -- not inferred from comparative timing, as
+every prior phase's conclusions were. `cudaMallocHost` and
+`cudaHostAlloc(cudaHostAllocDefault)` are statistically
+indistinguishable (confirms CUDA's documentation empirically).
+`cudaHostRegister` on pre-touched memory is 1.5x-4x CHEAPER than
+`cudaMallocHost`/`cudaHostAlloc` for the full lifecycle, reproduced
+across 4 independent fresh-process runs, and shows the SAME `ioctl`-
+bound profile but ~3x faster per call. A separate, new finding: plain
+pageable `malloc`+`memset` (zero pinning, zero CUDA) ALSO jumps
+sharply at exactly 2MiB -- Phase 18's THP-hint effect generalizes
+beyond `mlock()`/pinning entirely, to ordinary anonymous-mapping
+first-touch at the huge-page size boundary (a separate, additive
+mechanism from the CUDA/`ioctl` cost). Also audited the CMake
+`gpufhe_test` macro (it auto-registers every target with `ctest`,
+including pure timing diagnostics) and added a `gpufhe_benchmark`
+function (same build target, no `add_test`) for the whole Phase
+16-19 pinned-memory/THP diagnostic cluster. **No production or
+experimental code was changed** -- `cudaHostRegister` is a credible,
+well-evidenced alternative, but NOT yet implemented/verified inside
+the real production pooled/prewarmed code paths; that is the
+explicitly recommended next step. See `EXPERIMENT_LEDGER.md` entry
+#52 and `research/TRANSFER_PROFILING.md`'s Phase 19 section for full
+detail.
+
+## Earlier commit (Phase 18)
+
+HEAD was previously a commit on top of entry #50's commit `ff81b97`
+(the GOD PROMPT "CKKS PHASE 18"
 round: a CONTROLLED DIAGNOSTIC experiment, no production or
 experimental code changed. The system-wide THP toggle
 (`/sys/kernel/mm/transparent_hugepage/enabled`) is BLOCKED BY
@@ -16,43 +55,17 @@ one THP variable controllable without root (per-call
 but narrow effect: a consistent ~5x `mlock()` slowdown specific to
 EXACTLY 2MiB allocations when the hugepage hint is disabled (absent at
 256KB/512KB/1MB). More importantly, a same-session INTERLEAVED
-re-test directly CONTRADICTS Phase 17's own HIGH-confidence "pure
+re-test directly CONTRADICTED Phase 17's own HIGH-confidence "pure
 Linux `mlock()` reproduces the same variance as `cudaMallocHost`, so
-it's not CUDA-specific" conclusion -- pure Linux `mlock()` was clean
-and fast (174-1613us) while `cudaMallocHost`, interleaved in the same
-window for the identical size, remained consistently 2984-5079us.
-Phase 17's conclusion is now explicitly REVISED: CUDA/WSL2-driver-
-passthrough overhead is promoted to the leading hypothesis
-(MEDIUM-HIGH confidence); the pure-kernel-`mlock()` explanation is
-downgraded to MEDIUM (demonstrated once, not reproduced under matched
-conditions this phase). Decision: category 3 continues -- no
-production or config change justified; Phase 16's opt-in design
-stands, now on a partially revised rationale. THP settings and
-`ulimit -l` verified unchanged throughout (trivially, since no write
-ever succeeded). See `EXPERIMENT_LEDGER.md` entry #51 and `research/
+it's not CUDA-specific" conclusion -- **Phase 19's mechanistic
+`ioctl`-level trace (see "Current commit" above) has since confirmed
+directly why this comparison was never valid: `mlock()` and
+`cudaMallocHost` are not equivalent operations.** Decision at the
+time: category 3 continues -- no production or config change
+justified; Phase 16's opt-in design stands (this decision itself
+still stands). THP settings and `ulimit -l` verified unchanged
+throughout. See `EXPERIMENT_LEDGER.md` entry #51 and `research/
 TRANSFER_PROFILING.md`'s Phase 18 section for full detail.
-
-## Earlier commit (Phase 17)
-
-HEAD was previously a commit on top of entry #49's commit `baee7a1`
-(the GOD PROMPT "CKKS PHASE 17"
-round: a PURE DIAGNOSTIC investigation, no production or experimental
-code changed. Found a real methodology flaw in Phase 16's own "prewarm
-cost" measurement (it bundled 5 separate CUDA calls into one timed
-number) and built 3 properly-separated diagnostics instead. The
-headline finding at the time: the SAME allocation-cost variance Phase
-16 found (microseconds to several milliseconds) appeared to reproduce
-with a PURE Linux `mmap`+`madvise`+`mlock` test using ZERO CUDA code --
-**this specific conclusion was REVISED by Phase 18's same-session
-interleaved re-test; see the "Current commit" section above and
-`research/TRANSFER_PROFILING.md`'s Phase 18 section**. Decision at the
-time: category 3 -- the variance is externally controlled, now
-DEMONSTRATED rather than merely suspected, so Phase 16's opt-in design
-remains exactly as it was (this decision itself still stands, only the
-"not CUDA-specific" framing was revised). No `.wslconfig` change, no
-WSL restart, nothing system-level was modified. See
-`EXPERIMENT_LEDGER.md` entry #50 and `research/TRANSFER_PROFILING.md`'s
-Phase 17 section for full detail.
 Confirm push status -- push again if `git status` shows ahead of
 origin.
 
@@ -65,7 +78,63 @@ an entirely unrelated commit history (raw CUDA-kernel-optimization
 work) and untracked, stale copies of `rust/`/`research/` -- never run
 `git status`/`log`/commit decisions against it for this work.
 
-## READ THIS FIRST if resuming into pinned-memory/THP work: the system-wide THP toggle is BLOCKED BY PERMISSIONS (documented, not worked around); a real but narrow ~5x THP-hint effect exists at exactly 2MiB; Phase 17's "not CUDA-specific" conclusion is REVISED -- CUDA/WSL2-driver overhead is now the leading hypothesis
+## READ THIS FIRST if resuming into pinned-memory work: the root mechanism is now PROVEN (`ioctl()`-bound, every call, via NVIDIA's own tracer) -- `cudaHostRegister` is a credible, well-evidenced, NOT-YET-IMPLEMENTED alternative worth prototyping next
+
+**Phase 19's core result**: built a new controlled comparison
+(`bench/bench_alloc_path_comparison.cpp`: pageable malloc, pure-Linux
+`mlock`, `cudaMallocHost`, `cudaHostAlloc` with two documented flags,
+`cudaHostRegister` -- 5 paths x 4 sizes, CUDA context init isolated
+as its own stage, fixed-seed randomized interleaving, 425 samples/run
+in raw CSV, reproduced across 4 independent fresh-process runs) and
+profiled it with `nsys` (NVIDIA Nsight Systems -- installed and
+usable WITHOUT root on this system; not previously known/used in
+Phases 16-18).
+
+**Mechanistic proof, not comparative inference**: querying `nsys`'s
+own exported SQLite trace directly (restricted to the single
+CUDA-calling thread) shows 87-97% of every `cudaHostAlloc`/
+`cudaMallocHost` call's wall-clock time is spent inside `ioctl()`
+syscalls into the NVIDIA driver -- 4 `ioctl` calls per call, every
+time, not a one-time cost. The very first `cudaMalloc` (CUDA context
+init, 371-845ms, now cleanly isolated as its own stage so it never
+contaminates any other measurement) is 86% `ioctl`-bound too, via
+many calls in a retry/poll-like pattern.
+
+**`cudaMallocHost` and `cudaHostAlloc(cudaHostAllocDefault)` are
+confirmed the SAME operation** (statistically indistinguishable at
+every size, across 4 runs) -- CUDA's documentation claim, now
+verified empirically rather than assumed.
+
+**This also retroactively explains Phase 17/18's `mlock()` confusion**:
+`cudaPointerGetAttributes` confirms plain `malloc`+`mlock()` memory
+is `cudaMemoryTypeUnregistered` -- CUDA genuinely does not consider it
+pinned. `mlock()` and `cudaMallocHost` were never comparable
+operations; Phase 17's "pure Linux reproduces the variance" claim was
+unreliable independent of any timing confound.
+
+**The practically useful finding**: `cudaHostRegister` on
+already-allocated, already-touched memory is 1.5x-4x CHEAPER than
+`cudaMallocHost`/`cudaHostAlloc` for the FULL lifecycle (alloc+touch+
+pin+unpin+free), reproduced across all 4 fresh-process runs, and
+shows the identical `ioctl`-bound mechanism but ~3x faster per call
+(`nsys`-confirmed: ~1.03ms/call vs. ~3.2ms/call). **No production
+code was changed this phase, by design** -- this is a credible,
+well-evidenced DIAGNOSTIC finding, not yet implemented or
+correctness-verified inside the real pooled/prewarmed production
+paths. **The clearest next step, if this is revisited, is to
+prototype substituting `cudaHostRegister` for `cudaHostAlloc`/
+`cudaMallocHost` inside `src/encrypt_host_shoup_pooled_barrett_
+batched_pinned.cpp` and the Phase 16 prewarming API, re-verify
+bit-exact correctness and concurrency safety from scratch, and
+re-run the full-pipeline benchmark before deciding whether to ship
+it.** Also found, separately: plain pageable `malloc`+`memset` (zero
+CUDA, zero pinning) jumps sharply at exactly 2MiB too -- the THP
+effect Phase 18 found is not pinning-specific, it is a property of
+ordinary anonymous-mapping first-touch at the huge-page boundary (an
+ADDITIVE, separate mechanism from the CUDA/`ioctl` cost). Full
+detail: `research/TRANSFER_PROFILING.md`'s Phase 19 section.
+
+## READ THIS SECOND if resuming into pinned-memory/THP work: the system-wide THP toggle is BLOCKED BY PERMISSIONS (documented, not worked around); a real but narrow ~5x THP-hint effect exists at exactly 2MiB; Phase 17's "not CUDA-specific" conclusion was REVISED -- see Phase 19 above for the mechanistic proof of why
 
 **Phase 18's core result**: attempted the originally-planned
 controlled THP experiment (THP=madvise vs. THP=disabled vs. restored).
@@ -111,7 +180,7 @@ planned system-wide A/B/C THP comparison, or a GPU-passthrough-layer
 trace to test the CUDA/driver hypothesis directly. Full detail:
 `research/TRANSFER_PROFILING.md`'s Phase 18 section.
 
-## READ THIS SECOND if resuming into pinned-memory work: the allocation-cost variance was EXPLORED (Linux kernel mlock() path vs. CUDA/driver overhead -- see Phase 18 above for the revision), the Phase 16 decision stands, and a WSL2-ballooning claim from Phase 16 has been downgraded to "not confirmed"
+## READ THIS THIRD if resuming into pinned-memory work: the allocation-cost variance was EXPLORED (Linux kernel mlock() path vs. CUDA/driver overhead -- see Phase 19 above for the mechanistic proof), the Phase 16 decision stands, and a WSL2-ballooning claim from Phase 16 has been downgraded to "not confirmed"
 
 **Phase 17's core result**: Phase 16 found `cudaMallocHost`'s cost
 varies wildly (16us-5.9ms) and guessed, without evidence, that WSL2
@@ -147,7 +216,7 @@ or a controlled, reversible test of disabling Transparent Huge Pages
 to see if that is a necessary ingredient. Full detail: `research/
 TRANSFER_PROFILING.md`'s Phase 17 section.
 
-## READ THIS THIRD if resuming into performance work: a pinned-memory PREWARMING API exists, fully correct and concurrency-safe, but was NOT promoted because its own allocation cost is unpredictable in this environment
+## READ THIS FOURTH if resuming into performance work: a pinned-memory PREWARMING API exists, fully correct and concurrency-safe, but was NOT promoted because its own allocation cost is unpredictable in this environment
 
 **Phase 16's core result**: `encrypt_prewarm_pinned_buffer(n,sizeQ)` /
 `encrypt_pinned_buffer_is_ready(n,sizeQ)` / `encrypt_host_shoup_
@@ -181,7 +250,7 @@ accepting the risk explicitly for a specific, named long-lived-service
 deployment where Profile C's unconditional win is what matters.** Full
 detail: `research/TRANSFER_PROFILING.md`'s Phase 16 section.
 
-## READ THIS FOURTH if resuming into performance work on the OLDER (Phase 15) material: transfer batching is DONE and shipped; a pinned-memory follow-up was built, verified, measured FASTER in isolation, then found to be a net loss for real usage and correctly NOT shipped
+## READ THIS FIFTH if resuming into performance work on the OLDER (Phase 15) material: transfer batching is DONE and shipped; a pinned-memory follow-up was built, verified, measured FASTER in isolation, then found to be a net loss for real usage and correctly NOT shipped
 
 **Phase 15's core result**: `encrypt_host_shoup_pooled_barrett_batched`
 (`src/encrypt_host_shoup_pooled_barrett_batched.cpp`) is now the actual
