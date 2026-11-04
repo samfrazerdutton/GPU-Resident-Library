@@ -49,6 +49,7 @@ add_library(gpufhe STATIC
   src/encrypt_host_shoup_pooled_barrett.cpp
   src/encrypt_host_shoup_pooled_barrett_batched.cpp
   src/encrypt_host_shoup_pooled_barrett_batched_pinned.cpp
+  src/encrypt_host_shoup_pooled_barrett_prewarm.cpp
   src/rotate.cpp
   src/ptops.cpp
   src/params.cpp
@@ -175,6 +176,16 @@ gpufhe_test(test_encrypt_host_shoup_pooled_barrett_batched_matches_reference tes
 gpufhe_test(test_encrypt_host_shoup_pooled_barrett_batched_concurrency_audit tests/test_encrypt_host_shoup_pooled_barrett_batched_concurrency_audit.cpp)
 gpufhe_test(test_encrypt_host_shoup_pooled_barrett_batched_pinned_matches_reference tests/test_encrypt_host_shoup_pooled_barrett_batched_pinned_matches_reference.cpp)
 gpufhe_test(test_encrypt_host_shoup_pooled_barrett_batched_pinned_concurrency_audit tests/test_encrypt_host_shoup_pooled_barrett_batched_pinned_concurrency_audit.cpp)
+# GOD PROMPT "CKKS PHASE 16": correctness + lifecycle/concurrency tests
+# for the explicit pinned-memory PREWARMING API (encrypt_prewarm_
+# pinned_buffer/encrypt_pinned_buffer_is_ready/encrypt_host_shoup_
+# pooled_barrett_prewarmed). RETAINED AS AN OPT-IN EXPERIMENTAL
+# FEATURE, NOT promoted to production and NOT wired into the Rust FFI
+# bridge this round -- see research/TRANSFER_PROFILING.md's Phase 16
+# section and research/EXPERIMENT_LEDGER.md entry #49 for the full
+# workload-level decision.
+gpufhe_test(test_encrypt_host_prewarm_matches_reference tests/test_encrypt_host_prewarm_matches_reference.cpp)
+gpufhe_test(test_encrypt_host_prewarm_concurrency_audit tests/test_encrypt_host_prewarm_concurrency_audit.cpp)
 gpufhe_test(test_keygen tests/test_keygen.cpp)
 gpufhe_test(test_evalkeygen tests/test_evalkeygen.cpp)
 # GOD PROMPT "CKKS PHASE 8": fully native (OpenFHE-free) isolation of
@@ -360,6 +371,12 @@ gpufhe_test(bench_encrypt_phase14_all_variants bench/bench_encrypt_phase14_all_v
 # research/EXPERIMENT_LEDGER.md entry #48.
 gpufhe_test(bench_encrypt_phase15_all_variants bench/bench_encrypt_phase15_all_variants.cpp)
 gpufhe_test(bench_encrypt_phase15_pinned_vs_batched bench/bench_encrypt_phase15_pinned_vs_batched.cpp)
+# GOD PROMPT "CKKS PHASE 16": workload-level benchmark for the
+# prewarming API -- context-creation/prewarm cost, first-operation and
+# steady-state latency, and the three workload-profile comparisons
+# (cold-start/typical/long-lived) the decision in research/
+# TRANSFER_PROFILING.md's Phase 16 section is based on.
+gpufhe_test(bench_encrypt_prewarm_workloads bench/bench_encrypt_prewarm_workloads.cpp)
 gpufhe_test(test_mult_barrett tests/test_mult_barrett.cpp)
 # Directive "VERIFY OOM DIAGNOSIS AND REMOVE THE LARGE-N DIAGONAL
 # BOTTLENECK", Priority 3: proves an O(S*2^RST) analytic replacement for

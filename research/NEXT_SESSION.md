@@ -3,24 +3,29 @@
 ## Current commit
 
 Check `git log -3` on resume. As of this writing, HEAD is a new commit
-on top of entry #47's commit `7ea73fd` (the GOD PROMPT "CKKS PHASE 15"
-round: merged encrypt_host's 8 separate H2D/D2H transfer calls into 2
-over one packed buffer, same kernel-launch logic unchanged -- 1.07x-
-1.17x faster than Phase 14 alone, 1.57x-2.78x faster than the original
-encrypt_host. ALSO built and fully verified a second experiment, pinned
-host staging memory, which looked even better in an isolated,
-warmed-up benchmark (1.06x-1.17x further speedup) -- but the full-
-pipeline benchmark's cold single-call measurement exposed the OPPOSITE
-result, root-caused to `cudaMallocHost` costing ~3-8ms per distinct
-(n,sizeQ) key (more than encrypt_host's entire typical latency), making
-it a net loss for low-repetition usage. Correctly NOT integrated into
-production per the directive's own instruction, kept in the repo as a
-documented experiment. Zero correctness regression either way. The old
-`encrypt_host_shoup_pooled_barrett` (Phase 14) and `encrypt_host`
-(Phase 11) both remain fully present, tested, and reachable as
-reference/fallback. See `EXPERIMENT_LEDGER.md` entry #48 and `research/
-TRANSFER_PROFILING.md` for full detail). Confirm push status -- push
-again if `git status` shows ahead of origin.
+on top of entry #48's commit `69d307a` (the GOD PROMPT "CKKS PHASE 16"
+round: built and proved correct/concurrency-safe an EXPLICIT pinned-
+memory PREWARMING API (`encrypt_prewarm_pinned_buffer`/
+`encrypt_pinned_buffer_is_ready`/`encrypt_host_shoup_pooled_barrett_
+prewarmed`), directly following up on Phase 15's closing
+recommendation. Found a genuinely unexpected, reproducible result: the
+one-time `cudaMallocHost` cost is NOT simply a function of buffer size
+in this environment -- it ranged from 16us to 5.9ms depending on `n`,
+consistently, across two independent full runs -- making the break-
+even point for prewarming unpredictable for short workloads. Profile C
+(long-lived, many repeated calls) wins unconditionally; Profiles A/B
+(cold-start/typical) are mixed. Per the decision gate, this was
+RETAINED AS AN OPT-IN EXPERIMENTAL C++ FEATURE, NOT promoted to
+production and NOT wired into the Rust API or FFI bridge this round --
+the implementation is fully correct and concurrency-safe (0/372
+mismatches across 5 runs, 6 lifecycle scenarios), but its performance
+benefit depends on allocation-cost variance the library cannot predict
+or control. `encrypt_host_shoup_pooled_barrett_batched` (Phase 15,
+pageable, production) and every earlier phase's implementation remain
+completely unchanged. See `EXPERIMENT_LEDGER.md` entry #49 and
+`research/TRANSFER_PROFILING.md`'s Phase 16 section for full detail).
+Confirm push status -- push again if `git status` shows ahead of
+origin.
 
 **Reminder, confirmed the hard way in an earlier round**: this machine
 has (at least) two SEPARATE git clones of this GitHub repo -- the WSL
@@ -31,7 +36,41 @@ an entirely unrelated commit history (raw CUDA-kernel-optimization
 work) and untracked, stale copies of `rust/`/`research/` -- never run
 `git status`/`log`/commit decisions against it for this work.
 
-## READ THIS FIRST if resuming into performance work: transfer batching is DONE and shipped; a pinned-memory follow-up was built, verified, measured FASTER in isolation, then found to be a net loss for real usage and correctly NOT shipped -- read this before re-attempting pinned memory
+## READ THIS FIRST if resuming into performance work: a pinned-memory PREWARMING API now exists, fully correct and concurrency-safe, but was NOT promoted because its own allocation cost is unpredictable in this environment -- read this before re-attempting pinned memory work
+
+**Phase 16's core result**: `encrypt_prewarm_pinned_buffer(n,sizeQ)` /
+`encrypt_pinned_buffer_is_ready(n,sizeQ)` / `encrypt_host_shoup_
+pooled_barrett_prewarmed(...)` (`src/encrypt_host_shoup_pooled_
+barrett_prewarm.cpp`) exist, are bit-exact correct, and are
+concurrency-safe (0/372 mismatches across 5 independent runs covering
+6 lifecycle scenarios: same-key/different-key concurrent prewarm,
+simultaneous encrypt at a prewarmed key, prewarm/encrypt interleaved on
+a fresh key, 200-cycle longevity, mixed shared-key race). An
+application that never calls `encrypt_prewarm_pinned_buffer` pays
+NOTHING extra and behaves exactly like today's production path
+(`encrypt_host_shoup_pooled_barrett_batched`, unchanged).
+
+**Why it was NOT promoted**: a workload-level benchmark
+(`bench/bench_encrypt_prewarm_workloads.cpp`) found the one-time
+`cudaMallocHost` cost ITSELF is unpredictable -- n=1024/8192
+consistently cost several milliseconds while n=2048/4096 consistently
+cost under 20 microseconds, reproduced across two independent full
+runs in the same order, plausibly tied to this session's own host-
+memory pressure interacting with WSL2's dynamic-memory ballooning
+(NOT independently confirmed -- no WSL2 VM memory-ballooning trace
+tool was available to verify the mechanism directly). This makes the
+prewarm/no-prewarm break-even point itself unpredictable for short
+workloads (Profile A: cold-start, 1-3 ops; Profile B: typical, 20 ops
+-- both MIXED, winning or losing depending on which allocation-cost
+regime a given key happens to land in). Only Profile C (long-lived,
+500-5000 ops) wins unconditionally at every tested n. **Do not
+re-promote this to production without either (a) getting real
+visibility into the allocation-cost variance's root cause, or (b)
+accepting the risk explicitly for a specific, named long-lived-service
+deployment where Profile C's unconditional win is what matters.** Full
+detail: `research/TRANSFER_PROFILING.md`'s Phase 16 section.
+
+## READ THIS NEXT if resuming into performance work on the OLDER (Phase 15) material: transfer batching is DONE and shipped; a pinned-memory follow-up was built, verified, measured FASTER in isolation, then found to be a net loss for real usage and correctly NOT shipped
 
 **Phase 15's core result**: `encrypt_host_shoup_pooled_barrett_batched`
 (`src/encrypt_host_shoup_pooled_barrett_batched.cpp`) is now the actual

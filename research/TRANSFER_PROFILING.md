@@ -272,3 +272,237 @@ context-creation time (when a one-time cost is expected and acceptable)
 rather than lazily on the first real encryption call, which would let
 production capture the proven 1.06x-1.17x steady-state win without the
 cold-start regression risk this round identified.
+
+## Phase 16: explicit pinned-memory prewarming -- built, proven correct and safe, measured honestly, RETAINED AS AN OPT-IN EXPERIMENTAL FEATURE (not promoted)
+
+GOD PROMPT "CKKS PHASE 16". Starting commit `69d307a` (Phase 15 end
+state), confirmed via `git log -1` and `origin/main` before any change.
+This section directly follows up on Phase 15's closing recommendation
+above.
+
+### Verified starting state
+
+Re-read the actual repository rather than trusting the prior report:
+confirmed `cpp_bridge/encdec_bridge.cpp`'s `gpufhe_encrypt` calls
+`encrypt_host_shoup_pooled_barrett_batched` (the pageable production
+path, NOT the pinned experiment) -- Phase 15's report was accurate.
+Re-read `src/encrypt_host_shoup_pooled_barrett_batched_pinned.cpp` in
+full: its pinned buffer is allocated LAZILY on first use, keyed by
+`(n,sizeQ)`, in a process-lifetime `std::map` protected by one
+`std::mutex` that serializes the entire encrypt call; there is no
+explicit cleanup/destroy anywhere in this codebase's pooling pattern
+(every cache -- `enc_dev_tab`, `KROT`/`KSC`, every Phase 13-15 buffer
+pool -- lives for the process lifetime, bounded only by the number of
+distinct keys actually used).
+
+### Lifecycle design (directive Step 2, decided BEFORE implementation)
+
+```
+1. Caller (anywhere -- no Rust-level "context" object touches
+   encrypt_host today) optionally calls
+   encrypt_prewarm_pinned_buffer(n, sizeQ).
+2. That call allocates (or confirms already-allocated) the pinned
+   host + device packed buffers for exactly this (n,sizeQ), checking
+   EVERY CUDA allocation's return code (a deliberate, narrow exception
+   to this codebase's otherwise-universal "don't check CUDA errors"
+   convention, justified because this function's entire contract is
+   about failure-safety). Returns true iff a FULLY valid buffer is
+   now available.
+3. encrypt_pinned_buffer_is_ready(n, sizeQ) lets a caller query
+   status without allocating.
+4. encrypt_host_shoup_pooled_barrett_prewarmed(...) is the adaptive
+   encrypt call: it checks readiness FIRST. If ready, it uses the
+   pinned path (identical arithmetic to Phase 15's pinned experiment).
+   If NOT ready (prewarm never called, or it failed), it transparently
+   defers to the UNMODIFIED, already-production
+   encrypt_host_shoup_pooled_barrett_batched -- never attempting its
+   own lazy pinned allocation. An application that never calls
+   encrypt_prewarm_pinned_buffer pays NOTHING extra and behaves
+   EXACTLY like today's production path -- ordinary use is not made
+   unexpectedly expensive.
+5. A failed prewarm (any one of the 5 allocation calls failing) rolls
+   back whatever subset succeeded and marks the entry not-ready BEFORE
+   it is ever inserted into the cache -- there is no code path that
+   can leave encryption able to observe, let alone use, a half-
+   initialized buffer.
+6. No explicit "destroy" exists, by design, matching every other
+   resource in this codebase (see "Verified starting state" above).
+```
+
+**Ownership model chosen**: a SHARED, PROCESS-LEVEL pool keyed by
+`(n,sizeQ)` -- the SAME model every other cache in this codebase
+already uses. This C++ layer has no per-context object for
+`encrypt_host` to begin with (Rust's `EvalMultContext`/
+`KeySwitchContext` are a separate crate layer that never touches
+`encrypt_host`), so introducing a NEW per-context ownership model here
+would be a bigger, less consistent, and riskier change than reusing
+the architecture that already exists -- exactly what the directive's
+"do not introduce a new global ownership model merely for
+convenience" steers away from in the other direction (toward reusing
+what exists). Multiple concurrent "contexts" at the same `(n,sizeQ)`
+safely SHARE one prewarmed buffer, identically to how every earlier
+phase's device pool is already shared and already proven safe.
+
+### Correctness (directive Step 3/7)
+
+`tests/test_encrypt_host_prewarm_matches_reference.cpp`: bit-exact vs.
+the untouched `encrypt_host` across BOTH code paths this new function
+can take -- (a) the fallback path (no prewarm ever requested, every
+`(n,sizeQ)` x message pattern tested, confirmed each key starts
+NOT-ready before the test exercises it) and (b) the prewarmed path
+(explicit prewarm requested first, confirmed ready, then encrypted,
+across the same n/sizeQ/message matrix PLUS idempotency -- prewarming
+twice must not fail or reallocate -- and a 10-call pool-reuse stress).
+**Every case: EXACT MATCH.**
+
+### Concurrency and lifecycle (directive Step 4)
+
+`tests/test_encrypt_host_prewarm_concurrency_audit.cpp`, run 5
+independent times, **0/372 mismatches, 0 prewarm-consistency failures,
+every run**:
+
+1. Same-key contexts prewarming CONCURRENTLY (10 threads racing to be
+   the one that allocates) -- all report the same final ready state.
+2. Different-key contexts prewarming CONCURRENTLY (6 distinct fresh
+   keys, concurrent map-mutation race) -- all become ready.
+3. Multiple threads ENCRYPTING simultaneously at an already-prewarmed
+   key -- the exact class of bug Phase 13's original, unsynchronized
+   pool had.
+4. Prewarm and encrypt INTERLEAVED on the SAME fresh key from
+   different threads -- some encrypt calls race the prewarm and
+   correctly take the fallback path, others see it ready; both paths
+   verified bit-exact regardless of which one a given call took.
+5. 200 sequential prewarmed-cycle reuses at one key (longevity).
+6. A mixed shared-key race across 2 keys, 10 threads x 10 iterations,
+   randomly prewarming and encrypting.
+
+"Allocation failure and fallback" and "partial initialization
+failure" were NOT forced via deliberate OOM -- consistent with this
+codebase's established practice (Phase 14's audit noted the same
+limitation), deliberately engineering an OOM condition on a shared
+6GiB GPU under this session's own tight host-memory pressure was
+judged a disproportionate risk to the session for a defect class no
+other test in this 50+ test codebase has ever forced either. The
+rollback path was instead verified by direct code reading: every
+allocation step is gated on the previous one's success, and the
+resulting entry is inserted into the cache only AFTER success/failure
+is fully resolved -- `ready=true` and `ready=false` are the only two
+observable states, both fully initialized or fully rolled back, never
+partial.
+
+### Workload-level benchmark (directive Step 3/5)
+
+`bench/bench_encrypt_prewarm_workloads.cpp`, run twice independently,
+n in {1024, 2048, 4096, 8192}, sizeQ=8, both steady-state series
+properly warmed up before any timed measurement:
+
+| n | prewarm cost (fresh key, 2 runs) | steady-state savings (run 1) | break-even ops |
+|---|---|---|---|
+| 1024 | 4555-4825us | 63us (~1.10x) | ~72 |
+| 2048 | 16-16us | 122us (~1.12x) | ~0.13 |
+| 4096 | 18-19us | 278us (~1.15x) | ~0.07 |
+| 8192 | 5358-5897us | 422us (~1.12x) | ~13 |
+
+**A real, reproducible, and unexpected finding**: the one-time
+`cudaMallocHost` cost itself is NOT a simple function of buffer size --
+n=1024 and n=8192 consistently cost several MILLISECONDS across two
+independent runs, while n=2048 and n=4096 consistently cost under 20
+MICROSECONDS, every time, in the same run order. This is almost
+certainly related to this session's own persistent host memory
+pressure (Windows free RAM measured at 1.2-2.4GB throughout this
+round, well under comfortable headroom) interacting with WSL2's
+dynamic-memory ballooning (documented extensively elsewhere in this
+project, `research/MEMORY_FEASIBILITY.md`) -- a pinned-memory request
+that requires the WSL2 VM to negotiate MORE memory from the Windows
+host is plausibly much slower than one that fits within already-
+committed slack, and which buffer sizes trigger that negotiation is
+not something this round could directly instrument or confirm (no
+per-process WSL2 VM memory-ballooning trace is available). This is
+reported as an OBSERVED, REPRODUCIBLE pattern with a PLAUSIBLE but NOT
+independently confirmed mechanism, consistent with this project's own
+established practice of flagging "not independently confirmed" rather
+than asserting a cause it cannot directly verify.
+
+**This finding matters for the decision below**: it means prewarming's
+own upfront cost is itself unpredictable in this environment, ranging
+over two full orders of magnitude (16us to 5.9ms) for reasons tied to
+host memory conditions, not to anything the caller controls. A
+break-even calculation that can range from "essentially free" to
+"~70 operations needed" depending on conditions outside the library's
+control is not the kind of clean, unconditional result this project's
+other kept optimizations (Phases 11-15) have delivered.
+
+### Workload profile comparison (directive Step 5)
+
+Using the directly-measured quantities above, combined analytically
+(total time = prewarm_cost + N x steady_state_us, vs. N x pageable_us):
+
+| Profile | n=1024 | n=2048 | n=4096 | n=8192 |
+|---|---|---|---|---|
+| A: cold-start (1 op) | LOSES (-4.49ms) | WINS (+0.11ms) | WINS (+0.26ms) | LOSES (-4.94ms) |
+| A: cold-start (3 ops) | LOSES (-4.37ms) | WINS (+0.35ms) | WINS (+0.82ms) | LOSES (-4.09ms) |
+| B: typical (20 ops) | LOSES (-3.30ms) | WINS (+2.43ms) | WINS (+5.54ms) | WINS, marginal (+3.07ms, ~3.8% of total) |
+| C: long-lived (500 ops) | WINS (+26.9ms) | WINS (+61.1ms) | WINS (+138.9ms) | WINS (+205.4ms) |
+| C: long-lived (5000 ops) | WINS (+310.2ms) | WINS (+611.1ms) | WINS (+1389.1ms) | WINS (+2102.3ms) |
+
+Profile C (long-lived service, many repeated calls at one
+configuration) is the ONLY profile that wins UNCONDITIONALLY across
+every tested `n`, consistent with Phase 15's own original hypothesis.
+Profile A (cold-start, 1-3 operations) LOSES whenever the prewarm cost
+happens to be large (n=1024, n=8192 in this environment) and WINS when
+it happens to be small (n=2048, n=4096) -- i.e., its outcome is
+determined by the SAME unpredictable allocation-cost variance just
+described, not by the workload itself. Profile B (typical, 20 ops) is
+mixed, winning at 3 of 4 tested `n` but only marginally at n=8192.
+
+### Memory overhead (directive Step 8)
+
+Measured directly: prewarming 8 distinct `(n,sizeQ)` keys (every
+`n` in {1024,2048,4096,8192} x `sizeQ` in {4,8}) added **6.00MB** to
+GPU memory usage and **6.25MB** to host RSS -- small and bounded, each
+key's packed buffer capped at `4*sizeQ*n*8` bytes (at most 2MB device
++ 2MB pinned host at the largest tested configuration, n=8192,
+sizeQ=8).
+
+### Decision (directive Step 8's three categories)
+
+**RETAINED AS AN OPT-IN EXPERIMENTAL FEATURE. NOT promoted to
+production, and NOT exposed through the Rust API this round.**
+
+This is neither a clean win (category 1) nor a clear rejection
+(category 3) -- it sits in category 2 deliberately:
+
+- The implementation is fully correct (bit-exact, every path), fully
+  concurrency-safe (0/372 mismatches across 5 independent runs
+  covering 6 distinct lifecycle scenarios), and has small, bounded
+  memory overhead. These are NOT reasons to reject it.
+- But the governing directive's own decision gate requires a
+  "repeatable end-to-end improvement for a clearly defined workload,"
+  and this round found the improvement is repeatable ONLY for
+  Profile C (long-lived services) -- exactly the profile Phase 15
+  already flagged as the target. For Profiles A and B, the outcome
+  this round measured DEPENDS on an allocation-cost variance this
+  library cannot predict or control, which is a materially different,
+  weaker claim than every other kept optimization in Phases 11-15 has
+  made.
+- Per directive Step 6, no public Rust API is shipped this round:
+  "Do not ship a public API until its ownership and failure semantics
+  are unambiguous" -- the OWNERSHIP and FAILURE semantics ARE
+  unambiguous (documented above, tested above), but the PERFORMANCE
+  semantics (when does this actually help?) are not yet clean enough
+  to commit to a public contract. A future round that wants to
+  promote this should first either (a) confirm the allocation-cost
+  variance's root cause (ideally with WSL2 VM memory-ballooning
+  visibility this round did not have) and find a way to bound or
+  avoid it, or (b) accept the risk explicitly for a specific, named
+  long-lived-service deployment that calls `encrypt_prewarm_pinned_
+  buffer` once at startup and performs many thousands of encryptions
+  afterward, where Profile C's unconditional win applies regardless of
+  the allocation-cost variance.
+- `encrypt_host_shoup_pooled_barrett_prewarmed`,
+  `encrypt_prewarm_pinned_buffer`, and `encrypt_pinned_buffer_is_ready`
+  remain in the repository, fully built, tested, and registered in
+  `CMakeLists.txt` -- available for any future C++-level caller or
+  Rust FFI work that wants to build on a proven-correct, proven-safe
+  foundation, without this round over-claiming a production-ready
+  performance win it did not cleanly establish.

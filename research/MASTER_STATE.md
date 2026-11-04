@@ -2135,3 +2135,90 @@ end state), confirmed via `git log -1` before any change.
   first real encryption call — which would let production capture the
   proven steady-state win without the cold-start regression risk this
   round identified.
+
+## GOD PROMPT "CKKS PHASE 16": built, proved correct, and concurrency-hardened an explicit pinned-memory prewarming API — found the allocation cost itself is unpredictable in this environment, so retained it as an opt-in experimental feature rather than promoting it to production
+
+Full detail: `research/TRANSFER_PROFILING.md`'s Phase 16 section and
+`EXPERIMENT_LEDGER.md` entry #49. Starting commit `69d307a` (Phase 15
+end state), confirmed via `git log -1` before any change. Direct
+follow-up to Phase 15's own closing recommendation.
+
+- **Lifecycle designed before implementation**: `encrypt_prewarm_
+  pinned_buffer(n,sizeQ)` (explicit, idempotent, checks every CUDA
+  allocation's return code — the one deliberate, narrowly-scoped
+  exception to this codebase's "don't check CUDA errors" convention,
+  justified because this function's whole contract is failure-safety)
+  → `encrypt_pinned_buffer_is_ready(n,sizeQ)` (query-only) →
+  `encrypt_host_shoup_pooled_barrett_prewarmed(...)` (adaptive encrypt:
+  uses the pinned path ONLY if ready, otherwise transparently defers
+  to the UNMODIFIED production pageable path, never allocating pinned
+  memory itself). A failed prewarm rolls back whatever subset
+  succeeded and is NEVER inserted into the cache as "ready" — no code
+  path can leave a half-initialized buffer observable to encryption.
+  An application that never calls `encrypt_prewarm_pinned_buffer` pays
+  nothing extra and behaves exactly like today's production path.
+- **Ownership model**: a SHARED, PROCESS-LEVEL pool keyed by
+  `(n,sizeQ)` — the SAME model every other cache in this codebase
+  already uses, deliberately NOT a new per-context model (this C++
+  layer has no context object for `encrypt_host` to begin with).
+- **Correctness**: bit-exact vs. the untouched `encrypt_host` across
+  both the fallback path and the prewarmed path, incl. idempotency and
+  pool-reuse stress — every case EXACT MATCH
+  (`tests/test_encrypt_host_prewarm_matches_reference.cpp`).
+- **Concurrency/lifecycle, 6 scenarios re-audited (not assumed from
+  Phase 13-15's own proofs)**: same-key concurrent prewarm, different-
+  key concurrent prewarm, simultaneous encrypt at a prewarmed key,
+  prewarm/encrypt interleaved on a fresh key (both race outcomes
+  verified correct), 200-cycle longevity, mixed shared-key race. 5
+  independent runs: **0/372 mismatches, 0 prewarm-consistency
+  failures, every run.**
+- **An unexpected, reproducible finding**: the one-time `cudaMallocHost`
+  cost itself is NOT simply a function of buffer size in this
+  environment — n=1024/8192 consistently cost several milliseconds
+  while n=2048/4096 consistently cost under 20 microseconds, across
+  two independent full benchmark runs in the SAME order, plausibly
+  tied to this session's persistent host-memory pressure interacting
+  with WSL2's dynamic-memory ballooning (not independently
+  confirmable with the tooling available — reported honestly as
+  "plausible, not confirmed," not asserted as fact).
+- **Workload profile comparison** (directive's three required
+  profiles, computed from directly-measured quantities): Profile C
+  (long-lived, 500-5000 ops) wins UNCONDITIONALLY at every tested n.
+  Profiles A (cold-start, 1-3 ops) and B (typical, 20 ops) are MIXED —
+  winning or losing depending on which unpredictable allocation-cost
+  regime a given key happened to land in, not on the workload itself.
+- **Memory overhead**: 6.00MB GPU + 6.25MB host RSS for 8 prewarmed
+  keys — small and bounded.
+- **Decision: RETAINED AS AN OPT-IN EXPERIMENTAL C++ FEATURE — NOT
+  promoted to production, NOT wired into `cpp_bridge/encdec_bridge.cpp`,
+  NOT exposed through the Rust API this round.** The implementation is
+  fully correct and fully concurrency-safe (not the reason it wasn't
+  promoted) — the reason is that its performance benefit depends on an
+  allocation-cost variance this library cannot predict or control,
+  which is a materially weaker claim than every other kept optimization
+  in Phases 11-15 made. `encrypt_host_shoup_pooled_barrett_prewarmed`,
+  `encrypt_prewarm_pinned_buffer`, and `encrypt_pinned_buffer_is_ready`
+  remain in the repository, fully built, tested, and registered in
+  `CMakeLists.txt`, available for a future round that either resolves
+  the allocation-cost variance's root cause or accepts the risk
+  explicitly for a specific, named long-lived-service deployment.
+- `CMakeLists.txt` gained the new source file, 2 new tests, and 1 new
+  benchmark. `rust/crates/ckks-cuda/build.rs` and `cpp_bridge/
+  encdec_bridge.cpp` were deliberately left UNCHANGED this round — no
+  production or Rust-API surface change. Full Rust suite unaffected:
+  38 passed, 0 failed, 1 ignored, both build profiles. Full CMake
+  rebuild not attempted (host free memory ~1.3GB throughout, under the
+  6GB gate) — every claim verified via direct `nvcc`/`g++` compilation
+  from a clean, from-scratch object-cache rebuild, plus the full
+  `cargo test` suite.
+- **Post-Phase-16 remaining opportunity**: if a future round wants to
+  pursue pinned prewarming further, the highest-value next step is
+  getting visibility into WSL2's VM memory-ballooning behavior
+  directly (this round could only observe its plausible EFFECT, not
+  confirm the mechanism) — or, more simply, accepting the current
+  implementation as-is for a specific long-lived-service use case where
+  Profile C's unconditional win is what matters. Otherwise, encrypt_
+  host's host-side arithmetic and transfer stages are all now
+  optimized (Phases 13-15); the GPU-resident tensor+keyswitch+combine+
+  rescale chain remains ~1% of total pipeline latency, unchanged since
+  Phase 11.
