@@ -161,6 +161,12 @@ fn main() {
     // which remain as the tested reference/fallback). See research/
     // FFT_ENCODING_DERIVATION.md.
     objs.push(compile_cpp(&root.join("src/encode_fft.cpp"), &out_dir, &include_dir, &cuda_include));
+    // GOD PROMPT "CKKS PHASE 13": the new Shoup-modmul + pooled-buffer
+    // encrypt_host_shoup_pooled, now the actual production path
+    // (cpp_bridge/encdec_bridge.cpp's gpufhe_encrypt calls this, not
+    // encrypt_host above, which remains as the tested reference/
+    // fallback). See research/ENCRYPT_PROFILING.md.
+    objs.push(compile_cpp(&root.join("src/encrypt_host_shoup_pooled.cpp"), &out_dir, &include_dir, &cuda_include));
     objs.push(compile_cpp(
         &manifest_dir.join("cpp_bridge/native_root_bridge.cpp"),
         &out_dir, &include_dir, &cuda_include,

@@ -36,9 +36,30 @@ namespace gpufhe {
 // the old path.
 void encode_host_fft(std::vector<int64_t>&, const std::vector<std::complex<double>>&, uint32_t, double);
 void decode_host_fft(std::vector<std::complex<double>>&, const std::vector<int64_t>&, uint32_t, double);
-void encrypt_host(std::vector<uint64_t>&, std::vector<uint64_t>&, const std::vector<int64_t>&,
-                   const std::vector<uint64_t>&, const std::vector<uint64_t>&, uint32_t,
-                   const std::vector<uint64_t>&, const std::vector<uint64_t>&, uint64_t, double, uint64_t);
+// GOD PROMPT "CKKS PHASE 13": encrypt_host (src/encdec.cpp, the Phase
+// 11 batched-NTT version) remains fully present and tested, as the
+// reference/fallback the governing directive requires -- NOT called
+// from here anymore. This bridge (the actual production call site
+// every Rust caller goes through via codec::encrypt) now calls
+// encrypt_host_shoup_pooled (src/encrypt_host_shoup_pooled.cpp), which
+// combines two independently verified, bit-exact optimizations over
+// encrypt_host's own combine loop and device-buffer lifecycle: Shoup's
+// precomputed-constant modular multiplication (replacing calls that
+// profiling proved compile to libgcc's slow __umodti3 software 128-bit
+// division -- see research/ENCRYPT_PROFILING.md) and a process-
+// lifetime device-buffer pool keyed by (n,sizeQ) (eliminating repeated
+// cudaMalloc/cudaFree). Verified bit-exact against encrypt_host across
+// every supported dimension, multiple seeds, and multiple message
+// patterns (tests/test_encrypt_host_shoup_matches_reference.cpp, tests/
+// test_encrypt_host_shoup_pooled_matches_reference.cpp -- the latter
+// also stress-tests interleaved calls across different (n,sizeQ)
+// configurations to rule out pool cross-contamination), and measured
+// 1.04x-1.19x (Shoup alone) / 1.13x-1.88x (combined) faster before this
+// swap was made. encrypt_host is still reachable directly by any test
+// or future caller that explicitly wants the old path.
+void encrypt_host_shoup_pooled(std::vector<uint64_t>&, std::vector<uint64_t>&, const std::vector<int64_t>&,
+                                const std::vector<uint64_t>&, const std::vector<uint64_t>&, uint32_t,
+                                const std::vector<uint64_t>&, const std::vector<uint64_t>&, uint64_t, double, uint64_t);
 void decrypt_host(std::vector<int64_t>&, const std::vector<uint64_t>&, const std::vector<uint64_t>&,
                    const std::vector<uint64_t>&, uint32_t, const std::vector<uint64_t>&, const std::vector<uint64_t>&);
 }
@@ -81,7 +102,7 @@ void gpufhe_encrypt(const int64_t* m, uint32_t n,
     std::vector<uint64_t> pkAv(pkA, pkA + (size_t)size_q * n), pkBv(pkB, pkB + (size_t)size_q * n);
     std::vector<uint64_t> modv(mod, mod + size_q), rootv(root, root + size_q);
     std::vector<uint64_t> c0, c1;
-    gpufhe::encrypt_host(c0, c1, mv, pkAv, pkBv, n, modv, rootv, ns, sigma, seed);
+    gpufhe::encrypt_host_shoup_pooled(c0, c1, mv, pkAv, pkBv, n, modv, rootv, ns, sigma, seed);
     std::memcpy(c0_out, c0.data(), (size_t)size_q * n * 8);
     std::memcpy(c1_out, c1.data(), (size_t)size_q * n * 8);
 }

@@ -48,6 +48,15 @@ void decode_host_fft(std::vector<std::complex<double>>&, const std::vector<int64
 void encrypt_host(std::vector<uint64_t>&, std::vector<uint64_t>&, const std::vector<int64_t>&,
                    const std::vector<uint64_t>&, const std::vector<uint64_t>&, uint32_t,
                    const std::vector<uint64_t>&, const std::vector<uint64_t>&, uint64_t, double, uint64_t);
+// GOD PROMPT "CKKS PHASE 13": the new Shoup-modmul + pooled-buffer
+// encrypt_host_shoup_pooled (src/encrypt_host_shoup_pooled.cpp) -- now
+// the actual production path (cpp_bridge/encdec_bridge.cpp calls this,
+// not encrypt_host above). This benchmark can measure EITHER path (see
+// run_config's useFastEncrypt parameter) for a direct old-vs-new
+// full-pipeline comparison.
+void encrypt_host_shoup_pooled(std::vector<uint64_t>&, std::vector<uint64_t>&, const std::vector<int64_t>&,
+                                const std::vector<uint64_t>&, const std::vector<uint64_t>&, uint32_t,
+                                const std::vector<uint64_t>&, const std::vector<uint64_t>&, uint64_t, double, uint64_t);
 void decrypt_host(std::vector<int64_t>&, const std::vector<uint64_t>&, const std::vector<uint64_t>&,
                    const std::vector<uint64_t>&, uint32_t, const std::vector<uint64_t>&, const std::vector<uint64_t>&);
 }
@@ -236,11 +245,12 @@ struct EvalMultFixtureCpp {
 // this so a correctness regression actually fails the exit code, not
 // just prints a warning that a CI/ctest run would silently ignore.
 static bool run_config(uint32_t n, uint32_t sizeQ, uint32_t sizeP, uint32_t numPart,
-                        size_t reps, size_t trials, bool useFft)
+                        size_t reps, size_t trials, bool useFft, bool useFastEncrypt)
 {
     std::cout << "\n=== Configuration: n=" << n << " sizeQ=" << sizeQ
               << " sizeP=" << sizeP << " numPart=" << numPart
-              << " encode/decode=" << (useFft ? "FFT (NEW, O(N log N))" : "parallel O(N^2) (OLD)") << " ===\n";
+              << " encode/decode=" << (useFft ? "FFT (NEW, O(N log N))" : "parallel O(N^2) (OLD)")
+              << " encrypt=" << (useFastEncrypt ? "Shoup+pooled (NEW)" : "batched-NTT (OLD)") << " ===\n";
 
     // --- Mandatory validation BEFORE building anything. Never bypassed. ---
     std::vector<uint64_t> mod, modP;
@@ -367,8 +377,13 @@ static bool run_config(uint32_t n, uint32_t sizeQ, uint32_t sizeP, uint32_t numP
 
         std::vector<uint64_t> c0a, c1a, c0b, c1b;
         t0 = std::chrono::steady_clock::now();
-        gpufhe::encrypt_host(c0a, c1a, ma, fx.pubKeyA, fx.pubKeyB, n, fx.modQ, fx.rootQ, 1, 3.19, 9001);
-        gpufhe::encrypt_host(c0b, c1b, mb, fx.pubKeyA, fx.pubKeyB, n, fx.modQ, fx.rootQ, 1, 3.19, 9002);
+        if (useFastEncrypt) {
+            gpufhe::encrypt_host_shoup_pooled(c0a, c1a, ma, fx.pubKeyA, fx.pubKeyB, n, fx.modQ, fx.rootQ, 1, 3.19, 9001);
+            gpufhe::encrypt_host_shoup_pooled(c0b, c1b, mb, fx.pubKeyA, fx.pubKeyB, n, fx.modQ, fx.rootQ, 1, 3.19, 9002);
+        } else {
+            gpufhe::encrypt_host(c0a, c1a, ma, fx.pubKeyA, fx.pubKeyB, n, fx.modQ, fx.rootQ, 1, 3.19, 9001);
+            gpufhe::encrypt_host(c0b, c1b, mb, fx.pubKeyA, fx.pubKeyB, n, fx.modQ, fx.rootQ, 1, 3.19, 9002);
+        }
         t1 = std::chrono::steady_clock::now();
         double encrypt_us = std::chrono::duration<double, std::micro>(t1 - t0).count();
 
@@ -486,13 +501,15 @@ int main(int argc, char** argv) {
         uint32_t sizeP = argc > 5 ? (uint32_t)std::atoi(argv[5]) : 2;
         uint32_t numPart = argc > 6 ? (uint32_t)std::atoi(argv[6]) : 4;
         bool useFft = argc > 7 ? (std::atoi(argv[7]) != 0) : true; // default: NEW (production) path
-        allPass = run_config(n, sizeQ, sizeP, numPart, reps, trials, useFft);
+        bool useFastEncrypt = argc > 8 ? (std::atoi(argv[8]) != 0) : true; // default: NEW (production) path
+        allPass = run_config(n, sizeQ, sizeP, numPart, reps, trials, useFft, useFastEncrypt);
     } else {
         // Full sweep, BOTH paths per n, for a direct old-vs-new
-        // full-pipeline comparison (GOD PROMPT "CKKS PHASE 12").
+        // full-pipeline comparison (GOD PROMPT "CKKS PHASE 12" for
+        // encode/decode, GOD PROMPT "CKKS PHASE 13" for encrypt).
         for (uint32_t n : {1024u, 2048u, 4096u, 8192u}) {
-            if (!run_config(n, 8, 2, 4, reps, trials, /*useFft=*/false)) allPass = false;
-            if (!run_config(n, 8, 2, 4, reps, trials, /*useFft=*/true)) allPass = false;
+            if (!run_config(n, 8, 2, 4, reps, trials, /*useFft=*/true, /*useFastEncrypt=*/false)) allPass = false;
+            if (!run_config(n, 8, 2, 4, reps, trials, /*useFft=*/true, /*useFastEncrypt=*/true)) allPass = false;
         }
     }
     if (!allPass) { std::cerr << "\n[OVERALL FAIL] at least one configuration's correctness check failed\n"; return 1; }

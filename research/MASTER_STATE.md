@@ -1826,3 +1826,120 @@ end state), confirmed via `git log -1` before any change.
   highest-value experiment is profiling `encrypt_host`'s own internal
   cost breakdown (NTT vs. embedding/combine loops), not another pass
   over encode/decode.
+
+## GOD PROMPT "CKKS PHASE 13": deep-profiled `encrypt_host` — NOT the already-batched NTT, but two host-side loops (embed + combine) dominate; combine's modular multiply was calling libgcc's slow `__umodti3`; fixed with Shoup modmul + a device-buffer pool, catching and fixing a real concurrency bug along the way — 1.10x-1.84x faster, zero correctness regression
+
+Full detail: `research/ENCRYPT_PROFILING.md` (the dedicated profiling/
+derivation document this phase's directive required) and
+`EXPERIMENT_LEDGER.md` entry #46. Starting commit `4a62f0a` (Phase 12
+end state), confirmed via `git log -1` before any change.
+
+- **Fresh baseline re-established, not reused from Phase 12's closing
+  estimate**: confirmed `HEAD=4a62f0a` matches `origin/main`, no `-G`,
+  16 CPU threads, GPU 5955MiB free, host free RAM 2.53GB (gate not
+  cleared, `n=131072` correctly not attempted). Re-ran the existing
+  Rust suite clean (38/0/1) and `bench_evalmult_e2e_breakdown.cpp`
+  before touching anything — encrypt_host's own single-call latency at
+  n=8192 (~8.8-9.7ms/call) matched Phase 12's closing "~17.0ms total
+  (x2 calls)" figure, confirming it was real, not stale.
+- **Internal stage-level profiling (Section 4 of the directive) done
+  via an instrumented BYTE-FOR-BYTE copy** (`bench/
+  bench_encrypt_profile.cpp`'s `encrypt_host_profiled`), verified
+  bit-exact against production before any timing was trusted. Found
+  the ALREADY-batched NTT kernel is a SHRINKING share of total time as
+  n grows (13.0%→5.7%) — the governing directive's own explicit warning
+  not to assume otherwise was correct. The real bottlenecks are two
+  host-side loops: **embed** (RNS embedding, 20-27% of total, the
+  single largest stage at every n) and **combine** (final ciphertext
+  assembly, 17-24%) — together ~37-45% of total time. **Device
+  allocation+free is a third, size-dependent cost** (10-27% combined),
+  far from the "small constant overhead" one might assume.
+- **Root cause of combine's cost confirmed via direct assembly
+  inspection, not assumed**: every host-side modular multiply in this
+  ENTIRE codebase (`src/keygen.cpp`, `src/evalkeygen.cpp`, `src/
+  keyswitch_resident.cpp`, `src/ks_constants.cpp`, and `encrypt_host`'s
+  own `mm()`) is written as `(uint64_t)(((unsigned
+  __int128)a*b)%q)` — compiling this expression in isolation and
+  checking the object file with `nm` confirms it calls libgcc's
+  `__umodti3`, a slow software 128-bit division, not a hardware
+  instruction.
+- **Experiment 1 (KEPT): Shoup's precomputed-constant modmul in the
+  combine loop.** New file `src/encrypt_host_shoup.cpp`
+  (`encrypt_host_shoup`), reusing the SAME technique already validated
+  in this codebase's own CUDA kernels (`kernels/intt_ct.cu`'s/`kernels/
+  basis_convert.cu`'s device `shoup_mulmod`). `ns%q`'s precon is
+  computed once per tower (not per coefficient); `v`'s NTT-domain value
+  is reused as the fixed multiplicand for both `pkB*v` and `pkA*v`,
+  halving the precon computations needed. Bit-exact verified against
+  the untouched `encrypt_host` across 60 (n,sizeQ,message)
+  combinations (`tests/test_encrypt_host_shoup_matches_reference.cpp`)
+  — zero tolerance anywhere, Shoup reduction is exact. Measured
+  1.04x-1.19x faster than OLD at every n, interleaved A/B, consistent
+  across multiple independent runs.
+- **Experiment 2 (KEPT, after fixing a real concurrency bug): a
+  process-lifetime device-buffer pool keyed by `(n,sizeQ)`.** New file
+  `src/encrypt_host_shoup_pooled.cpp` (`encrypt_host_shoup_pooled`),
+  builds on Experiment 1 by also eliminating the repeated
+  `cudaMalloc`/`cudaFree` of the four per-call device buffers (same
+  caching pattern already used for immutable root tables, applied here
+  to mutable per-call DATA buffers that are always fully overwritten
+  before use). **Found and fixed a real data race, not a theoretical
+  one**: after wiring this into the production FFI bridge, `cargo test
+  --release` (default PARALLEL execution) FAILED 4/38 tests with wrong
+  decrypted values; `--test-threads=1` passed 38/38 cleanly, isolating
+  the cause to a race (two threads corrupting the SAME shared pooled
+  buffer), not an arithmetic defect. Fixed with one `std::mutex`
+  serializing the function body — negligible overhead for the real
+  (sequential) calling pattern. Verified with a dedicated multi-
+  threaded C++ stress test (`tests/
+  test_encrypt_host_shoup_pooled_thread_safety.cpp`, 8 threads x 6
+  concurrent calls at the same key, run 3x): **0/48 mismatches every
+  run.** After the fix, full Rust suite re-confirmed **38 passed, 0
+  failed, 1 ignored** under cargo's default PARALLEL execution, in both
+  `--release` and debug. Pooling's own incremental benefit (on top of
+  Shoup) ranges 1.00x-1.66x — real and never negative, but strongly
+  n-dependent (largest at n=2048, smallest at n=1024/4096), reproduced
+  across independent runs; exact mechanism (likely CUDA allocator
+  sub-allocation behavior) not independently confirmed — no per-process
+  GPU allocator tracing is available in this WSL2 setup (same
+  limitation `MEMORY_FEASIBILITY.md` already documented for GPU memory
+  investigations).
+- **Production swap**: `cpp_bridge/encdec_bridge.cpp`'s `gpufhe_encrypt`
+  now calls `encrypt_host_shoup_pooled`; `encrypt_host` (`src/
+  encdec.cpp`) is UNCHANGED and remains fully present, tested, and
+  directly reachable as reference/fallback. Zero change to randomness,
+  Gaussian sampling, ternary sampling, or the embedding formula anywhere
+  — verified both by direct inspection and by the bit-exact correctness
+  tests themselves (any divergence in sampling would show up as an
+  immediate mismatch; none did). The concurrency bug was a race on
+  shared DEVICE BUFFER CONTENT, never on RNG state (`std::mt19937_64
+  rng(seed)` is always a per-call local variable) — no cryptographic
+  property was ever at risk.
+- **Combined result**: Shoup+pooled measured 1.10x-1.84x faster than
+  OLD `encrypt_host` across n=1024-8192 (interleaved A/B/C, multiple
+  independent runs, `bench/bench_encrypt_all_variants.cpp`). Full real-
+  encrypted pipeline impact (5-sample medians per n, since single-call
+  timing is cold-start-noisy): 1.02x-1.18x faster end-to-end at every n
+  on top of Phase 12's own gains, never a regression. Every correctness
+  gate passed: RNS-level (0 mismatches), real encrypted round trip
+  (error unchanged from Phase 12, `~5e-12`-`~1e-10` vs. `1e-6`
+  tolerance), full Rust suite (38/0/1, both build profiles, default
+  parallel execution).
+- `CMakeLists.txt` gained `src/encrypt_host_shoup.cpp` and `src/
+  encrypt_host_shoup_pooled.cpp` in the main library's source list,
+  3 new correctness tests, and 4 new benchmarks. `rust/crates/ckks-
+  cuda/build.rs` gained compilation of `src/
+  encrypt_host_shoup_pooled.cpp` (the one new file the production
+  bridge actually calls). Full CMake rebuild NOT attempted this round
+  either (host free memory 1.8-2.5GB throughout, under the 6GB gate) —
+  every claim verified via direct `nvcc`/`g++` compilation to
+  standalone binaries plus the full `cargo test` suite (which DOES
+  build and link everything through `build.rs`).
+- **Post-Phase-13 remaining opportunity**: `embed` (RNS embedding, NOT
+  touched by either optimization this round) is now almost certainly
+  the single largest remaining cost inside `encrypt_host_shoup_pooled`
+  — same double-loop shape as `combine` but using signed hardware
+  division (`%`) rather than `__umodti3`, a smaller but still real
+  candidate for a future round. The GPU-resident tensor+keyswitch+
+  combine+rescale chain remains ~1% of total pipeline latency
+  (unchanged conclusion since Phase 11).

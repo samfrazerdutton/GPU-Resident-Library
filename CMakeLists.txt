@@ -44,6 +44,8 @@ add_library(gpufhe STATIC
   src/encdec.cpp
   src/encode.cpp
   src/encode_fft.cpp
+  src/encrypt_host_shoup.cpp
+  src/encrypt_host_shoup_pooled.cpp
   src/rotate.cpp
   src/ptops.cpp
   src/params.cpp
@@ -134,6 +136,16 @@ gpufhe_test(test_encrypt_host_fast_matches_sequential tests/test_encrypt_host_fa
 # decode_host -- see research/FFT_ENCODING_DERIVATION.md and research/
 # EXPERIMENT_LEDGER.md entry #45.
 gpufhe_test(test_encode_fft_matches_reference tests/test_encode_fft_matches_reference.cpp)
+# GOD PROMPT "CKKS PHASE 13": correctness tests for the Shoup-modmul
+# (encrypt_host_shoup) and Shoup+pooled-buffer (encrypt_host_shoup_
+# pooled) encrypt_host variants against the EXISTING, untouched
+# encrypt_host -- see research/ENCRYPT_PROFILING.md and research/
+# EXPERIMENT_LEDGER.md entry #46. The pooled thread-safety test directly
+# reproduces, via real std::threads (not relying on cargo's own
+# scheduling), the concurrency bug found and fixed this round.
+gpufhe_test(test_encrypt_host_shoup_matches_reference tests/test_encrypt_host_shoup_matches_reference.cpp)
+gpufhe_test(test_encrypt_host_shoup_pooled_matches_reference tests/test_encrypt_host_shoup_pooled_matches_reference.cpp)
+gpufhe_test(test_encrypt_host_shoup_pooled_thread_safety tests/test_encrypt_host_shoup_pooled_thread_safety.cpp)
 gpufhe_test(test_keygen tests/test_keygen.cpp)
 gpufhe_test(test_evalkeygen tests/test_evalkeygen.cpp)
 # GOD PROMPT "CKKS PHASE 8": fully native (OpenFHE-free) isolation of
@@ -293,6 +305,17 @@ gpufhe_test(bench_evalmult_e2e_breakdown bench/bench_evalmult_e2e_breakdown.cpp)
 # benchmark isolating exactly the OLD (parallel O(N^2)) vs NEW (FFT,
 # O(N log N)) encode_host/decode_host algorithmic change.
 gpufhe_test(bench_encode_fft_vs_parallel bench/bench_encode_fft_vs_parallel.cpp)
+# GOD PROMPT "CKKS PHASE 13": encrypt_host internal stage-level profiler
+# (RNG/embed/alloc/upload/NTT-kernel/download/free/combine breakdown)
+# plus three A/B benchmarks isolating, in turn, the Shoup-modmul change
+# alone, the buffer-pooling change alone (on top of Shoup), and all
+# three variants (old/Shoup/Shoup+pooled) together in one interleaved
+# run. See research/ENCRYPT_PROFILING.md and research/
+# EXPERIMENT_LEDGER.md entry #46.
+gpufhe_test(bench_encrypt_profile bench/bench_encrypt_profile.cpp)
+gpufhe_test(bench_encrypt_shoup_vs_reference bench/bench_encrypt_shoup_vs_reference.cpp)
+gpufhe_test(bench_encrypt_shoup_pooled_vs_reference bench/bench_encrypt_shoup_pooled_vs_reference.cpp)
+gpufhe_test(bench_encrypt_all_variants bench/bench_encrypt_all_variants.cpp)
 gpufhe_test(test_mult_barrett tests/test_mult_barrett.cpp)
 # Directive "VERIFY OOM DIAGNOSIS AND REMOVE THE LARGE-N DIAGONAL
 # BOTTLENECK", Priority 3: proves an O(S*2^RST) analytic replacement for
