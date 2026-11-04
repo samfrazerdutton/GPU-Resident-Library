@@ -57,6 +57,15 @@ void encrypt_host(std::vector<uint64_t>&, std::vector<uint64_t>&, const std::vec
 void encrypt_host_shoup_pooled(std::vector<uint64_t>&, std::vector<uint64_t>&, const std::vector<int64_t>&,
                                 const std::vector<uint64_t>&, const std::vector<uint64_t>&, uint32_t,
                                 const std::vector<uint64_t>&, const std::vector<uint64_t>&, uint64_t, double, uint64_t);
+// GOD PROMPT "CKKS PHASE 14": encrypt_host_shoup_pooled_barrett (src/
+// encrypt_host_shoup_pooled_barrett.cpp) -- now the actual production
+// path (cpp_bridge/encdec_bridge.cpp calls this, not
+// encrypt_host_shoup_pooled above). This benchmark can measure any of
+// the three variants (see run_config's encryptVariant parameter: 0=OLD
+// encrypt_host, 1=Phase 13 shoup_pooled, 2=Phase 14 shoup_pooled_barrett).
+void encrypt_host_shoup_pooled_barrett(std::vector<uint64_t>&, std::vector<uint64_t>&, const std::vector<int64_t>&,
+                                        const std::vector<uint64_t>&, const std::vector<uint64_t>&, uint32_t,
+                                        const std::vector<uint64_t>&, const std::vector<uint64_t>&, uint64_t, double, uint64_t);
 void decrypt_host(std::vector<int64_t>&, const std::vector<uint64_t>&, const std::vector<uint64_t>&,
                    const std::vector<uint64_t>&, uint32_t, const std::vector<uint64_t>&, const std::vector<uint64_t>&);
 }
@@ -244,13 +253,18 @@ struct EvalMultFixtureCpp {
 // intentional outcome, not a test failure). The caller (main) tracks
 // this so a correctness regression actually fails the exit code, not
 // just prints a warning that a CI/ctest run would silently ignore.
+// encryptVariant: 0 = OLD encrypt_host, 1 = Phase 13 encrypt_host_
+// shoup_pooled, 2 = Phase 14 encrypt_host_shoup_pooled_barrett.
 static bool run_config(uint32_t n, uint32_t sizeQ, uint32_t sizeP, uint32_t numPart,
-                        size_t reps, size_t trials, bool useFft, bool useFastEncrypt)
+                        size_t reps, size_t trials, bool useFft, int encryptVariant)
 {
+    const char* encLabel = encryptVariant == 0 ? "batched-NTT (OLD, Phase 11)"
+                          : encryptVariant == 1 ? "Shoup+pooled (Phase 13)"
+                          : "Shoup+pooled+Barrett-embed (Phase 14)";
     std::cout << "\n=== Configuration: n=" << n << " sizeQ=" << sizeQ
               << " sizeP=" << sizeP << " numPart=" << numPart
               << " encode/decode=" << (useFft ? "FFT (NEW, O(N log N))" : "parallel O(N^2) (OLD)")
-              << " encrypt=" << (useFastEncrypt ? "Shoup+pooled (NEW)" : "batched-NTT (OLD)") << " ===\n";
+              << " encrypt=" << encLabel << " ===\n";
 
     // --- Mandatory validation BEFORE building anything. Never bypassed. ---
     std::vector<uint64_t> mod, modP;
@@ -377,7 +391,10 @@ static bool run_config(uint32_t n, uint32_t sizeQ, uint32_t sizeP, uint32_t numP
 
         std::vector<uint64_t> c0a, c1a, c0b, c1b;
         t0 = std::chrono::steady_clock::now();
-        if (useFastEncrypt) {
+        if (encryptVariant == 2) {
+            gpufhe::encrypt_host_shoup_pooled_barrett(c0a, c1a, ma, fx.pubKeyA, fx.pubKeyB, n, fx.modQ, fx.rootQ, 1, 3.19, 9001);
+            gpufhe::encrypt_host_shoup_pooled_barrett(c0b, c1b, mb, fx.pubKeyA, fx.pubKeyB, n, fx.modQ, fx.rootQ, 1, 3.19, 9002);
+        } else if (encryptVariant == 1) {
             gpufhe::encrypt_host_shoup_pooled(c0a, c1a, ma, fx.pubKeyA, fx.pubKeyB, n, fx.modQ, fx.rootQ, 1, 3.19, 9001);
             gpufhe::encrypt_host_shoup_pooled(c0b, c1b, mb, fx.pubKeyA, fx.pubKeyB, n, fx.modQ, fx.rootQ, 1, 3.19, 9002);
         } else {
@@ -501,15 +518,17 @@ int main(int argc, char** argv) {
         uint32_t sizeP = argc > 5 ? (uint32_t)std::atoi(argv[5]) : 2;
         uint32_t numPart = argc > 6 ? (uint32_t)std::atoi(argv[6]) : 4;
         bool useFft = argc > 7 ? (std::atoi(argv[7]) != 0) : true; // default: NEW (production) path
-        bool useFastEncrypt = argc > 8 ? (std::atoi(argv[8]) != 0) : true; // default: NEW (production) path
-        allPass = run_config(n, sizeQ, sizeP, numPart, reps, trials, useFft, useFastEncrypt);
+        int encryptVariant = argc > 8 ? std::atoi(argv[8]) : 2; // default: NEW (production) path
+        allPass = run_config(n, sizeQ, sizeP, numPart, reps, trials, useFft, encryptVariant);
     } else {
-        // Full sweep, BOTH paths per n, for a direct old-vs-new
-        // full-pipeline comparison (GOD PROMPT "CKKS PHASE 12" for
-        // encode/decode, GOD PROMPT "CKKS PHASE 13" for encrypt).
+        // Full sweep, all three encrypt variants per n, for a direct
+        // old-vs-Phase13-vs-Phase14 full-pipeline comparison (GOD
+        // PROMPT "CKKS PHASE 12" for encode/decode, "CKKS PHASE 13" and
+        // "CKKS PHASE 14" for encrypt).
         for (uint32_t n : {1024u, 2048u, 4096u, 8192u}) {
-            if (!run_config(n, 8, 2, 4, reps, trials, /*useFft=*/true, /*useFastEncrypt=*/false)) allPass = false;
-            if (!run_config(n, 8, 2, 4, reps, trials, /*useFft=*/true, /*useFastEncrypt=*/true)) allPass = false;
+            if (!run_config(n, 8, 2, 4, reps, trials, /*useFft=*/true, /*encryptVariant=*/0)) allPass = false;
+            if (!run_config(n, 8, 2, 4, reps, trials, /*useFft=*/true, /*encryptVariant=*/1)) allPass = false;
+            if (!run_config(n, 8, 2, 4, reps, trials, /*useFft=*/true, /*encryptVariant=*/2)) allPass = false;
         }
     }
     if (!allPass) { std::cerr << "\n[OVERALL FAIL] at least one configuration's correctness check failed\n"; return 1; }

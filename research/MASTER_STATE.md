@@ -1943,3 +1943,106 @@ end state), confirmed via `git log -1` before any change.
   candidate for a future round. The GPU-resident tensor+keyswitch+
   combine+rescale chain remains ~1% of total pipeline latency
   (unchanged conclusion since Phase 11).
+
+## GOD PROMPT "CKKS PHASE 14": audited Phase 13's device-buffer pool (found it already sound, hardened with 4 new targeted concurrency tests) and optimized `embed` — the remaining largest stage — with a per-tower Barrett reduction, derived for the FULL int64_t range including LONG_MIN, validated 22M+ times with zero mismatches — 1.44x-1.73x faster `encrypt_host`, 1.17x-1.36x faster full pipeline, zero correctness regression
+
+Full detail: `research/EMBED_AND_POOL_HARDENING.md` and
+`EXPERIMENT_LEDGER.md` entry #47. Starting commit `4d46420` (Phase 13
+end state), confirmed via `git log -1` before any change.
+
+- **Buffer-pool audit (Section 3 of the directive) done as a real
+  line-by-line trace, not a rubber stamp**: ownership, lifetime, keys,
+  mutex scope, CUDA stream association, sync-before-reuse, failure
+  paths, shutdown, concurrent contexts, different key material,
+  reentrancy, and exception paths were all traced through `src/
+  encrypt_host_shoup_pooled.cpp`'s existing Phase 13 implementation.
+  **Conclusion: the single global mutex (serializing the whole
+  function body) already covers every scenario correctly** — no new
+  safety issue was found, so the pool's existing semantics were REUSED
+  unchanged for Phase 14's new function (per the directive's own "if a
+  safety issue is discovered, fix it before expanding the pool's
+  role" — none was).
+- **4 new targeted concurrency tests built to get positive evidence,
+  not just a paper audit** (`tests/
+  test_encrypt_host_shoup_pooled_barrett_concurrency_audit.cpp`): same-
+  key concurrent reuse (8 threads x 8 calls), concurrent pool growth on
+  8 simultaneously-first-used fresh keys, 200-iteration single-key
+  longevity stress, and a mixed-shared-key race (10 threads cycling 2
+  keys). **5 independent runs: 0/396 mismatches every time.** (One bug
+  caught in the TEST ITSELF along the way: several non-power-of-2 `n`
+  values caused an immediate segfault in the NTT's bit-reversal logic
+  — fixed before trusting any result; `n` must be a power of 2
+  throughout this codebase, same as every other `n` used elsewhere.)
+- **Main experiment: `embed`, encrypt_host's remaining largest stage
+  (20-27% of total per Phase 13's own profile).** Assembly inspection
+  (per the directive's explicit instruction, not assumed) confirmed
+  the existing `emb(x)=(x%q+q)%q` compiles to TWO hardware `idiv`
+  instructions per call — a real cost, but NOT a slow software call
+  like Phase 13's `__umodti3` finding, since `q` here fits safely in
+  signed 64-bit range and the one UB case (`INT64_MIN % -1`) can never
+  trigger (the divisor is always a positive CKKS modulus).
+- **Derivation**: since `q` is the SAME for all `n` coefficients within
+  a tower, a Barrett reduction constant (`mu = floor(2^64/q)`) is
+  precomputed ONCE PER TOWER (not per coefficient, unlike Shoup's
+  per-coefficient precon in Phase 13's combine fix). The embedding
+  loop's signed input `x` (which can span `m[k]`'s FULL `int64_t`
+  range, not just small values) is reduced via an unsigned-negation
+  trick (`ax = (x<0) ? (0ULL-(uint64_t)x) : (uint64_t)x`) that is
+  well-defined for EVERY `int64_t` including `LONG_MIN` (no signed-
+  overflow UB anywhere), then Barrett-reduces `ax mod q`, then restores
+  `emb()`'s own sign convention. New file `src/
+  encrypt_host_shoup_pooled_barrett.cpp`
+  (`encrypt_host_shoup_pooled_barrett`), builds on Phase 13's already-
+  verified Shoup-combine + buffer-pool implementation unchanged except
+  for this one loop.
+- **Independent differential-test validation BEFORE touching
+  production** (directive Section 6): a standalone scratch harness
+  (12,000,102 checks across synthetic + realistic moduli, boundary
+  cases including `LONG_MIN`/`LONG_MAX`, 2M random full-range values
+  per modulus) plus a production-moduli test (`tests/
+  test_embed_barrett_matches_reference.cpp`, 10,400,884 checks against
+  this project's own REAL `native_primes()`-generated moduli at every
+  supported n/sizeQ) — **22,400,986 total checks, ZERO mismatches**,
+  exact integer arithmetic, no tolerance anywhere.
+- **Production-integration correctness** (`tests/
+  test_encrypt_host_shoup_pooled_barrett_matches_reference.cpp`):
+  bit-exact vs. the untouched `encrypt_host` across n/sizeQ combinations
+  x message patterns including `LONG_MIN`/`LONG_MAX`-adjacent and dense
+  mixed-sign/magnitude, plus the pool-reuse/interleaved-different-keys
+  stress sections carried forward from Phase 13 — every case EXACT
+  MATCH.
+- **Production swap**: `cpp_bridge/encdec_bridge.cpp`'s `gpufhe_encrypt`
+  now calls `encrypt_host_shoup_pooled_barrett`; `encrypt_host_shoup_
+  pooled` (Phase 13) and `encrypt_host` (Phase 11) both remain fully
+  present, tested, and directly reachable as reference/fallback. Full
+  Rust suite re-confirmed **38 passed, 0 failed, 1 ignored** across 5
+  separate runs under cargo's default PARALLEL execution — zero
+  flakiness, both `--release` and debug.
+- **Benchmarks, interleaved, old implementations kept runnable
+  throughout**: embed loop alone 1.97x(n=8192)-5.13x(n=1024) faster
+  (speedup shrinks with n, consistent with the arithmetic advantage
+  mattering less as the working set becomes more memory/cache-bound).
+  Full `encrypt_host`, unified 3-way interleaved, run twice
+  independently: **1.44x-1.73x faster than the original Phase-11
+  encrypt_host, 1.18x-1.28x faster than Phase 13 alone**, consistent
+  and positive at every n both times. Full real-encrypted pipeline
+  (5-sample medians per n, since single-call timing is cold-start-
+  noisy): **1.17x-1.36x faster than OLD on top of Phase 12's own
+  encode/decode gains**, never a regression. Every correctness gate
+  passed: RNS-level (0 mismatches), real encrypted round trip (error
+  magnitude IDENTICAL across all three encrypt variants at every n,
+  `~5e-12`-`~1e-10` vs. `1e-6` tolerance).
+- `CMakeLists.txt` gained `src/encrypt_host_shoup_pooled_barrett.cpp`
+  in the main library's source list, 3 new correctness tests, and 2 new
+  benchmarks. `rust/crates/ckks-cuda/build.rs` gained compilation of
+  the one new file the production bridge actually calls. Full CMake
+  rebuild NOT attempted this round either (host free memory 1.8-3.1GB
+  throughout, under the 6GB gate) — every claim verified via direct
+  `nvcc`/`g++` compilation to standalone binaries from a CLEAN,
+  from-scratch object-cache rebuild, plus the full `cargo test` suite.
+- **Post-Phase-14 remaining opportunity**: both of `encrypt_host`'s two
+  largest host-side loops (embed and combine) are now optimized, and
+  device alloc/free is already pooled. The clear next candidate is the
+  upload/download transfer stage (19-31% combined, not yet touched) —
+  specifically whether the four separate per-buffer `cudaMemcpy` calls
+  (`d_v,d_e0,d_e1,d_m`) can be merged into fewer, larger transfers.

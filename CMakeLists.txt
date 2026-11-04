@@ -46,6 +46,7 @@ add_library(gpufhe STATIC
   src/encode_fft.cpp
   src/encrypt_host_shoup.cpp
   src/encrypt_host_shoup_pooled.cpp
+  src/encrypt_host_shoup_pooled_barrett.cpp
   src/rotate.cpp
   src/ptops.cpp
   src/params.cpp
@@ -146,6 +147,18 @@ gpufhe_test(test_encode_fft_matches_reference tests/test_encode_fft_matches_refe
 gpufhe_test(test_encrypt_host_shoup_matches_reference tests/test_encrypt_host_shoup_matches_reference.cpp)
 gpufhe_test(test_encrypt_host_shoup_pooled_matches_reference tests/test_encrypt_host_shoup_pooled_matches_reference.cpp)
 gpufhe_test(test_encrypt_host_shoup_pooled_thread_safety tests/test_encrypt_host_shoup_pooled_thread_safety.cpp)
+# GOD PROMPT "CKKS PHASE 14": independent differential test for the
+# Barrett-based embed() replacement (22.4M+ cases incl. LONG_MIN/
+# LONG_MAX, against this project's own real native_primes() moduli),
+# the full production-integration bit-exact test against the untouched
+# encrypt_host, and a dedicated buffer-pool concurrency audit (4
+# scenarios: same-key reuse, concurrent pool growth, longevity,
+# mixed-key race) re-validating Phase 13's mutex design under direct
+# stress. See research/EMBED_AND_POOL_HARDENING.md and research/
+# EXPERIMENT_LEDGER.md entry #47.
+gpufhe_test(test_embed_barrett_matches_reference tests/test_embed_barrett_matches_reference.cpp)
+gpufhe_test(test_encrypt_host_shoup_pooled_barrett_matches_reference tests/test_encrypt_host_shoup_pooled_barrett_matches_reference.cpp)
+gpufhe_test(test_encrypt_host_shoup_pooled_barrett_concurrency_audit tests/test_encrypt_host_shoup_pooled_barrett_concurrency_audit.cpp)
 gpufhe_test(test_keygen tests/test_keygen.cpp)
 gpufhe_test(test_evalkeygen tests/test_evalkeygen.cpp)
 # GOD PROMPT "CKKS PHASE 8": fully native (OpenFHE-free) isolation of
@@ -316,6 +329,14 @@ gpufhe_test(bench_encrypt_profile bench/bench_encrypt_profile.cpp)
 gpufhe_test(bench_encrypt_shoup_vs_reference bench/bench_encrypt_shoup_vs_reference.cpp)
 gpufhe_test(bench_encrypt_shoup_pooled_vs_reference bench/bench_encrypt_shoup_pooled_vs_reference.cpp)
 gpufhe_test(bench_encrypt_all_variants bench/bench_encrypt_all_variants.cpp)
+# GOD PROMPT "CKKS PHASE 14": isolated embed-loop-only A/B benchmark
+# (OLD signed-% vs NEW per-tower Barrett) plus a unified three-way
+# interleaved benchmark (OLD encrypt_host / Phase 13 Shoup+pooled /
+# Phase 14 +Barrett-embed) in one run. See research/
+# EMBED_AND_POOL_HARDENING.md and research/EXPERIMENT_LEDGER.md entry
+# #47.
+gpufhe_test(bench_embed_barrett_vs_reference bench/bench_embed_barrett_vs_reference.cpp)
+gpufhe_test(bench_encrypt_phase14_all_variants bench/bench_encrypt_phase14_all_variants.cpp)
 gpufhe_test(test_mult_barrett tests/test_mult_barrett.cpp)
 # Directive "VERIFY OOM DIAGNOSIS AND REMOVE THE LARGE-N DIAGONAL
 # BOTTLENECK", Priority 3: proves an O(S*2^RST) analytic replacement for

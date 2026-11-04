@@ -167,6 +167,13 @@ fn main() {
     // encrypt_host above, which remains as the tested reference/
     // fallback). See research/ENCRYPT_PROFILING.md.
     objs.push(compile_cpp(&root.join("src/encrypt_host_shoup_pooled.cpp"), &out_dir, &include_dir, &cuda_include));
+    // GOD PROMPT "CKKS PHASE 14": the new Barrett-embed + Shoup-modmul +
+    // pooled-buffer encrypt_host_shoup_pooled_barrett, now the actual
+    // production path (cpp_bridge/encdec_bridge.cpp's gpufhe_encrypt
+    // calls this, not encrypt_host_shoup_pooled above, which remains as
+    // the tested reference/fallback). See research/
+    // EMBED_AND_POOL_HARDENING.md.
+    objs.push(compile_cpp(&root.join("src/encrypt_host_shoup_pooled_barrett.cpp"), &out_dir, &include_dir, &cuda_include));
     objs.push(compile_cpp(
         &manifest_dir.join("cpp_bridge/native_root_bridge.cpp"),
         &out_dir, &include_dir, &cuda_include,

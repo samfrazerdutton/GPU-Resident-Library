@@ -3,20 +3,22 @@
 ## Current commit
 
 Check `git log -3` on resume. As of this writing, HEAD is a new commit
-on top of entry #45's commit `4a62f0a` (the GOD PROMPT "CKKS PHASE 13"
-round: deep-profiled `encrypt_host`, found the host-side `embed` and
-`combine` loops -- not the already-batched NTT -- dominate its cost,
-fixed `combine`'s slow `__umodti3`-based modmul with Shoup's
-precomputed-constant technique and eliminated repeated device-buffer
-alloc/free with a process-lifetime pool, found and fixed a real data
-race in the pooled version along the way (confirmed via
-`--test-threads=1` and a dedicated multi-threaded stress test) -- 1.10x
--1.84x faster `encrypt_host`, 1.02x-1.18x faster full real-encrypted
-pipeline on top of Phase 12's own gains, zero correctness regression.
-The old `encrypt_host` remains fully present, tested, and reachable as
-reference/fallback. See `EXPERIMENT_LEDGER.md` entry #46 and
-`research/ENCRYPT_PROFILING.md` for full detail). Confirm push status
--- push again if `git status` shows ahead of origin.
+on top of entry #46's commit `4d46420` (the GOD PROMPT "CKKS PHASE 14"
+round: audited Phase 13's device-buffer pool against every concurrency
+scenario -- found the existing single-mutex design already sound,
+hardened it with 4 new targeted tests (same-key reuse, concurrent pool
+growth, longevity, mixed-key race, 5 runs x 0/396 mismatches) -- then
+optimized `embed` (encrypt_host's remaining largest stage at 20-27% of
+total) with a per-tower precomputed Barrett reduction, derived for the
+FULL int64_t range including LONG_MIN and validated 22.4M+ times with
+zero mismatches before touching production. 1.44x-1.73x faster
+`encrypt_host`, 1.17x-1.36x faster full real-encrypted pipeline on top
+of Phase 13's own gains, zero correctness regression. The old
+`encrypt_host_shoup_pooled` (Phase 13) and `encrypt_host` (Phase 11)
+both remain fully present, tested, and reachable as reference/
+fallback. See `EXPERIMENT_LEDGER.md` entry #47 and `research/
+EMBED_AND_POOL_HARDENING.md` for full detail). Confirm push status --
+push again if `git status` shows ahead of origin.
 
 **Reminder, confirmed the hard way in an earlier round**: this machine
 has (at least) two SEPARATE git clones of this GitHub repo -- the WSL
@@ -27,63 +29,60 @@ an entirely unrelated commit history (raw CUDA-kernel-optimization
 work) and untracked, stale copies of `rust/`/`research/` -- never run
 `git status`/`log`/commit decisions against it for this work.
 
-## READ THIS FIRST if resuming into performance work: `encrypt_host`'s combine/embed loops were the real cost, not its NTT -- both encode/decode AND encrypt are now optimized, `embed` is the next candidate, and the GPU chain is still only ~1% of latency
+## READ THIS FIRST if resuming into performance work: `encrypt_host`'s two largest host-side loops (combine AND embed) are both now optimized; the next candidate is upload/download transfer batching, and the GPU chain is still only ~1% of latency
 
-**Phase 13's core result**: `encrypt_host_shoup_pooled` (`src/
-encrypt_host_shoup_pooled.cpp`) is now the actual production path
-(`cpp_bridge/encdec_bridge.cpp`'s `gpufhe_encrypt` calls it) -- Phase
-12's own "clear next experiment" (profile encrypt_host internally) is
-DONE. Profiling found the already-batched NTT kernel is NOT the
-bottleneck (5.7-13% of total, shrinking with n) -- the real costs are
-`embed` (RNS embedding, 20-27%, the single largest stage) and `combine`
-(final ciphertext assembly, 17-24%), plus device alloc+free (10-27%).
-`combine`'s generic `(a*b)%q` was confirmed via direct assembly
-inspection to call libgcc's slow `__umodti3`. Fixed with Shoup's
-precomputed-constant modmul (reusing the technique this codebase's own
-CUDA kernels already use) PLUS a process-lifetime device-buffer pool
-keyed by `(n,sizeQ)`. **A real data race was found and fixed along the
-way**: the first pooled version failed 4/38 Rust tests under cargo's
-default parallel execution (wrong decrypted values); fixed with one
-mutex, re-verified via `--test-threads=1` AND a dedicated multi-
-threaded C++ stress test (0/48 mismatches across 3 runs). The old
-`encrypt_host` (`src/encdec.cpp`, Phase 11's batched-NTT version) is
-UNCHANGED and remains fully present, tested, and directly callable as
-reference/fallback. Measured 1.10x-1.84x faster `encrypt_host`
-(interleaved A/B/C, multiple runs) and 1.02x-1.18x faster full real-
-encrypted pipeline on top of Phase 12's own gains (5-sample medians per
-n, since single-call timing is cold-start-noisy). Full Rust suite
-unaffected: 38 passed, 0 failed, 1 ignored, both build profiles, under
-cargo's DEFAULT PARALLEL execution.
+**Phase 14's core result**: `encrypt_host_shoup_pooled_barrett` (`src/
+encrypt_host_shoup_pooled_barrett.cpp`) is now the actual production
+path (`cpp_bridge/encdec_bridge.cpp`'s `gpufhe_encrypt` calls it) --
+Phase 13's own "clear next experiment" (optimize `embed`) is DONE.
+`embed` was confirmed via assembly inspection to compile to TWO
+hardware `idiv` instructions per call (not a slow software call like
+Phase 13's `combine` fix needed) -- fixed with a per-TOWER (not
+per-coefficient) precomputed Barrett reduction, derived to handle the
+FULL `int64_t` input range correctly including `LONG_MIN` (an
+unsigned-negation trick avoids all signed-overflow UB), and validated
+with 22.4 MILLION differential-test cases (12M synthetic + 10.4M
+against this project's own real moduli) before any production file
+was touched -- zero mismatches. Before integrating, Phase 13's device-
+buffer pool was ALSO re-audited against every concurrency scenario the
+governing directive listed (ownership, lifetime, mutex scope, streams,
+sync-before-reuse, failure paths, reentrancy, exceptions) and hardened
+with 4 new targeted multi-threaded tests (same-key reuse, concurrent
+pool growth on fresh keys, 200-iteration longevity, mixed-key race) --
+5 independent runs, 0/396 mismatches every time; the existing
+single-mutex design was found already sound and reused unchanged. The
+old `encrypt_host_shoup_pooled` (Phase 13) and `encrypt_host` (Phase
+11) both remain fully present, tested, and directly callable as
+reference/fallback. Measured 1.44x-1.73x faster `encrypt_host` (vs. the
+original Phase-11 version), 1.18x-1.28x faster than Phase 13 alone,
+and 1.17x-1.36x faster full real-encrypted pipeline on top of Phase
+12's own encode/decode gains. Full Rust suite unaffected: 38 passed, 0
+failed, 1 ignored, both build profiles, re-confirmed across 5 separate
+runs under cargo's DEFAULT PARALLEL execution with zero flakiness.
 
-**POST-Phase-13 ranked bottleneck inside encrypt_host** (the next thing
-to fix if performance work continues): `embed` (RNS embedding, NOT
-touched by either optimization this round) is now almost certainly the
-single largest remaining cost -- same double-loop shape as `combine`
-but using signed hardware division (`%`) rather than `__umodti3`, so a
-smaller win is expected than `combine`'s own Shoup fix delivered, but
-it is the clear next candidate. The GPU-resident tensor+keyswitch+
-combine+rescale chain is still only ~1% of total latency, same
-conclusion as every prior phase.
+**POST-Phase-14 ranked bottleneck inside encrypt_host** (the next thing
+to fix if performance work continues): both `embed` and `combine` are
+now optimized, and device alloc/free is already pooled (Phase 13). The
+clear next candidate is upload/download transfer batching -- the four
+separate per-buffer `cudaMemcpy` calls for `d_v,d_e0,d_e1,d_m` (19-31%
+of total time combined, per the original Phase 13 profile, not yet
+touched) might merge into fewer, larger transfers the same way Phase
+11's NTT batching reduced kernel-launch overhead. The GPU-resident
+tensor+keyswitch+combine+rescale chain is still only ~1% of total
+latency, same conclusion as every prior phase.
 
-**Two secondary candidates considered, NOT pursued this round**: (a)
-investigating WHY pooling's incremental benefit is so n-dependent
-(dramatic at n=2048, modest at n=1024/4096) -- would need per-process
-GPU allocator tracing, unavailable in this WSL2/CUDA-passthrough setup
-(same limitation `MEMORY_FEASIBILITY.md` already hit for GPU memory);
-(b) applying Shoup/Barrett to the `embed` loop's signed 64-bit `%` --
-a real but smaller opportunity than `combine`'s fix was, flagged as the
-clear next experiment above rather than attempted this round (per the
-"do not stack unverified changes" discipline -- this round already
-shipped two).
-
-**Do not re-measure the Phase-12-era baseline numbers (1.16/0.29/17.0ms
-for encode/decode/encrypt at n=8192) as if they still apply** --
-`bench/bench_evalmult_e2e_breakdown.cpp` (now extended with a
-`useFastEncrypt` A/B flag alongside Phase 12's `useFft`) is the
-current, correct per-stage benchmark; re-run it fresh rather than
-citing this entry's, entry #44's, or entry #45's own tables. For
-`encrypt_host`'s OWN internal stage breakdown specifically, use `bench/
-bench_encrypt_profile.cpp` (new this round) rather than re-deriving it.
+**Do not re-measure the Phase-13-era baseline numbers as if they still
+apply** -- `bench/bench_evalmult_e2e_breakdown.cpp` (now extended with
+a 3-way `encryptVariant` int flag: 0=OLD encrypt_host, 1=Phase 13,
+2=Phase 14, alongside Phase 12's `useFft`) is the current, correct
+per-stage benchmark; re-run it fresh rather than citing this entry's or
+any earlier entry's own tables. For `encrypt_host`'s OWN internal stage
+breakdown, `bench/bench_encrypt_profile.cpp` (Phase 13) still reflects
+the ORIGINAL `encrypt_host`'s breakdown (useful for understanding what
+embed/combine used to cost) -- it was not re-run against the Phase 14
+function this round; a fresh profiling pass against `encrypt_host_
+shoup_pooled_barrett` specifically would be needed to get an updated
+per-stage breakdown (upload/download/alloc/etc.) for that function.
 
 ## Phase 10 recap (for key-switch/EvalMult correctness context, superseded as the primary focus by Phase 11's performance work above): the real encrypted EvalMult AND key-switch round trips both PASS. Invalid configurations are REJECTED at construction time, not just avoided by convention.
 
