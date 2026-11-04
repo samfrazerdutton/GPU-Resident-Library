@@ -3,22 +3,24 @@
 ## Current commit
 
 Check `git log -3` on resume. As of this writing, HEAD is a new commit
-on top of entry #46's commit `4d46420` (the GOD PROMPT "CKKS PHASE 14"
-round: audited Phase 13's device-buffer pool against every concurrency
-scenario -- found the existing single-mutex design already sound,
-hardened it with 4 new targeted tests (same-key reuse, concurrent pool
-growth, longevity, mixed-key race, 5 runs x 0/396 mismatches) -- then
-optimized `embed` (encrypt_host's remaining largest stage at 20-27% of
-total) with a per-tower precomputed Barrett reduction, derived for the
-FULL int64_t range including LONG_MIN and validated 22.4M+ times with
-zero mismatches before touching production. 1.44x-1.73x faster
-`encrypt_host`, 1.17x-1.36x faster full real-encrypted pipeline on top
-of Phase 13's own gains, zero correctness regression. The old
-`encrypt_host_shoup_pooled` (Phase 13) and `encrypt_host` (Phase 11)
-both remain fully present, tested, and reachable as reference/
-fallback. See `EXPERIMENT_LEDGER.md` entry #47 and `research/
-EMBED_AND_POOL_HARDENING.md` for full detail). Confirm push status --
-push again if `git status` shows ahead of origin.
+on top of entry #47's commit `7ea73fd` (the GOD PROMPT "CKKS PHASE 15"
+round: merged encrypt_host's 8 separate H2D/D2H transfer calls into 2
+over one packed buffer, same kernel-launch logic unchanged -- 1.07x-
+1.17x faster than Phase 14 alone, 1.57x-2.78x faster than the original
+encrypt_host. ALSO built and fully verified a second experiment, pinned
+host staging memory, which looked even better in an isolated,
+warmed-up benchmark (1.06x-1.17x further speedup) -- but the full-
+pipeline benchmark's cold single-call measurement exposed the OPPOSITE
+result, root-caused to `cudaMallocHost` costing ~3-8ms per distinct
+(n,sizeQ) key (more than encrypt_host's entire typical latency), making
+it a net loss for low-repetition usage. Correctly NOT integrated into
+production per the directive's own instruction, kept in the repo as a
+documented experiment. Zero correctness regression either way. The old
+`encrypt_host_shoup_pooled_barrett` (Phase 14) and `encrypt_host`
+(Phase 11) both remain fully present, tested, and reachable as
+reference/fallback. See `EXPERIMENT_LEDGER.md` entry #48 and `research/
+TRANSFER_PROFILING.md` for full detail). Confirm push status -- push
+again if `git status` shows ahead of origin.
 
 **Reminder, confirmed the hard way in an earlier round**: this machine
 has (at least) two SEPARATE git clones of this GitHub repo -- the WSL
@@ -29,60 +31,65 @@ an entirely unrelated commit history (raw CUDA-kernel-optimization
 work) and untracked, stale copies of `rust/`/`research/` -- never run
 `git status`/`log`/commit decisions against it for this work.
 
-## READ THIS FIRST if resuming into performance work: `encrypt_host`'s two largest host-side loops (combine AND embed) are both now optimized; the next candidate is upload/download transfer batching, and the GPU chain is still only ~1% of latency
+## READ THIS FIRST if resuming into performance work: transfer batching is DONE and shipped; a pinned-memory follow-up was built, verified, measured FASTER in isolation, then found to be a net loss for real usage and correctly NOT shipped -- read this before re-attempting pinned memory
 
-**Phase 14's core result**: `encrypt_host_shoup_pooled_barrett` (`src/
-encrypt_host_shoup_pooled_barrett.cpp`) is now the actual production
-path (`cpp_bridge/encdec_bridge.cpp`'s `gpufhe_encrypt` calls it) --
-Phase 13's own "clear next experiment" (optimize `embed`) is DONE.
-`embed` was confirmed via assembly inspection to compile to TWO
-hardware `idiv` instructions per call (not a slow software call like
-Phase 13's `combine` fix needed) -- fixed with a per-TOWER (not
-per-coefficient) precomputed Barrett reduction, derived to handle the
-FULL `int64_t` input range correctly including `LONG_MIN` (an
-unsigned-negation trick avoids all signed-overflow UB), and validated
-with 22.4 MILLION differential-test cases (12M synthetic + 10.4M
-against this project's own real moduli) before any production file
-was touched -- zero mismatches. Before integrating, Phase 13's device-
-buffer pool was ALSO re-audited against every concurrency scenario the
-governing directive listed (ownership, lifetime, mutex scope, streams,
-sync-before-reuse, failure paths, reentrancy, exceptions) and hardened
-with 4 new targeted multi-threaded tests (same-key reuse, concurrent
-pool growth on fresh keys, 200-iteration longevity, mixed-key race) --
-5 independent runs, 0/396 mismatches every time; the existing
-single-mutex design was found already sound and reused unchanged. The
-old `encrypt_host_shoup_pooled` (Phase 13) and `encrypt_host` (Phase
-11) both remain fully present, tested, and directly callable as
-reference/fallback. Measured 1.44x-1.73x faster `encrypt_host` (vs. the
-original Phase-11 version), 1.18x-1.28x faster than Phase 13 alone,
-and 1.17x-1.36x faster full real-encrypted pipeline on top of Phase
-12's own encode/decode gains. Full Rust suite unaffected: 38 passed, 0
-failed, 1 ignored, both build profiles, re-confirmed across 5 separate
-runs under cargo's DEFAULT PARALLEL execution with zero flakiness.
+**Phase 15's core result**: `encrypt_host_shoup_pooled_barrett_batched`
+(`src/encrypt_host_shoup_pooled_barrett_batched.cpp`) is now the actual
+production path (`cpp_bridge/encdec_bridge.cpp`'s `gpufhe_encrypt`
+calls it) -- Phase 14's own "clear next experiment" (batch the
+upload/download transfers) is DONE. Traced the four separate
+`d_v/d_e0/d_e1/d_m` transfers, confirmed they share identical size/
+lifetime/pattern, and merged the 8 separate `cudaMemcpy` calls into 2
+(one packed H2D, one packed D2H) over ONE pooled device buffer -- the
+four kernel launches are UNCHANGED, just receiving pointer offsets
+into the packed region. Bit-exact verified against `encrypt_host`
+including a packed-buffer-boundary stress case; the new pooled
+resource's concurrency safety re-audited (not assumed inherited) with
+4 scenarios, 5 runs, 0/396 mismatches. Measured 1.57x-2.78x faster than
+the original `encrypt_host`, 1.07x-1.17x faster than Phase 14 alone.
 
-**POST-Phase-14 ranked bottleneck inside encrypt_host** (the next thing
-to fix if performance work continues): both `embed` and `combine` are
-now optimized, and device alloc/free is already pooled (Phase 13). The
-clear next candidate is upload/download transfer batching -- the four
-separate per-buffer `cudaMemcpy` calls for `d_v,d_e0,d_e1,d_m` (19-31%
-of total time combined, per the original Phase 13 profile, not yet
-touched) might merge into fewer, larger transfers the same way Phase
-11's NTT batching reduced kernel-launch overhead. The GPU-resident
+**A second experiment (pinned host staging memory) was ALSO built,
+fully verified, and measured FASTER in an isolated warmed-up
+benchmark (1.06x-1.17x further speedup) -- but is NOT in production.**
+Wiring it into the full-pipeline benchmark's cold single-call
+measurement showed the OPPOSITE result (slower than Phase 14),
+investigated directly: `cudaMallocHost` costs ~3-8ms per distinct
+`(n,sizeQ)` key on first use (vs. ~0.4-0.5ms for ordinary `cudaMalloc`)
+-- more than `encrypt_host`'s entire typical latency, so any usage
+pattern that doesn't repeat enough calls at one key to amortize this
+cost would see it as a net loss despite the real steady-state benefit.
+**Do not re-attempt wiring the pinned variant (`src/
+encrypt_host_shoup_pooled_barrett_batched_pinned.cpp`, already fully
+built and tested) into production without first solving this cold-
+start problem** -- e.g. an explicit pre-warming step at context-
+creation time, decoupling the one-time `cudaMallocHost` cost from the
+first real encryption call. Full investigation: `research/
+TRANSFER_PROFILING.md`.
+
+The old `encrypt_host_shoup_pooled_barrett` (Phase 14) and
+`encrypt_host` (Phase 11) both remain fully present, tested, and
+directly callable as reference/fallback. Full Rust suite unaffected:
+38 passed, 0 failed, 1 ignored, both build profiles, re-confirmed
+across 4 separate release runs under cargo's DEFAULT PARALLEL
+execution with zero flakiness.
+
+**POST-Phase-15 ranked state inside encrypt_host**: embed, combine, and
+transfer/allocation are all now optimized. The clear next candidate
+(if performance work continues) is the pinned-memory pre-warming idea
+above -- a real, already-measured 1.06x-1.17x win is sitting there,
+blocked only by the cold-start problem, not by any correctness or
+concurrency issue (both are already proven). The GPU-resident
 tensor+keyswitch+combine+rescale chain is still only ~1% of total
 latency, same conclusion as every prior phase.
 
-**Do not re-measure the Phase-13-era baseline numbers as if they still
+**Do not re-measure the Phase-14-era baseline numbers as if they still
 apply** -- `bench/bench_evalmult_e2e_breakdown.cpp` (now extended with
-a 3-way `encryptVariant` int flag: 0=OLD encrypt_host, 1=Phase 13,
-2=Phase 14, alongside Phase 12's `useFft`) is the current, correct
+a 5-way `encryptVariant` int flag: 0=OLD, 1=Phase13, 2=Phase14,
+3=Phase15 Experiment1/production, 4=Phase15 Experiment2/pinned-
+not-shipped, alongside Phase 12's `useFft`) is the current, correct
 per-stage benchmark; re-run it fresh rather than citing this entry's or
-any earlier entry's own tables. For `encrypt_host`'s OWN internal stage
-breakdown, `bench/bench_encrypt_profile.cpp` (Phase 13) still reflects
-the ORIGINAL `encrypt_host`'s breakdown (useful for understanding what
-embed/combine used to cost) -- it was not re-run against the Phase 14
-function this round; a fresh profiling pass against `encrypt_host_
-shoup_pooled_barrett` specifically would be needed to get an updated
-per-stage breakdown (upload/download/alloc/etc.) for that function.
+any earlier entry's own tables. The single-config mode's own default
+is `encryptVariant=3` (the actual production path), NOT 4.
 
 ## Phase 10 recap (for key-switch/EvalMult correctness context, superseded as the primary focus by Phase 11's performance work above): the real encrypted EvalMult AND key-switch round trips both PASS. Invalid configurations are REJECTED at construction time, not just avoided by convention.
 

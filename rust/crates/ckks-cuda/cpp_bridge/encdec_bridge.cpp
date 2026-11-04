@@ -90,6 +90,41 @@ void encrypt_host_shoup_pooled(std::vector<uint64_t>&, std::vector<uint64_t>&, c
 void encrypt_host_shoup_pooled_barrett(std::vector<uint64_t>&, std::vector<uint64_t>&, const std::vector<int64_t>&,
                                         const std::vector<uint64_t>&, const std::vector<uint64_t>&, uint32_t,
                                         const std::vector<uint64_t>&, const std::vector<uint64_t>&, uint64_t, double, uint64_t);
+// GOD PROMPT "CKKS PHASE 15": encrypt_host_shoup_pooled_barrett
+// (Phase 14) remains fully present and tested, as the reference/
+// fallback the governing directive requires -- NOT called from here
+// anymore. This bridge now calls encrypt_host_shoup_pooled_barrett_
+// batched (src/encrypt_host_shoup_pooled_barrett_batched.cpp), which
+// ADDITIONALLY merges the four separate per-buffer H2D/D2H cudaMemcpy
+// calls (for d_v,d_e0,d_e1,d_m) into ONE H2D and ONE D2H call each,
+// over a single packed device buffer -- the four kernel launches
+// themselves are UNCHANGED (same signature, same tables, same tower
+// count; they now receive pointer offsets into one packed allocation
+// instead of four separate ones). Verified bit-exact against
+// encrypt_host, including the packed-buffer boundaries specifically
+// (tests/
+// test_encrypt_host_shoup_pooled_barrett_batched_matches_reference.cpp),
+// and the new pooled resource's concurrency safety re-audited with 4
+// dedicated multi-threaded scenarios (tests/
+// test_encrypt_host_shoup_pooled_barrett_batched_concurrency_audit.cpp,
+// 5 runs, 0/396 mismatches). Measured 1.04x-1.17x faster than Phase 14
+// alone, 1.57x-2.78x faster than the original encrypt_host, before
+// this swap was made.
+//
+// A SECOND experiment this round (pinned host staging memory, src/
+// encrypt_host_shoup_pooled_barrett_batched_pinned.cpp) was built,
+// verified bit-exact, and measured a further REAL 1.06x-1.17x
+// steady-state speedup -- but was NOT promoted here: `cudaMallocHost`
+// was measured to cost ~3-8ms per distinct (n,sizeQ) key on first use
+// (vs. ~0.4-0.5ms for the ordinary `cudaMalloc` this batched version
+// already uses), large enough to exceed a single encrypt call's ENTIRE
+// latency and make the pinned version a net LOSS for any usage pattern
+// that does not repeat many calls at the same key before the process
+// ends. See research/TRANSFER_PROFILING.md for the full measurement
+// and this round's keep/revert reasoning.
+void encrypt_host_shoup_pooled_barrett_batched(std::vector<uint64_t>&, std::vector<uint64_t>&, const std::vector<int64_t>&,
+                                                const std::vector<uint64_t>&, const std::vector<uint64_t>&, uint32_t,
+                                                const std::vector<uint64_t>&, const std::vector<uint64_t>&, uint64_t, double, uint64_t);
 void decrypt_host(std::vector<int64_t>&, const std::vector<uint64_t>&, const std::vector<uint64_t>&,
                    const std::vector<uint64_t>&, uint32_t, const std::vector<uint64_t>&, const std::vector<uint64_t>&);
 }
@@ -132,7 +167,7 @@ void gpufhe_encrypt(const int64_t* m, uint32_t n,
     std::vector<uint64_t> pkAv(pkA, pkA + (size_t)size_q * n), pkBv(pkB, pkB + (size_t)size_q * n);
     std::vector<uint64_t> modv(mod, mod + size_q), rootv(root, root + size_q);
     std::vector<uint64_t> c0, c1;
-    gpufhe::encrypt_host_shoup_pooled_barrett(c0, c1, mv, pkAv, pkBv, n, modv, rootv, ns, sigma, seed);
+    gpufhe::encrypt_host_shoup_pooled_barrett_batched(c0, c1, mv, pkAv, pkBv, n, modv, rootv, ns, sigma, seed);
     std::memcpy(c0_out, c0.data(), (size_t)size_q * n * 8);
     std::memcpy(c1_out, c1.data(), (size_t)size_q * n * 8);
 }

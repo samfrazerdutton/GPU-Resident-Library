@@ -2046,3 +2046,92 @@ end state), confirmed via `git log -1` before any change.
   upload/download transfer stage (19-31% combined, not yet touched) —
   specifically whether the four separate per-buffer `cudaMemcpy` calls
   (`d_v,d_e0,d_e1,d_m`) can be merged into fewer, larger transfers.
+
+## GOD PROMPT "CKKS PHASE 15": merged encrypt_host's 8 separate transfer calls into 2 over one packed buffer (1.07x-1.17x faster) — then measured a SECOND pinned-memory experiment that looked even better in isolation, caught it was actually a net loss for real usage via the full-pipeline benchmark, and correctly did NOT ship it
+
+Full detail: `research/TRANSFER_PROFILING.md` and
+`EXPERIMENT_LEDGER.md` entry #48. Starting commit `7ea73fd` (Phase 14
+end state), confirmed via `git log -1` before any change.
+
+- **Transfer data flow traced (Section 4 of the directive) before
+  changing anything**: `d_v/d_e0/d_e1/d_m` are four separate pooled
+  device buffers, each uploaded/downloaded via its own blocking
+  `cudaMemcpy` from/to a pageable `std::vector`. All four share
+  identical size, lifetime, and transfer pattern (same per-tower
+  modulus/root tables, identical `LaunchNTT_CT_Batched` calls differing
+  only in which pointer is passed) — confirmed safe to pack together,
+  not assumed.
+- **Experiment 1 (KEPT): batched transfers.** `src/
+  encrypt_host_shoup_pooled_barrett_batched.cpp` replaces the four
+  separate device buffers with ONE pooled packed buffer
+  (`[v|e0|e1|m]`, `4*sizeQ*n*8` bytes) and merges the 8 separate
+  transfer calls into 2 (one H2D, one D2H) — the FOUR kernel launches
+  themselves are completely unchanged, just receiving pointer offsets
+  into the packed region instead of four separate buffers. Bit-exact
+  verified against `encrypt_host`, including a dedicated
+  packed-buffer-boundary stress case (distinct extreme values at the
+  first/last tower of each sub-buffer, to catch an off-by-one in the
+  offsets). The new pooled device buffer's concurrency safety was
+  re-audited (not assumed to inherit Phase 14's proof) with 4 targeted
+  multi-threaded scenarios, 5 independent runs, **0/396 mismatches
+  every run**. Measured **1.57x-2.78x faster than the original
+  encrypt_host, 1.07x-1.17x faster than Phase 14 alone**, run twice
+  independently, consistent both times.
+- **Experiment 2 (measured, NOT promoted): pinned host staging
+  memory.** Built on top of Experiment 1 — `src/
+  encrypt_host_shoup_pooled_barrett_batched_pinned.cpp` additionally
+  pools the host-side packed buffer as pinned (`cudaMallocHost`)
+  memory. Also bit-exact verified and concurrency-audited the same
+  way (5 runs, 0/396 mismatches). A standalone, properly-warmed-up
+  benchmark showed a genuine further **1.06x-1.17x steady-state
+  speedup**. **But wiring it into the full-pipeline benchmark's
+  single-call (cold) measurement showed the OPPOSITE result** —
+  slower than Phase 14 — which was investigated directly rather than
+  dismissed: a dedicated timing test found `cudaMallocHost` costs
+  **~3-8ms per distinct `(n,sizeQ)` key** on first use (vs. ~0.4-0.5ms
+  for ordinary `cudaMalloc`), larger than `encrypt_host`'s entire
+  typical latency — meaning any usage pattern that doesn't repeat
+  enough calls at one key to amortize this cost would see Experiment 2
+  as a net LOSS overall, despite its real steady-state benefit. **Per
+  the governing directive's own explicit instruction ("if pinned
+  memory introduces more overhead than it saves, revert it"), this
+  was NOT integrated into production** — kept in the repository as a
+  fully tested, honestly-reported experiment rather than silently
+  discarded.
+- **Production swap**: `cpp_bridge/encdec_bridge.cpp`'s `gpufhe_encrypt`
+  now calls `encrypt_host_shoup_pooled_barrett_batched` (Experiment 1
+  only); `encrypt_host_shoup_pooled_barrett` (Phase 14) and
+  `encrypt_host` (Phase 11) both remain fully present, tested, and
+  directly reachable as reference/fallback. Full Rust suite
+  re-confirmed **38 passed, 0 failed, 1 ignored** across 4 separate
+  release runs under cargo's default PARALLEL execution — zero
+  flakiness, both `--release` and debug.
+- **Full real-encrypted pipeline impact** (5-sample medians per n,
+  since single-call timing is cold-start-noisy — this exact noisiness
+  is what exposed Experiment 2's cold-start cost in the first place):
+  **1.14x-1.33x faster than OLD, 1.04x-1.05x faster than Phase 14
+  alone**, on top of Phase 12's encode/decode gains, never a
+  regression. Every correctness gate passed: RNS-level (0 mismatches),
+  real encrypted round trip (error IDENTICAL across all five measured
+  encrypt variants at every n, `~5e-12`-`~1e-10` vs. `1e-6` tolerance).
+- `CMakeLists.txt` gained both new source files (Experiment 1 and
+  Experiment 2, both kept for the historical record) in the main
+  library's source list, 4 new correctness/concurrency tests, and 3
+  new benchmarks. `rust/crates/ckks-cuda/build.rs` gained compilation
+  of ONLY `src/encrypt_host_shoup_pooled_barrett_batched.cpp` (the one
+  file the production bridge actually calls — the pinned variant was
+  deliberately NOT added to `build.rs`, consistent with this
+  project's established convention of only compiling production-
+  reachable files into the Rust-linked object set). Full CMake rebuild
+  NOT attempted this round either (host free memory 1.2-2.4GB
+  throughout, under the 6GB gate) — every claim verified via direct
+  `nvcc`/`g++` compilation to standalone binaries from a CLEAN,
+  from-scratch object-cache rebuild, plus the full `cargo test` suite.
+- **Post-Phase-15 remaining opportunity**: embed, combine, and
+  transfer/allocation are all now optimized. The clear next candidate
+  is revisiting Experiment 2 with an explicit pre-warming scheme —
+  allocating the pinned pool entry at context-creation time (when a
+  one-time cost is expected and acceptable) rather than lazily on the
+  first real encryption call — which would let production capture the
+  proven steady-state win without the cold-start regression risk this
+  round identified.

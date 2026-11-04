@@ -174,6 +174,16 @@ fn main() {
     // the tested reference/fallback). See research/
     // EMBED_AND_POOL_HARDENING.md.
     objs.push(compile_cpp(&root.join("src/encrypt_host_shoup_pooled_barrett.cpp"), &out_dir, &include_dir, &cuda_include));
+    // GOD PROMPT "CKKS PHASE 15": the new batched-transfer encrypt_host_
+    // shoup_pooled_barrett_batched, now the actual production path
+    // (cpp_bridge/encdec_bridge.cpp's gpufhe_encrypt calls this, not
+    // encrypt_host_shoup_pooled_barrett above, which remains as the
+    // tested reference/fallback). The pinned-memory variant
+    // (encrypt_host_shoup_pooled_barrett_batched_pinned.cpp) was
+    // measured and deliberately NOT added here -- see research/
+    // TRANSFER_PROFILING.md for why (a real steady-state win offset by
+    // a large one-time cudaMallocHost cost per distinct (n,sizeQ) key).
+    objs.push(compile_cpp(&root.join("src/encrypt_host_shoup_pooled_barrett_batched.cpp"), &out_dir, &include_dir, &cuda_include));
     objs.push(compile_cpp(
         &manifest_dir.join("cpp_bridge/native_root_bridge.cpp"),
         &out_dir, &include_dir, &cuda_include,

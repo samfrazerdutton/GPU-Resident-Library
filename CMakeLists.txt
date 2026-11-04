@@ -47,6 +47,8 @@ add_library(gpufhe STATIC
   src/encrypt_host_shoup.cpp
   src/encrypt_host_shoup_pooled.cpp
   src/encrypt_host_shoup_pooled_barrett.cpp
+  src/encrypt_host_shoup_pooled_barrett_batched.cpp
+  src/encrypt_host_shoup_pooled_barrett_batched_pinned.cpp
   src/rotate.cpp
   src/ptops.cpp
   src/params.cpp
@@ -159,6 +161,20 @@ gpufhe_test(test_encrypt_host_shoup_pooled_thread_safety tests/test_encrypt_host
 gpufhe_test(test_embed_barrett_matches_reference tests/test_embed_barrett_matches_reference.cpp)
 gpufhe_test(test_encrypt_host_shoup_pooled_barrett_matches_reference tests/test_encrypt_host_shoup_pooled_barrett_matches_reference.cpp)
 gpufhe_test(test_encrypt_host_shoup_pooled_barrett_concurrency_audit tests/test_encrypt_host_shoup_pooled_barrett_concurrency_audit.cpp)
+# GOD PROMPT "CKKS PHASE 15": correctness + concurrency tests for the
+# batched-transfer production candidate (encrypt_host_shoup_pooled_
+# barrett_batched, bit-exact vs. both encrypt_host and Phase 14, incl.
+# a packed-buffer-boundary stress case) and for the pinned-memory
+# experiment (encrypt_host_shoup_pooled_barrett_batched_pinned, built,
+# verified, and deliberately NOT promoted to production -- see
+# research/TRANSFER_PROFILING.md). Each new pooled resource gets its
+# own dedicated 4-scenario concurrency audit rather than assuming
+# Phase 14's audit generalizes. See research/EXPERIMENT_LEDGER.md
+# entry #48.
+gpufhe_test(test_encrypt_host_shoup_pooled_barrett_batched_matches_reference tests/test_encrypt_host_shoup_pooled_barrett_batched_matches_reference.cpp)
+gpufhe_test(test_encrypt_host_shoup_pooled_barrett_batched_concurrency_audit tests/test_encrypt_host_shoup_pooled_barrett_batched_concurrency_audit.cpp)
+gpufhe_test(test_encrypt_host_shoup_pooled_barrett_batched_pinned_matches_reference tests/test_encrypt_host_shoup_pooled_barrett_batched_pinned_matches_reference.cpp)
+gpufhe_test(test_encrypt_host_shoup_pooled_barrett_batched_pinned_concurrency_audit tests/test_encrypt_host_shoup_pooled_barrett_batched_pinned_concurrency_audit.cpp)
 gpufhe_test(test_keygen tests/test_keygen.cpp)
 gpufhe_test(test_evalkeygen tests/test_evalkeygen.cpp)
 # GOD PROMPT "CKKS PHASE 8": fully native (OpenFHE-free) isolation of
@@ -337,6 +353,13 @@ gpufhe_test(bench_encrypt_all_variants bench/bench_encrypt_all_variants.cpp)
 # #47.
 gpufhe_test(bench_embed_barrett_vs_reference bench/bench_embed_barrett_vs_reference.cpp)
 gpufhe_test(bench_encrypt_phase14_all_variants bench/bench_encrypt_phase14_all_variants.cpp)
+# GOD PROMPT "CKKS PHASE 15": unified 4-way interleaved benchmark
+# (OLD/Phase13/Phase14/Phase15-Experiment1) plus a dedicated isolated
+# A/B isolating Experiment 2's (pinned memory) incremental contribution
+# on top of Experiment 1. See research/TRANSFER_PROFILING.md and
+# research/EXPERIMENT_LEDGER.md entry #48.
+gpufhe_test(bench_encrypt_phase15_all_variants bench/bench_encrypt_phase15_all_variants.cpp)
+gpufhe_test(bench_encrypt_phase15_pinned_vs_batched bench/bench_encrypt_phase15_pinned_vs_batched.cpp)
 gpufhe_test(test_mult_barrett tests/test_mult_barrett.cpp)
 # Directive "VERIFY OOM DIAGNOSIS AND REMOVE THE LARGE-N DIAGONAL
 # BOTTLENECK", Priority 3: proves an O(S*2^RST) analytic replacement for
