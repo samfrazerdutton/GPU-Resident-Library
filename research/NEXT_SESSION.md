@@ -3,7 +3,103 @@
 ## Current commit
 
 Check `git log -3` on resume. As of this writing, HEAD is a new commit
-on top of entry #54's commit `a22ff5f` (the GOD PROMPT "CKKS PHASE 22"
+on top of entry #55's commit `43d541f` (the GOD PROMPT "CKKS PHASE 23"
+round: "FULL CKKS CAPABILITY COMPLETION, APPLICATION READINESS &
+PERFORMANCE AUDIT" -- the first round of a new mission, explicitly NOT
+another isolated microbenchmark. **Section 1-2 (capability audit)**:
+read `research/MIGRATION_MATRIX.md` plus direct source, confirming the
+"Bootstrap pipeline: C++-only done, everything else not started" row
+was accurate. **Section 3 (bootstrap investigation)**: found the
+COMPLETE bootstrap (ModRaise/C2S/EvalMod x2/S2C/recovery, real keys,
+sparse secret h=64, analytic-inverse-DFT C2S with rotation hoisting,
+degree-10-Chebyshev double-angle EvalMod) lives entirely inside
+`tests/test_boot.cpp` (960 lines) -- no dedicated `src/bootstrap.cpp`
+exists. Confirmed, via a memory-safe BUILD-ONLY verification (6 missing
+object files chased down and compiled: `src/ptops.cpp`, `src/rotate.cpp`,
+`kernels/rns_arith.cu`, `kernels/automorph.cu`, `kernels/automorph_eval.cu`,
+`kernels/stage_acc.cu`; final link against `test_boot.cpp` had ZERO
+undefined references), that this pipeline is NOT bit-rotted -- but it
+was **NOT re-run at runtime**: Windows host free RAM measured
+repeatedly at 0.34-0.92GB throughout this phase, the lowest sustained
+range this project has recorded, below any level this project's own
+discipline would permit for an n=8192 run generating dozens of real
+rotation keys. **Explicitly NOT claimed to numerically pass this
+round** -- re-run deferred to a safer-memory session (see `## Blocked
+this round` below). **Section 4 (target selection)**: compared
+rotation, plaintext ops, conjugation, polynomial evaluation, and
+serialization via direct grep/read before choosing. Conjugation
+inherits rotation's status (it IS rotation, by `k=M-1`). Polynomial
+evaluation was rejected -- grepping it surfaces only `test_polyeval`'s
+own still-UNRESOLVED multi-level noise question, which this phase does
+not resolve and the governing directive forbids claiming fixed.
+Serialization does not exist at the C++ level AT ALL (a far larger,
+greenfield lift). **ROTATION selected**: fully implemented in C++,
+already used correctly inside the bootstrap itself (`test_boot.cpp`'s
+own `KROT` rotation-key cache IS this operation), zero Rust/FFI
+exposure, and needed no new cryptographic primitive -- reading
+`src/evalkeygen.cpp` found `evalkeygen_host_sold` already takes an
+explicit, general `sOld` parameter ("generalized: caller supplies the
+switched key" per its own comment), so a rotation eval key
+(`sOld = sigma_k(s)`, not `s^2`) needed only a different argument to an
+already-general function. **Section 5 (implementation)**: new
+`rust/crates/ckks-cuda/cpp_bridge/rotation_bridge.cpp` + new
+`rust/crates/ckks-cuda/src/rotation.rs` (`RotationContext`, same
+setup/hot-path split as `KeySwitchContext`) -- composes ONLY existing
+`gpufhe::` functions, zero production C++ file changed. Caches
+`DeviceKSContext`/`DeviceKSWork` ONCE at construction, unlike
+`rotate_ct_resident`'s own per-call rebuild (its own source comment
+flags this as a known opportunity -- taken here). `build.rs` gained
+`src/rotate.cpp` + 3 kernel files. **9 new Rust tests, 0 mismatches**:
+`rotate` bit-exact vs. the host-orchestrated `rotate_ct_host` oracle
+across random/boundary/repeated-call cases, PLUS a genuinely
+independent real-ciphertext check (encrypt -> rotate -> decrypt ->
+decode vs. an expected slot permutation computed without touching the
+crypto pipeline) that caught a real bug on its first run -- in the
+TEST's own expectation (it assumed a narrow 4-element wraparound
+instead of the TRUE full n/2=512-slot cyclic shift), not the
+implementation; fixed the test, confirmed `rot_amount=r` is a LEFT
+shift (`k=5^r mod 2n`) empirically. **Performance** (n=1024, sizeQ=8,
+sizeP=2, numPart=4, release, cold-start/steady-state kept separate):
+`RotationContext::new` ~524.5ms cold-start; `rotate` steady-state
+median 1.84ms (20 reused-context calls, range 1.64-1.95ms); ~285x
+cold-to-steady ratio. **Full regression**: `cargo test` (debug, 58
+tests): 56 passed, 2 FAILED, but both failures are in
+`codec::registered_tests` (Phase 20/22's unrelated registered-memory
+feature, zero files touched this round), reproduce ONLY alongside 2
+specific earlier tests in that module and PASS in total isolation --
+diagnosed as this session's severe Windows-RAM pressure hitting
+`cudaHostRegister`'s own documented capacity sensitivity, NOT a
+rotation regression; left as found per the governing directive's own
+"do not reopen Phase 22 without a reproducible defect" instruction.
+`cargo test --release rotation::`: 10/10 passed. Graphify refreshed and
+verified (2601->2683 nodes, 5734->5915 edges, 154->159 communities; new
+`RotationContext`/bridge symbols confirmed correctly attributed). See
+`EXPERIMENT_LEDGER.md` entry #56 and `research/MIGRATION_MATRIX.md`'s
+new rotation row for full detail.
+
+## Blocked this round
+
+**Bootstrap runtime re-verification** -- `/tmp/test_boot_build` (or an
+equivalent fresh build) is ready to run; it was NOT executed this round
+because Windows host free RAM was measured at 0.34-0.92GB throughout
+the session (`(Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory/1MB`
+from PowerShell -- WSL `free -h`/`nvidia-smi` both reported abundant
+headroom the whole time, re-confirming yet again that Windows host RAM,
+not WSL or GPU memory, is this project's real constraint). Re-attempt
+`tests/test_boot.cpp` (n=8192, sizeQ=30, sizeP=2) the NEXT time Windows
+free RAM is reliably above ~2-3GB for the session's duration, to get a
+genuine runtime confirmation of `eFin<2e-2` and correct level
+restoration -- per the governing directive's own "never claim
+bootstrapping works until an encrypted ciphertext has passed through
+the complete bootstrap and its restored precision/levels are
+independently validated" requirement. This is the natural next step
+once memory allows; rotation (this round's actual deliverable) is
+already a prerequisite the bootstrap itself depends on, so nothing
+about this round's work needs to be redone first.
+
+## Earlier commit (Phase 22)
+
+HEAD was previously a commit on top of entry #54's commit `a22ff5f` (the GOD PROMPT "CKKS PHASE 22"
 round: completed the missing Rust/FFI validation Phase 20 left open,
 RESOLVED Phase 20's unexplained prewarming anomaly, and reassessed the
 promotion decision with full evidence. Used Graphify BEFORE writing

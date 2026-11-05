@@ -127,6 +127,23 @@ fn main() {
         // Confirmed self-contained the same way (one inline `mulmod64`
         // device helper, defined and used in this one file).
         compile_cuda(&root.join("kernels/tensor.cu"), &out_dir, &include_dir),
+        // Phase 23: rotation's new kernels. automorph_eval.cu is the
+        // eval-domain batched-gather permutation (LaunchAutoEvalPermuteBatched)
+        // src/rotate.cpp's automorphism_eval_fast_device calls (the hot path
+        // this crate's rotation_bridge.cpp actually uses); stage_acc.cu is
+        // the final c0-combine step (LaunchAddInto) rotate_ct_device's (and
+        // rotation_bridge.cpp's) combine step calls. automorph.cu
+        // (LaunchAutomorphPermute) is needed too even though this crate
+        // never calls the function that uses it (automorphism_eval_device,
+        // the slower INTT/permute/NTT path) -- this build script links
+        // whole translation units (no -ffunction-sections), so every
+        // symbol src/rotate.cpp references, used by this crate or not,
+        // must resolve. All three confirmed self-contained the same way as
+        // every kernel above (grepped for cross-file __device__ symbols:
+        // none).
+        compile_cuda(&root.join("kernels/automorph_eval.cu"), &out_dir, &include_dir),
+        compile_cuda(&root.join("kernels/automorph.cu"), &out_dir, &include_dir),
+        compile_cuda(&root.join("kernels/stage_acc.cu"), &out_dir, &include_dir),
     ];
 
     // --- Host-only helpers: plain g++. src/params.cpp defines
@@ -198,6 +215,13 @@ fn main() {
     // TRANSFER_PROFILING.md's Phase 20/22 sections for the full
     // promotion-decision rationale.
     objs.push(compile_cpp(&root.join("src/encrypt_host_shoup_pooled_barrett_batched_registered.cpp"), &out_dir, &include_dir, &cuda_include));
+    // Phase 23: src/rotate.cpp -- the EXISTING, unmodified host-level
+    // rotation API (automorphism_eval_host/automorphism_eval_fast_device/
+    // rotate_ct_host/rotate_ct_resident/rotate_ct_device), now wrapped by
+    // this crate's new cpp_bridge/rotation_bridge.cpp below. No rotation
+    // algorithm is reimplemented here, only compiled directly, same as
+    // every other src/*.cpp file in this list.
+    objs.push(compile_cpp(&root.join("src/rotate.cpp"), &out_dir, &include_dir, &cuda_include));
     objs.push(compile_cpp(
         &manifest_dir.join("cpp_bridge/native_root_bridge.cpp"),
         &out_dir, &include_dir, &cuda_include,
@@ -212,6 +236,10 @@ fn main() {
     ));
     objs.push(compile_cpp(
         &manifest_dir.join("cpp_bridge/encdec_bridge.cpp"),
+        &out_dir, &include_dir, &cuda_include,
+    ));
+    objs.push(compile_cpp(
+        &manifest_dir.join("cpp_bridge/rotation_bridge.cpp"),
         &out_dir, &include_dir, &cuda_include,
     ));
 

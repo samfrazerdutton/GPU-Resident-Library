@@ -35,6 +35,13 @@
 //!   instead of synthetic raw RNS residues. See its module doc comment
 //!   for why this was deferred until every operation it depends on was
 //!   already proven.
+//! - [`rotation`]: the fifth ported operation (Phase 23) -- homomorphic
+//!   rotation (Galois automorphism + key switch), `src/rotate.cpp`.
+//!   Follows the same setup/hot-path split as `keyswitch`, with one new
+//!   eval key convention (`sOld = sigma_k(s)`, not `s^2`) built via the
+//!   EXISTING, already-general `evalkeygen_host_sold`. See
+//!   [`rotation::RotationContext`]'s module doc comment for the full
+//!   target-selection rationale and correctness methodology.
 //!
 //! `ntt` and `rescale` follow an IDENTICAL pattern: a context struct built
 //! once via `::new` that owns every reusable, input-independent resource
@@ -68,9 +75,11 @@ pub mod evalmult;
 pub mod keyswitch;
 pub mod ntt;
 pub mod rescale;
+pub mod rotation;
 mod util;
 
 pub use evalmult::EvalMultContext;
 pub use keyswitch::KeySwitchContext;
 pub use ntt::{cold_start_cost_probe, native_root, ntt_roundtrip, NttContext};
 pub use rescale::{cold_start_cost_probe as rescale_cold_start_cost_probe, native_rescale_consts, RescaleContext};
+pub use rotation::RotationContext;

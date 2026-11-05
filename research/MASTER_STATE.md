@@ -1,9 +1,22 @@
 # Master state
 
-Last updated: this session, GOD PROMPT "CKKS PHASE 5" round (real
-encode/encrypt/decrypt proven; the real encrypted EvalMult round trip
-found BLOCKED, on top of commit `6a3cf64`). **Read `## GOD PROMPT "CKKS
-PHASE 5"` near the end of this file first**, and `research/
+**STOP -- this file's body is historical (frozen at GOD PROMPT "CKKS
+PHASE 5"). For the actual current state, read `research/NEXT_SESSION.md`
+("## Current commit" at its top) and `research/MIGRATION_MATRIX.md`
+first.** As of GOD PROMPT "CKKS PHASE 23" (on top of commit `43d541f`),
+the Rust/CUDA evolution has reached FIVE ported operations (NTT,
+rescale, key switching, EvalMult, and rotation -- Phase 23's own
+addition, see `EXPERIMENT_LEDGER.md` entry #56), a complete-but-
+C++-only, build-verified-not-runtime-reconfirmed CKKS bootstrap
+(`tests/test_boot.cpp`), and CUDA-registered host memory as an opt-in
+experimental encryption path (Phase 20/22) -- none of this is
+production-integrated, and the main C++ engine's own
+production/security state described below is unaffected by any of it.
+
+Last updated (of the body below): this session, GOD PROMPT "CKKS PHASE 5"
+round (real encode/encrypt/decrypt proven; the real encrypted EvalMult
+round trip found BLOCKED, on top of commit `6a3cf64`). **Read `## GOD
+PROMPT "CKKS PHASE 5"` near the end of this file first**, and `research/
 MIGRATION_MATRIX.md` for the condensed per-operation status table
 (including the new "Real encrypted round trip" column — do not confuse
 it with "Independently tested," which is a weaker, RNS-level-only
