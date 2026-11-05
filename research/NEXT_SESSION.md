@@ -3,7 +3,49 @@
 ## Current commit
 
 Check `git log -3` on resume. As of this writing, HEAD is a new commit
-on top of entry #53's commit `f20fa88` (the GOD PROMPT "CKKS PHASE 21"
+on top of entry #54's commit `a22ff5f` (the GOD PROMPT "CKKS PHASE 22"
+round: completed the missing Rust/FFI validation Phase 20 left open,
+RESOLVED Phase 20's unexplained prewarming anomaly, and reassessed the
+promotion decision with full evidence. Used Graphify BEFORE writing
+code -- `graphify explain` confirmed in one command that no Rust/FFI
+caller existed yet for the registered path; refreshed the graph 3
+times during the work and verified the new symbols appear correctly
+connected afterward. Added `codec::encrypt_registered`/
+`prewarm_registered_buffer`/`registered_buffer_is_ready` to Rust (3
+new `extern "C"` functions in `cpp_bridge/encdec_bridge.cpp`, 1
+missing `build.rs` compile-list entry that was the SOLE reason this
+path was unreachable from Rust before, a new diagnostic C++ entry
+point the ORIGINAL Phase 20 function now delegates to unchanged).
+`codec::encrypt`'s own behavior is completely untouched. **8 new Rust
+tests, 0 mismatches**: correctness vs. production, pool reuse, prewarm
+idempotency, budget exhaustion with real fallback (14 keys, some
+registered, some correctly falling back), validation-error parity, 2
+concurrency scenarios (84 operations), and the critical real encrypted
+encode→encrypt_registered→EvalMult→decrypt→decode round trip through
+the actual Rust API (not RNS-only) -- PASSES. **A real bug found, NOT
+fixed (out of scope), documented**: `gpufhe_ks_fixture_create` crashes
+with `std::bad_alloc` at `size_q=5, size_p=2, num_part=4` specifically
+-- a pre-existing eval-keygen defect, unrelated to registered memory,
+this phase's own tests simply avoid. **Prewarming anomaly RESOLVED,
+not left inconclusive**: Phase 20's own benchmark compared DIFFERENT
+`(n,sizeQ)` keys between its lazy/prewarmed configs -- a confound. A
+controlled re-test at the IDENTICAL key (separate fresh processes)
+found NO real difference (confirmed by a structural source-code
+argument too: the C++ pool cannot distinguish how a key became
+ready). **Full pipeline re-measured**: `encrypt_registered` at or
+below `encrypt` in 3/3 runs through the ACTUAL Rust API (ratios
+0.873-0.970), confirming the win survives the FFI boundary. **Decision:
+Category B -- STILL RETAINED AS OPT-IN, not promoted** -- every
+safety/correctness criterion Phase 20 left open is now resolved; the
+ONLY remaining question is whether a modest, reproducible win
+justifies the added complexity for the DEFAULT path, a judgment call,
+not a safety one. See `EXPERIMENT_LEDGER.md` entry #55 and `research/
+TRANSFER_PROFILING.md`'s Phase 22 section for full detail.
+
+## Earlier commit (Phase 21)
+
+HEAD was previously a commit on top of entry #53's commit `f20fa88`
+(the GOD PROMPT "CKKS PHASE 21"
 round: NOT a CKKS research round -- a tooling/workflow integration.
 Installed Graphify (`pipx install graphifyy`, version `0.9.102`), a
 local, zero-LLM-backend code knowledge graph (tree-sitter AST,
@@ -20,8 +62,8 @@ is untouched) and added `.claude/skills/graphify/` +
 verified non-blocking -- detached background rebuild, 600s timeout,
 never delays `git commit`) plus a union-merge driver for
 `graphify-out/graph.json` were installed for auto-refresh. The graph
-itself (2539 nodes, 5563 edges, 162 communities after this phase's own
-edits) is committed (`graphify-out/graph.json`, `GRAPH_REPORT.md`,
+itself (2539 nodes, 5563 edges, 162 communities at the time) was
+committed (`graphify-out/graph.json`, `GRAPH_REPORT.md`,
 `.graphify_analysis.json`); `graph.html`/`cache/`/`manifest.json`/
 `.graphify_root` are gitignored as machine-specific or disposable.
 **A documented, honest 12-question validation suite** (`research/
@@ -30,16 +72,11 @@ navigation (god nodes, call paths, which tests reference a function)
 but confirmed real gaps: `CMakeLists.txt`/CTest registration is NOT
 indexed at all (CMake isn't a parsed language here); research `*.md`
 docs appear only as lightweight reference nodes, not semantically
-searchable (Phase 19/20's actual findings are NOT graph-answerable,
-by design -- Layer B stays authoritative); free-text `graphify query`
-can mis-seed on confusingly-named local symbols (`graphify explain
-"<exact name>"` is more reliable). Graphify's own `graphify benchmark`
-command measured 91.2x fewer tokens per query vs. naive full-corpus
-reading, on this actual repo. **No CKKS code, cryptographic behavior,
-or research conclusion was touched this phase.** See `EXPERIMENT_LEDGER.md`
-entry #54 and `research/GRAPHIFY_GUIDE.md` for full detail.
-
-## Earlier commit (Phase 20)
+searchable; free-text `graphify query` can mis-seed on confusingly-
+named local symbols (`graphify explain "<exact name>"` is more
+reliable). No CKKS code, cryptographic behavior, or research
+conclusion was touched that round. See `EXPERIMENT_LEDGER.md` entry
+#54 and `research/GRAPHIFY_GUIDE.md` for full detail.
 
 HEAD was previously a commit on top of entry #52's commit `8d6dbe4`
 (the GOD PROMPT "CKKS PHASE 20"
@@ -170,57 +207,52 @@ every known extraction gap, and the four-layer memory-architecture
 rationale: `research/GRAPHIFY_GUIDE.md`. `EXPERIMENT_LEDGER.md` entry
 #54.
 
-## READ THIS SECOND if resuming into pinned-memory work: a CUDA-registered host memory PROTOTYPE now exists (`include/registered_host_buffer.h` + `src/encrypt_host_shoup_pooled_barrett_batched_registered.cpp`), correctness/concurrency-verified, measurably resolves the pinned variant's cold-start weakness and wins modestly in steady state -- RETAINED AS OPT-IN, NOT promoted; two concrete follow-ups are open
+## READ THIS SECOND if resuming into pinned-memory work: CUDA-registered host memory is now Rust/FFI-ACCESSIBLE (`codec::encrypt_registered`), fully correctness/concurrency-verified at BOTH the C++ and Rust layers, and the prewarming anomaly is RESOLVED (it was a benchmark confound) -- STILL RETAINED AS OPT-IN; the only remaining question is magnitude-vs-complexity, not safety
 
-**Phase 20's core result**: Phase 19 found `cudaHostRegister` on
-pre-touched memory is mechanistically cheaper than `cudaMallocHost`/
-`cudaHostAlloc`. This phase turned that into a real, tested prototype.
-`RegisteredHostBuffer` (move-only RAII, 4-state machine) is the new
-ownership model; `encrypt_host_shoup_pooled_barrett_batched_registered`
-mirrors Phase 15's pinned variant exactly except the host staging
-buffer's allocation mechanism, registering ONCE per `(n,sizeQ)` key
-with a self-imposed 16MiB cumulative budget and a safe, leak-free
-fallback to the unmodified production pageable path if that budget is
-exceeded or registration fails.
+**Phase 20 built the C++ prototype; Phase 22 completed the missing
+Rust/FFI validation and resolved both open items Phase 20 left
+behind.** `RegisteredHostBuffer` (move-only RAII) + `encrypt_host_
+shoup_pooled_barrett_batched_registered` (C++, Phase 20) are now
+reachable from Rust via `codec::encrypt_registered`/
+`prewarm_registered_buffer`/`registered_buffer_is_ready` (Phase 22) --
+`codec::encrypt`'s own behavior is completely unchanged either way.
 
-**Correctness and concurrency are fully proven**: bit-exact vs.
-`encrypt_host`/Phase 15 batched/Phase 15 pinned across every size/
-boundary/repeat/interleave this project tests (0 mismatches); the real
-encrypted encode/encrypt/EvalMult/decrypt/decode pipeline (identical
-max error across all three implementations, [PASS]); a 6-scenario,
-436-check concurrency audit (0 mismatches), including prewarm racing
-with real encryption and fallback-under-genuine-budget-pressure (12
-registered + 4 correctly fell back, in the same run, both correct).
+**Both of Phase 20's own "unresolved follow-ups" are now resolved**:
+(1) the explicit-prewarming anomaly (prewarmed buffers measured
+slightly slower, every run) was found to be a BENCHMARK CONFOUND --
+Phase 20's own lazy/prewarmed comparison used DIFFERENT `(n,sizeQ)`
+keys (`sizeQ` vs. `sizeQ+1`). A controlled re-test at the IDENTICAL
+key, via separate fresh processes, found NO real difference
+(confirmed independently by a structural code argument: the C++ pool
+cannot tell how a key became ready). (2) Rust/FFI validation now
+exists: 8 new tests, 0 mismatches, including the real encrypted
+encode→encrypt_registered→EvalMult→decrypt→decode round trip through
+the ACTUAL Rust API (not RNS-only) -- PASSES. A concurrency audit at
+the Rust layer (84 operations, 0 mismatches) complements the
+re-confirmed C++ one (436 checks, 0 mismatches).
 
-**Performance, measured not assumed**: the registered path's
-cold-start (~9.0-9.4ms) is ~2.1-2.4x CHEAPER than the pinned path's
-cold-start (~18.9-21.6ms) -- this is the first concrete demonstration
-that the exact cold-start weakness blocking Phase 15/16's pinned
-variant from production (see "READ THIS FOURTH" below) can be
-resolved. In steady state, the registered path consistently beat
-production by ~7-14% across 3 independent fresh-process runs, and was
-competitive with the (unshipped) pinned path. `nsys`, profiling the
-REAL production-shaped code (not just Phase 19's isolated diagnostic),
-confirms `cudaHostRegister` is ~4.8x cheaper per call than
-`cudaHostAlloc` here too.
+**Performance confirmed again, now through Rust too**: `encrypt_
+registered` was at or below `encrypt` in 3/3 runs through the actual
+Rust API (ratios 0.873-0.970) -- the modest, reproducible win Phase
+20 found at the C++ level survives the FFI boundary crossing.
 
-**Two concrete, unresolved follow-ups, if this is revisited**: (1) an
-explicitly-prewarmed buffer was consistently slightly SLOWER than a
-lazily-created-on-first-use one, every one of 3 runs -- not
-investigated further this round, worth a dedicated look; (2) only 4
-total fresh-process repetitions were measured (fewer than this
-project's own 5+-run bar for its strongest claims), and there is
-ZERO Rust/FFI-layer validation -- `cpp_bridge/encdec_bridge.cpp` and
-`rust/crates/ckks-cuda` were never touched.
+**A real, separate, narrow bug was found and documented (NOT fixed,
+out of scope)**: `gpufhe_ks_fixture_create` crashes with `std::bad_
+alloc` at `size_q=5, size_p=2, num_part=4` specifically, regardless of
+`n` -- a pre-existing eval-key-generation defect, unrelated to
+registered memory itself. Avoid this exact combination in any new
+test; a future phase may want to investigate it directly.
 
-**Decision: Category B -- RETAIN AS AN OPT-IN EXPERIMENTAL C++
-FEATURE, NOT promoted to production, NOT wired into the Rust API.**
-This is a stronger case than Phase 15/16's pinned variant ever
-achieved (it resolves pinned's own blocking weakness), but the
-magnitude (~7-14%) and the two open items above make promotion
-premature. `encrypt_host_shoup_pooled_barrett_batched` (production)
-is completely unchanged. Full detail: `research/TRANSFER_PROFILING.md`'s
-Phase 20 section.
+**Decision: Category B -- STILL RETAINED AS AN OPT-IN EXPERIMENTAL
+FEATURE, NOT promoted to production.** Every safety/correctness
+criterion is now satisfied; the ONLY remaining question is whether a
+modest (single-digit-to-low-double-digit percent) win justifies the
+registered pool's own machinery becoming part of the DEFAULT
+production path -- a complexity judgment call, not something further
+testing resolves. `encrypt_host_shoup_pooled_barrett_batched`/
+`codec::encrypt` (production) remain completely unchanged. Full
+detail: `research/TRANSFER_PROFILING.md`'s Phase 20 AND Phase 22
+sections.
 
 ## READ THIS THIRD if resuming into pinned-memory work: the root mechanism is now PROVEN (`ioctl()`-bound, every call, via NVIDIA's own tracer) -- this is the finding Phase 20 (above) turned into a working prototype
 

@@ -140,6 +140,18 @@ struct EncryptBufPoolRegistered {
     uint64_t* d_mod = nullptr;
     uint32_t sizeQ = 0;
     bool ready = false; // true iff h_packed registered successfully AND stayed within budget
+    // GOD PROMPT "CKKS PHASE 22": diagnostic fields, additive -- existing
+    // callers (encrypt_host_shoup_pooled_barrett_batched_registered,
+    // encrypt_prewarm_registered_buffer, encrypt_registered_buffer_is_ready)
+    // are UNCHANGED and never read these; they exist so the new Rust/FFI
+    // diagnostic entry point (below) can observe WHY a key fell back to
+    // the pageable path, per the governing directive's explicit "keep
+    // telemetry sufficient to establish which path was actually executed"
+    // and "distinguish registration failure [from] memory-budget
+    // exhaustion" requirements -- neither of which the Phase 20 C++-only
+    // API exposed (only a single `ready` bool).
+    bool budgetSkipped = false;   // true: registration was never attempted because this key would have exceeded kRegisteredBudgetBytes
+    int lastErrorCode = 0;        // cudaError_t from the registration attempt (0/cudaSuccess if ready, or if budgetSkipped); meaningful only when !ready && !budgetSkipped
 };
 using RegisteredKey = std::pair<uint32_t, uint32_t>; // (n, sizeQ)
 
@@ -175,13 +187,17 @@ EncryptBufPoolRegistered& encrypt_buf_pool_registered_locked(uint32_t n, uint32_
             cudaMalloc(&P.d_fp, sizeQ * sizeof(uint64_t*));
             cudaMalloc(&P.d_mod, sizeQ * 8);
             P.ready = true;
+        } else {
+            P.lastErrorCode = (int)P.h_packed.last_error();
         }
         // If registration itself failed, P.h_packed is already Empty
         // (its own constructor rolled back cleanly) -- P.ready stays
         // false, no device buffers are allocated, nothing to free.
+    } else {
+        // Budget would be exceeded -- registration is never even
+        // attempted -- P.ready stays false, fallback applies.
+        P.budgetSkipped = true;
     }
-    // If the budget would be exceeded, registration is never even
-    // attempted -- P.ready stays false, fallback applies.
 
     return cache.emplace(key, std::move(P)).first->second;
 }
@@ -193,6 +209,17 @@ bool encrypt_prewarm_registered_buffer(uint32_t n, uint32_t sizeQ) {
     std::lock_guard<std::mutex> lock(registered_mutex());
     return encrypt_buf_pool_registered_locked(n, sizeQ).ready;
 }
+// GOD PROMPT "CKKS PHASE 22": diagnostic twin of the above, for the new
+// Rust/FFI bridge -- same idempotent creation, but also reports WHY a
+// non-ready result occurred (budget skip vs. a real registration
+// failure and its cudaError_t).
+bool encrypt_prewarm_registered_buffer_diag(uint32_t n, uint32_t sizeQ, bool& outBudgetSkipped, int& outLastErrorCode) {
+    std::lock_guard<std::mutex> lock(registered_mutex());
+    EncryptBufPoolRegistered& P = encrypt_buf_pool_registered_locked(n, sizeQ);
+    outBudgetSkipped = P.budgetSkipped;
+    outLastErrorCode = P.lastErrorCode;
+    return P.ready;
+}
 bool encrypt_registered_buffer_is_ready(uint32_t n, uint32_t sizeQ) {
     std::lock_guard<std::mutex> lock(registered_mutex());
     auto& cache = registered_cache();
@@ -200,16 +227,31 @@ bool encrypt_registered_buffer_is_ready(uint32_t n, uint32_t sizeQ) {
     return it != cache.end() && it->second.ready;
 }
 
-void encrypt_host_shoup_pooled_barrett_batched_registered(std::vector<uint64_t>& c0, std::vector<uint64_t>& c1,
-                                                            const std::vector<int64_t>& m,
-                                                            const std::vector<uint64_t>& pkA, const std::vector<uint64_t>& pkB,
-                                                            uint32_t n, const std::vector<uint64_t>& mod, const std::vector<uint64_t>& root,
-                                                            uint64_t ns, double sigma, uint64_t seed)
+// GOD PROMPT "CKKS PHASE 22": the diagnostic entry point every other
+// entry point in this file (and the new Rust/FFI bridge) delegates to.
+// `outUsedRegistered`/`outBudgetSkipped`/`outLastErrorCode` are ALWAYS
+// written (never left in an unspecified state) so a caller can observe
+// exactly which path executed and, if the registered path was not
+// used, distinguish a self-imposed budget skip (outLastErrorCode left
+// at 0 -- not a failure, a deliberate, documented limit) from a REAL
+// cudaHostRegister failure (outLastErrorCode holds the cudaError_t
+// value). This never changes what is computed -- only what is reported
+// about HOW it was computed.
+void encrypt_host_shoup_pooled_barrett_batched_registered_diag(
+    std::vector<uint64_t>& c0, std::vector<uint64_t>& c1,
+    const std::vector<int64_t>& m,
+    const std::vector<uint64_t>& pkA, const std::vector<uint64_t>& pkB,
+    uint32_t n, const std::vector<uint64_t>& mod, const std::vector<uint64_t>& root,
+    uint64_t ns, double sigma, uint64_t seed,
+    bool& outUsedRegistered, bool& outBudgetSkipped, int& outLastErrorCode)
 {
     uint32_t sizeQ = (uint32_t)mod.size();
 
     std::unique_lock<std::mutex> lock(registered_mutex());
     EncryptBufPoolRegistered& P = encrypt_buf_pool_registered_locked(n, sizeQ);
+    outUsedRegistered = P.ready;
+    outBudgetSkipped = P.budgetSkipped;
+    outLastErrorCode = P.lastErrorCode;
     if (!P.ready) {
         // Release our lock before deferring -- the fallback has its
         // own, entirely separate mutex and owes nothing to this pool.
@@ -276,5 +318,21 @@ void encrypt_host_shoup_pooled_barrett_batched_registered(std::vector<uint64_t>&
             c1[(size_t)t * n + k] = a;
         }
     }
+}
+
+// Phase 20's ORIGINAL, UNCHANGED public signature -- every existing
+// caller (the 2 C++ tests, the C++ concurrency audit) keeps working
+// identically. Now a thin wrapper delegating to the diag version above
+// with throwaway outputs, so the two entry points can never silently
+// drift apart.
+void encrypt_host_shoup_pooled_barrett_batched_registered(std::vector<uint64_t>& c0, std::vector<uint64_t>& c1,
+                                                            const std::vector<int64_t>& m,
+                                                            const std::vector<uint64_t>& pkA, const std::vector<uint64_t>& pkB,
+                                                            uint32_t n, const std::vector<uint64_t>& mod, const std::vector<uint64_t>& root,
+                                                            uint64_t ns, double sigma, uint64_t seed)
+{
+    bool usedRegistered, budgetSkipped; int lastErrorCode;
+    encrypt_host_shoup_pooled_barrett_batched_registered_diag(c0, c1, m, pkA, pkB, n, mod, root, ns, sigma, seed,
+                                                                usedRegistered, budgetSkipped, lastErrorCode);
 }
 } // namespace gpufhe

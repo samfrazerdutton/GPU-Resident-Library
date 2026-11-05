@@ -184,6 +184,20 @@ fn main() {
     // TRANSFER_PROFILING.md for why (a real steady-state win offset by
     // a large one-time cudaMallocHost cost per distinct (n,sizeQ) key).
     objs.push(compile_cpp(&root.join("src/encrypt_host_shoup_pooled_barrett_batched.cpp"), &out_dir, &include_dir, &cuda_include));
+    // GOD PROMPT "CKKS PHASE 20"/"CKKS PHASE 22": encrypt_host_shoup_
+    // pooled_barrett_batched_registered (CUDA-REGISTERED, not pinned,
+    // host staging memory) -- built and C++-correctness/concurrency-
+    // verified in Phase 20, but NOT reachable from Rust until Phase 22
+    // added the gpufhe_encrypt_registered/gpufhe_prewarm_registered_
+    // buffer/gpufhe_registered_buffer_is_ready FFI entry points
+    // (cpp_bridge/encdec_bridge.cpp). Compiled here so those symbols
+    // link; codec::encrypt (the default, production Rust API) still
+    // calls ONLY encrypt_host_shoup_pooled_barrett_batched above --
+    // this is purely an EXPERIMENTAL, explicitly opt-in sibling
+    // (codec::encrypt_registered), never the default. See research/
+    // TRANSFER_PROFILING.md's Phase 20/22 sections for the full
+    // promotion-decision rationale.
+    objs.push(compile_cpp(&root.join("src/encrypt_host_shoup_pooled_barrett_batched_registered.cpp"), &out_dir, &include_dir, &cuda_include));
     objs.push(compile_cpp(
         &manifest_dir.join("cpp_bridge/native_root_bridge.cpp"),
         &out_dir, &include_dir, &cuda_include,

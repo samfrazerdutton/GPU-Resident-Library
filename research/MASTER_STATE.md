@@ -2793,3 +2793,94 @@ via `git log -1`/`git status`/`origin/main` before any change.
   cloud dependency — not attempted this phase, judged to be more
   infrastructure than the task required given Layer B already serves
   that need.
+
+## GOD PROMPT "CKKS PHASE 22": Rust/FFI integration of CUDA-registered host memory — correctness/concurrency PROVEN at the FFI boundary; Phase 20's prewarming anomaly RESOLVED (a benchmark confound); still RETAINED AS OPT-IN (magnitude, not safety, is the remaining question)
+
+Full detail: `research/TRANSFER_PROFILING.md`'s Phase 22 section and
+`EXPERIMENT_LEDGER.md` entry #55. Starting commit `a22ff5f` (Phase 21
+end state). Used Graphify BEFORE writing code (`graphify explain`
+confirmed no Rust/FFI caller existed yet for the registered path —
+one command, no multi-file grep) and refreshed it 3 times during the
+work, verifying the new symbols appear and connect correctly
+afterward.
+
+- **Rust/FFI integration, Approach B (distinct sibling function, not
+  a hidden config flag)**: added `codec::encrypt_registered` /
+  `prewarm_registered_buffer` / `registered_buffer_is_ready` to
+  `rust/crates/ckks-cuda/src/codec.rs`, backed by 3 new `extern "C"`
+  functions in `cpp_bridge/encdec_bridge.cpp` and a new diagnostic
+  entry point in the C++ source
+  (`encrypt_host_shoup_pooled_barrett_batched_registered_diag`) that
+  the ORIGINAL, UNCHANGED Phase 20 function now delegates to. `build.rs`
+  gained the one compile-list entry that was the SOLE reason this
+  path was unreachable from Rust before. `codec::encrypt`'s own
+  behavior is completely unchanged. New diagnostic out-params
+  (`used_registered`/`budget_skipped`/`last_error_code`) make it
+  observable, for the first time, which path actually ran and why —
+  Phase 20's own C++ API only exposed a single `ready` bool.
+- **A small, justified API gap found and fixed**: `EvalMultContext`
+  had no public key accessors (its own tests reach them via a private
+  field, only possible from inside its own module) — added 3 one-line
+  pass-throughs (`public_key_a`/`public_key_b`/`secret_key`) needed to
+  write a real encode→encrypt_registered→EvalMult→decrypt→decode test
+  from a different module.
+- **8 new Rust tests, explicitly scoped (and the scoping explained,
+  not left implicit)**: correctness vs. production, pool reuse,
+  prewarm idempotency, budget exhaustion with real fallback (14 keys,
+  some registered, some correctly falling back, 0 mismatches either
+  way), validation-error parity, 2 concurrency scenarios (84 total
+  operations, 0 mismatches), and the critical real encrypted EvalMult
+  round trip through the actual Rust API (not RNS-only) — PASSES.
+  Items the directive listed that do not apply at this FFI boundary
+  (no Rust object ever owns the resource; no way to pass an invalid
+  CUDA flag through this surface) are stated explicitly as out of
+  scope, not silently skipped.
+- **A real bug found, NOT fixed (out of scope), documented**:
+  `KeySwitchContext::new`/`gpufhe_ks_fixture_create` crashes with
+  `std::bad_alloc` (not a clean `Err`) at `size_q=5, size_p=2,
+  num_part=4`, regardless of `n` — distinct from the clean, EXPECTED
+  `P<Q_part_max` rejection at `size_q>=9` (same config). A pre-existing
+  defect in eval-key-generation/fixture-creation code this phase never
+  touched; this phase's own tests simply avoid that one combination
+  (documented inline).
+- **Prewarming anomaly RESOLVED**: Phase 20's own benchmark compared
+  DIFFERENT `(n,sizeQ)` keys between its "lazy" and "prewarmed"
+  configurations (`sizeQ` vs. `sizeQ+1`) — a confound. A NEW
+  diagnostic (`bench/bench_registered_prewarm_anomaly.cpp`) removed it
+  by running lazy/prewarm/prewarm+delay as SEPARATE FRESH PROCESSES at
+  the IDENTICAL key: all three groups statistically indistinguishable
+  across 3 repetitions each (means of medians 3845-3938us, no
+  consistent ordering). Independently confirmed by a structural
+  source-code argument: the C++ pool cannot distinguish how a key
+  became ready, so a persistent difference was never mechanistically
+  possible. **Conclusive, not inconclusive.**
+- **Full pipeline re-measured**: C++ level unchanged from Phase 20
+  (re-run, same bit-exact result). Rust/FFI level, NEW: `encrypt_
+  registered` at or below `encrypt` in 3/3 runs through the actual
+  Rust API (ratios 0.873-0.970) — the improvement survives the FFI
+  boundary, though the boundary itself adds a real, modest `Vec`-copy
+  tax to BOTH paths equally.
+- **Decision: Category B — STILL RETAINED AS OPT-IN, not promoted.**
+  Every safety/correctness criterion Phase 20 left unresolved
+  (Rust/FFI correctness, concurrency, the anomaly) is now resolved in
+  the registered path's favor. The ONLY remaining question is whether
+  a modest (single-digit-to-low-double-digit percent), reproducible
+  win justifies making the registered pool's own machinery part of
+  the DEFAULT production path — a complexity judgment, not a safety
+  one. `codec::encrypt` (production) is completely unchanged;
+  `codec::encrypt_registered` is now a fully tested, Rust-accessible,
+  opt-in alternative.
+- **Regression**: full Rust suite — 4 passed + 47 passed, 0 failed, 1
+  ignored (pre-existing, unrelated), both debug and release. Phase
+  20's own C++ correctness test and concurrency audit (436 checks)
+  re-run, unaffected. Sanitizers NOT re-run — Phase 20's own
+  ASan-vs-`cudaHostRegister` limitation is unchanged and this phase
+  never touches the registration call itself, stated explicitly
+  rather than silently skipped.
+- **Next recommended step, if revisited**: if the magnitude question
+  is ever revisited, measure at a LARGER, more realistic workload
+  (many sequential real encrypt calls in a long-lived service,
+  mirroring Phase 16's own Profile C) to see whether the modest
+  per-call win compounds into something more decisive; separately,
+  the `size_q=5` `gpufhe_ks_fixture_create` crash is a real, narrow,
+  unrelated defect worth a dedicated investigation in a future phase.

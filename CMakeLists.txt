@@ -466,6 +466,14 @@ gpufhe_test(test_registered_host_buffer tests/test_registered_host_buffer.cpp)
 gpufhe_test(test_encrypt_host_shoup_pooled_barrett_batched_registered_matches_reference tests/test_encrypt_host_shoup_pooled_barrett_batched_registered_matches_reference.cpp)
 gpufhe_test(test_encrypt_host_shoup_pooled_barrett_batched_registered_concurrency_audit tests/test_encrypt_host_shoup_pooled_barrett_batched_registered_concurrency_audit.cpp)
 gpufhe_benchmark(bench_encrypt_registered_lifecycle bench/bench_encrypt_registered_lifecycle.cpp)
+# GOD PROMPT "CKKS PHASE 22": controlled re-test of Phase 20's
+# explicit-prewarming anomaly, using the IDENTICAL (n,sizeQ) key for
+# "lazy" and "prewarmed" conditions (via separate fresh-process
+# invocations) to remove the sizeQ-vs-sizeQ+1 confound Phase 20's own
+# benchmark had. A pure timing diagnostic -- gpufhe_benchmark, same
+# discipline as above. See research/TRANSFER_PROFILING.md's Phase 22
+# section and research/EXPERIMENT_LEDGER.md entry #55.
+gpufhe_benchmark(bench_registered_prewarm_anomaly bench/bench_registered_prewarm_anomaly.cpp)
 gpufhe_test(test_mult_barrett tests/test_mult_barrett.cpp)
 # Directive "VERIFY OOM DIAGNOSIS AND REMOVE THE LARGE-N DIAGONAL
 # BOTTLENECK", Priority 3: proves an O(S*2^RST) analytic replacement for

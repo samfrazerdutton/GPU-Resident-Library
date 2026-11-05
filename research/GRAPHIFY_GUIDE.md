@@ -362,3 +362,42 @@ integration is load-bearing for actually doing CKKS engineering work.
 Re-install with `pipx install graphifyy` (or `pipx reinstall graphifyy`
 if already present but broken) and re-run the `install`/`extract`
 commands at the top of this guide.
+
+## Phase 22 field validation: used for real engineering work, not just the validation suite
+
+Phase 21's validation suite tested Graphify against synthetic
+questions. Phase 22 is the first phase to actually USE it to do real
+engineering work (wiring Phase 20's CUDA-registered host memory into
+Rust), and the results reconfirm this guide's own earlier findings
+under real conditions rather than a scripted test:
+
+- **Genuinely saved effort**: `graphify explain
+  "encrypt_host_shoup_pooled_barrett_batched_registered" --all` (one
+  command) confirmed immediately that no Rust/FFI caller existed yet
+  for the registered path -- exactly the fact needed before writing
+  any FFI code, and faster than a multi-file `grep` across `rust/`.
+- **The documented cross-file-call-edge gap recurred, for real work
+  this time**: `graphify explain "gpufhe_encrypt" --all` on the
+  EXISTING FFI function returned mostly documentation
+  cross-references, not its actual call target
+  (`encrypt_host_shoup_pooled_barrett_batched`) -- the real answer
+  still had to come from reading `cpp_bridge/encdec_bridge.cpp`
+  directly. This is the SAME limitation this guide's own validation
+  question 2 already flagged; it recurring on a real task (not a
+  scripted question) is useful independent confirmation that the gap
+  is real and worth remembering, not a validation-suite artifact.
+- **The graph was refreshed 3 times mid-phase** (after the C++/Rust
+  source changes, after an unrelated small Rust API addition, after
+  a `CMakeLists.txt`-only change) and verified correct each time --
+  new symbols appeared, connected to their real callers, exactly as
+  expected; the `CMakeLists.txt` change correctly produced NO graph
+  change (confirming the CMake gap is still accurately reported, not
+  silently "fixed" by coincidence).
+- **Not overused**: `graphify query` (free-text) was not reached for
+  at all this phase -- every question was specific enough for
+  `explain`/`path` directly, consistent with this guide's own
+  recommendation to prefer exact-name lookups. Reading the actual
+  source (`registered_host_buffer.h`, the registered-encrypt `.cpp`,
+  `encdec_bridge.cpp`) remained necessary before writing any code, as
+  this guide always said it would be -- the graph oriented the
+  investigation, it did not replace reading the code.

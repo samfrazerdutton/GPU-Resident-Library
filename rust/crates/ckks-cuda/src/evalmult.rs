@@ -227,6 +227,31 @@ impl EvalMultContext {
         self.ks.modulus_q(tower)
     }
 
+    /// GOD PROMPT "CKKS PHASE 22": the public key's `a`/`b` components
+    /// and the secret key, forwarded from the embedded
+    /// `KeySwitchContext` -- added because a caller OUTSIDE this
+    /// module (e.g. `codec`'s own tests, composing `codec::encrypt`/
+    /// `codec::encrypt_registered` with `multiply_relin_rescale` for a
+    /// real encode->encrypt->EvalMult->decrypt->decode round trip) has
+    /// no other supported way to reach these keys: `ks` itself is, and
+    /// stays, private (this context owns it, nothing outside should
+    /// mutate or outlive it independently), so these are plain,
+    /// read-only pass-throughs, not a relaxation of that ownership.
+    /// `this module's own tests` used `ctx.ks.public_key_a()` etc.
+    /// directly, which only works from inside this module -- these
+    /// three methods are the minimal, justified fix for every OTHER
+    /// module that needs the same real keys this context's own relin
+    /// step already uses internally.
+    pub fn public_key_a(&self) -> Vec<u64> {
+        self.ks.public_key_a()
+    }
+    pub fn public_key_b(&self) -> Vec<u64> {
+        self.ks.public_key_b()
+    }
+    pub fn secret_key(&self) -> Vec<u64> {
+        self.ks.secret_key()
+    }
+
     /// Steady-state per-call path: `ct_a = (c0a, c1a)`, `ct_b = (c0b,
     /// c1b)`, each `input_towers() * n` elements, eval domain. Returns
     /// `(r0, r1)`, each `output_towers() * n` elements, eval domain --

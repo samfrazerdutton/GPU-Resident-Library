@@ -127,6 +127,21 @@ void encrypt_host_shoup_pooled_barrett_batched(std::vector<uint64_t>&, std::vect
                                                 const std::vector<uint64_t>&, const std::vector<uint64_t>&, uint64_t, double, uint64_t);
 void decrypt_host(std::vector<int64_t>&, const std::vector<uint64_t>&, const std::vector<uint64_t>&,
                    const std::vector<uint64_t>&, uint32_t, const std::vector<uint64_t>&, const std::vector<uint64_t>&);
+// GOD PROMPT "CKKS PHASE 22": Phase 20's CUDA-registered host-memory
+// EXPERIMENTAL encrypt path (src/encrypt_host_shoup_pooled_barrett_
+// batched_registered.cpp), now reachable from Rust for the first time,
+// via a NEW, separate FFI entry point below -- gpufhe_encrypt (above)
+// keeps calling the unchanged production pageable path; nothing about
+// the default Rust `codec::encrypt` changes. The `_diag` variant
+// reports which path actually executed (the C++-only Phase 20 API had
+// no way to tell a caller this without a SEPARATE query call).
+void encrypt_host_shoup_pooled_barrett_batched_registered_diag(
+    std::vector<uint64_t>&, std::vector<uint64_t>&, const std::vector<int64_t>&,
+    const std::vector<uint64_t>&, const std::vector<uint64_t>&, uint32_t,
+    const std::vector<uint64_t>&, const std::vector<uint64_t>&, uint64_t, double, uint64_t,
+    bool&, bool&, int&);
+bool encrypt_prewarm_registered_buffer_diag(uint32_t, uint32_t, bool&, int&);
+bool encrypt_registered_buffer_is_ready(uint32_t, uint32_t);
 }
 
 extern "C" {
@@ -187,6 +202,63 @@ void gpufhe_decrypt(const uint64_t* c0, const uint64_t* c1, const uint64_t* s,
     std::vector<int64_t> m;
     gpufhe::decrypt_host(m, c0v, c1v, sv, n, modv, rootv);
     std::memcpy(m_out, m.data(), (size_t)n * 8);
+}
+
+// GOD PROMPT "CKKS PHASE 22": EXPERIMENTAL -- CUDA-registered host
+// memory (Phase 20), reachable from Rust for the first time. Same
+// calling convention/ownership shape as gpufhe_encrypt above (every
+// argument copied into/out of std::vector on the C++ side; nothing
+// retained across the call; the underlying C++ function is fully
+// synchronous -- it calls cudaDeviceSynchronize() before returning, so
+// there is no asynchronous GPU work still touching this memory once
+// this function returns, and no pointer crosses back into Rust that
+// Rust could use after the C++-owned pool entry is gone). out_used_
+// registered/out_budget_skipped/out_last_error_code are ALWAYS written
+// (never left unspecified) so the Rust caller can observe exactly
+// which path executed and, on fallback, distinguish a deliberate
+// budget skip from a genuine cudaHostRegister failure.
+void gpufhe_encrypt_registered(const int64_t* m, uint32_t n,
+                                const uint64_t* pkA, const uint64_t* pkB,
+                                const uint64_t* mod, const uint64_t* root, uint32_t size_q,
+                                uint64_t ns, double sigma, uint64_t seed,
+                                uint64_t* c0_out, uint64_t* c1_out,
+                                uint8_t* out_used_registered, uint8_t* out_budget_skipped, int32_t* out_last_error_code)
+{
+    std::vector<int64_t> mv(m, m + n);
+    std::vector<uint64_t> pkAv(pkA, pkA + (size_t)size_q * n), pkBv(pkB, pkB + (size_t)size_q * n);
+    std::vector<uint64_t> modv(mod, mod + size_q), rootv(root, root + size_q);
+    std::vector<uint64_t> c0, c1;
+    bool usedRegistered = false, budgetSkipped = false; int lastErrorCode = 0;
+    gpufhe::encrypt_host_shoup_pooled_barrett_batched_registered_diag(
+        c0, c1, mv, pkAv, pkBv, n, modv, rootv, ns, sigma, seed,
+        usedRegistered, budgetSkipped, lastErrorCode);
+    std::memcpy(c0_out, c0.data(), (size_t)size_q * n * 8);
+    std::memcpy(c1_out, c1.data(), (size_t)size_q * n * 8);
+    *out_used_registered = usedRegistered ? 1 : 0;
+    *out_budget_skipped = budgetSkipped ? 1 : 0;
+    *out_last_error_code = (int32_t)lastErrorCode;
+}
+
+// Explicit, idempotent prewarm for the registered pool (mirrors
+// gpufhe_encrypt_registered's diagnostic shape). Returns 1 iff the
+// (n,size_q) key is now registered and ready; always writes the two
+// out-params so a caller can tell a budget skip from a real failure
+// even when ready==0.
+uint8_t gpufhe_prewarm_registered_buffer(uint32_t n, uint32_t size_q, uint8_t* out_budget_skipped, int32_t* out_last_error_code)
+{
+    bool budgetSkipped = false; int lastErrorCode = 0;
+    bool ready = gpufhe::encrypt_prewarm_registered_buffer_diag(n, size_q, budgetSkipped, lastErrorCode);
+    *out_budget_skipped = budgetSkipped ? 1 : 0;
+    *out_last_error_code = (int32_t)lastErrorCode;
+    return ready ? 1 : 0;
+}
+
+// Query-only: is the registered pool already ready for (n,size_q)?
+// Never allocates. Mirrors the existing C++-only
+// encrypt_registered_buffer_is_ready exactly.
+uint8_t gpufhe_registered_buffer_is_ready(uint32_t n, uint32_t size_q)
+{
+    return gpufhe::encrypt_registered_buffer_is_ready(n, size_q) ? 1 : 0;
 }
 
 } // extern "C"
