@@ -2,3 +2,17 @@ build/
 *.o
 *.so
 *.a
+
+# GOD PROMPT "CKKS PHASE 21": Graphify's knowledge-graph output. graph.json,
+# GRAPH_REPORT.md, and .graphify_analysis.json ARE committed (see research/
+# GRAPHIFY_GUIDE.md) -- they are small, portable (no absolute paths/machine
+# info), and let a fresh clone browse the graph/report without re-running
+# extraction. Everything else here is either a local absolute-path pointer,
+# a timestamp-dependent cache/manifest regenerated on the next `graphify
+# extract .`/`graphify update .`, or a 2MB interactive visualization nobody
+# needs to diff in git -- excluded, not because the directory is unwanted,
+# but because these specific files are machine-specific or disposable.
+graphify-out/*
+!graphify-out/graph.json
+!graphify-out/GRAPH_REPORT.md
+!graphify-out/.graphify_analysis.json

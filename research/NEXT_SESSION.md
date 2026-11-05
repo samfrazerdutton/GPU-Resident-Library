@@ -3,11 +3,50 @@
 ## Current commit
 
 Check `git log -3` on resume. As of this writing, HEAD is a new commit
-on top of entry #52's commit `8d6dbe4` (the GOD PROMPT "CKKS PHASE 20"
-round: the first phase in this investigation to move from diagnosis to
-a real implementation PROTOTYPE. Built `include/registered_host_
-buffer.h`'s `RegisteredHostBuffer` (move-only RAII, 4-state machine)
-owning a page-aligned host allocation registered via
+on top of entry #53's commit `f20fa88` (the GOD PROMPT "CKKS PHASE 21"
+round: NOT a CKKS research round -- a tooling/workflow integration.
+Installed Graphify (`pipx install graphifyy`, version `0.9.102`), a
+local, zero-LLM-backend code knowledge graph (tree-sitter AST,
+`GRAPHIFY_BACKEND=none` explicitly set throughout -- no project
+material was sent to any external service). Project-scoped Claude Code
+integration (`graphify install --project --platform claude`,
+deliberately WITHOUT `--strict` -- verified non-blocking) appended one
+`## graphify` section to the end of the pre-existing `CLAUDE.md`
+(the Scrum-Orchestrator block, diffed byte-for-byte against a backup,
+is untouched) and added `.claude/skills/graphify/` +
+`.claude/settings.json` alongside, never inside, the existing
+`.claude/agents/`/`scrum-orchestrator` skill. Four git hooks
+(`post-commit`/`post-checkout`/`post-merge`/`post-rewrite`, all
+verified non-blocking -- detached background rebuild, 600s timeout,
+never delays `git commit`) plus a union-merge driver for
+`graphify-out/graph.json` were installed for auto-refresh. The graph
+itself (2539 nodes, 5563 edges, 162 communities after this phase's own
+edits) is committed (`graphify-out/graph.json`, `GRAPH_REPORT.md`,
+`.graphify_analysis.json`); `graph.html`/`cache/`/`manifest.json`/
+`.graphify_root` are gitignored as machine-specific or disposable.
+**A documented, honest 12-question validation suite** (`research/
+GRAPHIFY_GUIDE.md`) found the graph genuinely useful for code
+navigation (god nodes, call paths, which tests reference a function)
+but confirmed real gaps: `CMakeLists.txt`/CTest registration is NOT
+indexed at all (CMake isn't a parsed language here); research `*.md`
+docs appear only as lightweight reference nodes, not semantically
+searchable (Phase 19/20's actual findings are NOT graph-answerable,
+by design -- Layer B stays authoritative); free-text `graphify query`
+can mis-seed on confusingly-named local symbols (`graphify explain
+"<exact name>"` is more reliable). Graphify's own `graphify benchmark`
+command measured 91.2x fewer tokens per query vs. naive full-corpus
+reading, on this actual repo. **No CKKS code, cryptographic behavior,
+or research conclusion was touched this phase.** See `EXPERIMENT_LEDGER.md`
+entry #54 and `research/GRAPHIFY_GUIDE.md` for full detail.
+
+## Earlier commit (Phase 20)
+
+HEAD was previously a commit on top of entry #52's commit `8d6dbe4`
+(the GOD PROMPT "CKKS PHASE 20"
+round: the first phase in the pinned-memory investigation to move from
+diagnosis to a real implementation PROTOTYPE. Built `include/
+registered_host_buffer.h`'s `RegisteredHostBuffer` (move-only RAII,
+4-state machine) owning a page-aligned host allocation registered via
 `cudaHostRegister`, and `src/encrypt_host_shoup_pooled_barrett_
 batched_registered.cpp` (mirrors Phase 15's pinned variant exactly,
 except the host staging buffer's allocation mechanism; registers ONCE
@@ -36,8 +75,10 @@ Category B -- RETAIN AS AN OPT-IN EXPERIMENTAL FEATURE, NOT promoted**
 (a real, modest win, but not yet validated at the Rust/FFI layer, and
 one unexplained anomaly). See `EXPERIMENT_LEDGER.md` entry #53 and
 `research/TRANSFER_PROFILING.md`'s Phase 20 section for full detail.
+Confirm push status -- push again if `git status` shows ahead of
+origin.
 
-## Earlier commit (Phase 19)
+## Earlier commit still (Phase 19)
 
 HEAD was previously a commit on top of entry #51's commit `91ae35f`
 (the GOD PROMPT "CKKS PHASE 19"
@@ -85,7 +126,51 @@ an entirely unrelated commit history (raw CUDA-kernel-optimization
 work) and untracked, stale copies of `rust/`/`research/` -- never run
 `git status`/`log`/commit decisions against it for this work.
 
-## READ THIS FIRST if resuming into pinned-memory work: a CUDA-registered host memory PROTOTYPE now exists (`include/registered_host_buffer.h` + `src/encrypt_host_shoup_pooled_barrett_batched_registered.cpp`), correctness/concurrency-verified, measurably resolves the pinned variant's cold-start weakness and wins modestly in steady state -- RETAINED AS OPT-IN, NOT promoted; two concrete follow-ups are open
+## READ THIS FIRST, ALWAYS, before any substantial task: Graphify (a local code knowledge graph) is installed and usable -- `graphify query`/`explain`/`path` for navigation, but it is NEVER the authoritative source for a decision, experiment result, or CKKS fact
+
+Phase 21 installed [Graphify](https://github.com/Graphify-Labs/graphify)
+(`pipx install graphifyy`, v0.9.102) as a project-scoped Claude Code
+skill + non-blocking advisory hooks (verified: NOT `--strict`, confirmed
+via direct testing that `graphify hook-guard search`/`read` exit 0 with
+no output). A committed graph (`graphify-out/graph.json`/
+`GRAPH_REPORT.md`/`.graphify_analysis.json`) covers this repo's C++/
+CUDA/Rust source (2539 nodes, 5563 edges, 162 communities as of this
+phase) with ZERO LLM/cloud calls (`GRAPHIFY_BACKEND=none` set
+explicitly throughout -- nothing left this machine).
+
+**Use it for**: `graphify explain "<exact symbol name>"` to find a
+function/class, its callers, and which tests reference it;
+`graphify path "A" "B"` for a dependency relationship; `graphify
+god-nodes` for the architectural hubs. All far cheaper than a broad
+`Grep`/`Read` (the tool's own `graphify benchmark` measured 91.2x
+fewer tokens per query on this actual repo).
+
+**Do NOT use it for**: anything this project's `research/*.md` docs
+already own -- what Phase 19/20 (or any phase) concluded, which
+implementation is production vs. experimental and WHY, what must
+never be weakened. The graph has research docs only as lightweight
+reference pointers, not semantic content (confirmed via testing, see
+below) -- read the actual markdown for that. `CMakeLists.txt`/CTest
+registration is NOT indexed at all (confirmed: zero nodes) -- grep
+`CMakeLists.txt` directly for the `gpufhe_test`/`gpufhe_benchmark`
+split. Free-text `graphify query` can mis-seed on a confusingly-named
+local variable (tested: it seeded on an enum value named
+`A_Production` instead of the real `encrypt_host_shoup_pooled_
+barrett_batched` function) -- prefer `explain`/`path` with exact
+names for anything you intend to rely on.
+
+**Keep it fresh**: run `graphify update .` after editing code (fast,
+local, no API cost) -- also auto-runs via a local-only post-commit/
+checkout/merge/rewrite git hook (never blocks `git commit`; logs to
+`~/.cache/graphify-rebuild.log`). `GRAPH_REPORT.md`'s own "Built from
+commit" line vs. `git rev-parse HEAD` tells you if it's stale.
+
+Full detail, the complete 12-question validation suite with evidence,
+every known extraction gap, and the four-layer memory-architecture
+rationale: `research/GRAPHIFY_GUIDE.md`. `EXPERIMENT_LEDGER.md` entry
+#54.
+
+## READ THIS SECOND if resuming into pinned-memory work: a CUDA-registered host memory PROTOTYPE now exists (`include/registered_host_buffer.h` + `src/encrypt_host_shoup_pooled_barrett_batched_registered.cpp`), correctness/concurrency-verified, measurably resolves the pinned variant's cold-start weakness and wins modestly in steady state -- RETAINED AS OPT-IN, NOT promoted; two concrete follow-ups are open
 
 **Phase 20's core result**: Phase 19 found `cudaHostRegister` on
 pre-touched memory is mechanistically cheaper than `cudaMallocHost`/
@@ -137,7 +222,7 @@ premature. `encrypt_host_shoup_pooled_barrett_batched` (production)
 is completely unchanged. Full detail: `research/TRANSFER_PROFILING.md`'s
 Phase 20 section.
 
-## READ THIS SECOND if resuming into pinned-memory work: the root mechanism is now PROVEN (`ioctl()`-bound, every call, via NVIDIA's own tracer) -- this is the finding Phase 20 (above) turned into a working prototype
+## READ THIS THIRD if resuming into pinned-memory work: the root mechanism is now PROVEN (`ioctl()`-bound, every call, via NVIDIA's own tracer) -- this is the finding Phase 20 (above) turned into a working prototype
 
 **Phase 19's core result**: built a new controlled comparison
 (`bench/bench_alloc_path_comparison.cpp`: pageable malloc, pure-Linux
@@ -193,7 +278,7 @@ ordinary anonymous-mapping first-touch at the huge-page boundary (an
 ADDITIVE, separate mechanism from the CUDA/`ioctl` cost). Full
 detail: `research/TRANSFER_PROFILING.md`'s Phase 19 section.
 
-## READ THIS THIRD if resuming into pinned-memory/THP work: the system-wide THP toggle is BLOCKED BY PERMISSIONS (documented, not worked around); a real but narrow ~5x THP-hint effect exists at exactly 2MiB; Phase 17's "not CUDA-specific" conclusion was REVISED -- see Phase 19/20 above for the mechanistic proof of why
+## READ THIS FOURTH if resuming into pinned-memory/THP work: the system-wide THP toggle is BLOCKED BY PERMISSIONS (documented, not worked around); a real but narrow ~5x THP-hint effect exists at exactly 2MiB; Phase 17's "not CUDA-specific" conclusion was REVISED -- see Phase 19/20 above for the mechanistic proof of why
 
 **Phase 18's core result**: attempted the originally-planned
 controlled THP experiment (THP=madvise vs. THP=disabled vs. restored).
@@ -239,7 +324,7 @@ planned system-wide A/B/C THP comparison, or a GPU-passthrough-layer
 trace to test the CUDA/driver hypothesis directly. Full detail:
 `research/TRANSFER_PROFILING.md`'s Phase 18 section.
 
-## READ THIS FOURTH if resuming into pinned-memory work: the allocation-cost variance was EXPLORED (Linux kernel mlock() path vs. CUDA/driver overhead -- see Phase 19/20 above for the mechanistic proof), the Phase 16 decision stands, and a WSL2-ballooning claim from Phase 16 has been downgraded to "not confirmed"
+## READ THIS FIFTH if resuming into pinned-memory work: the allocation-cost variance was EXPLORED (Linux kernel mlock() path vs. CUDA/driver overhead -- see Phase 19/20 above for the mechanistic proof), the Phase 16 decision stands, and a WSL2-ballooning claim from Phase 16 has been downgraded to "not confirmed"
 
 **Phase 17's core result**: Phase 16 found `cudaMallocHost`'s cost
 varies wildly (16us-5.9ms) and guessed, without evidence, that WSL2
@@ -275,7 +360,7 @@ or a controlled, reversible test of disabling Transparent Huge Pages
 to see if that is a necessary ingredient. Full detail: `research/
 TRANSFER_PROFILING.md`'s Phase 17 section.
 
-## READ THIS FIFTH if resuming into performance work: a pinned-memory PREWARMING API exists, fully correct and concurrency-safe, but was NOT promoted because its own allocation cost is unpredictable in this environment -- Phase 20 (top of this file) built a registered-memory alternative that resolves this exact weakness
+## READ THIS SIXTH if resuming into performance work: a pinned-memory PREWARMING API exists, fully correct and concurrency-safe, but was NOT promoted because its own allocation cost is unpredictable in this environment -- Phase 20 (top of this file) built a registered-memory alternative that resolves this exact weakness
 
 **Phase 16's core result**: `encrypt_prewarm_pinned_buffer(n,sizeQ)` /
 `encrypt_pinned_buffer_is_ready(n,sizeQ)` / `encrypt_host_shoup_
@@ -309,7 +394,7 @@ accepting the risk explicitly for a specific, named long-lived-service
 deployment where Profile C's unconditional win is what matters.** Full
 detail: `research/TRANSFER_PROFILING.md`'s Phase 16 section.
 
-## READ THIS SIXTH if resuming into performance work on the OLDER (Phase 15) material: transfer batching is DONE and shipped; a pinned-memory follow-up was built, verified, measured FASTER in isolation, then found to be a net loss for real usage and correctly NOT shipped
+## READ THIS SEVENTH if resuming into performance work on the OLDER (Phase 15) material: transfer batching is DONE and shipped; a pinned-memory follow-up was built, verified, measured FASTER in isolation, then found to be a net loss for real usage and correctly NOT shipped
 
 **Phase 15's core result**: `encrypt_host_shoup_pooled_barrett_batched`
 (`src/encrypt_host_shoup_pooled_barrett_batched.cpp`) is now the actual
