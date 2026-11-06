@@ -3,7 +3,66 @@
 ## Current commit
 
 Check `git log -3` on resume. As of this writing, HEAD is a new commit
-on top of entry #55's commit `43d541f` (the GOD PROMPT "CKKS PHASE 23"
+on top of entry #56's commit `6ca185d` (the GOD PROMPT "CKKS PHASE 24"
+round: "CKKS BOOTSTRAP RUNTIME VALIDATION, PRECISION RECOVERY &
+REGRESSION STABILIZATION," plus an unplanned WSL/Windows recovery
+mission that opened the round). **WSL recovery**: a `HCS_E_CONNECTION_
+TIMEOUT` from the prior session traced to Windows host free RAM
+bottoming at ~0.49GB (96.8% used by ordinary desktop apps -- none
+touched). No destructive action needed or taken: free RAM rose on its
+own and a plain `wsl -d Ubuntu` retry succeeded once it did. Repo
+verified intact (HEAD=origin/main=`6ca185d`, untracked user work
+preserved). **Resource gate established and enforced**: `tests/
+test_boot.cpp`'s own source comment records a historical 8.12-8.32GB
+peak host RSS at n=8192/sizeQ=30/sizeP=2 -- not the "~2-3GB" Phase 23
+speculated. Windows free RAM measured 1.8-3.6GB throughout this round,
+nowhere near a safe ~10GB floor, so **the bootstrap was correctly NOT
+executed** -- no claim of runtime success or failure is made.
+**Architecture fully audited instead** (the complete 960-line file read
+end to end): rotation-hoisting is disabled by default in the current
+file (the trusted `KROT`/`KSC`-cached path is what actually runs); the
+pipeline deliberately bounces CPU/GPU per diagonal, not fully
+GPU-resident; EvalMod's double-angle depth (`rDbl=7` at `HW=64`) has a
+real, quantified safety margin over the file's own measured actual
+input range (`K=9.49`); ModRaise/C2S/EvalMod(R) each already have a
+genuinely independent numerical check wired in (exact Garner-CRT, not
+circular); and the test as written is single-shot/fully-deterministic
+(hardcoded seeds, one fixed message) -- cannot demonstrate
+repeatability even once resources allow running it, without a new
+small driver. Rust/FFI exposure reconfirmed at zero (unchanged from
+Phase 23). **Phase 23's two "registered-memory" test failures,
+re-investigated and the diagnosis CORRECTED**: proved (not inferred)
+that both are deterministic test-order artifacts from `budget_
+exhaustion_falls_back_safely_and_stays_correct`'s own deliberate
+16MiB-budget-exceeding design, NOT Windows-RAM-pressure sensitivity as
+Phase 23 claimed -- skipping that one test makes everything else pass
+unconditionally; not skipping it reproduces the identical two failures
+regardless of current free RAM. Not a production defect; not fixed
+(test-hygiene, out of this phase's scope) -- documented precisely
+instead. Full regression (debug, no skip): 55 passed/2 failed
+(explained)/1 ignored, identical to Phase 23's counts. Release (skip
+the ordering-sensitive test): 56 passed/0 failed/1 ignored. No source
+file changed this round -- investigation and documentation only. See
+`EXPERIMENT_LEDGER.md` entry #57, `research/MIGRATION_MATRIX.md`'s
+bootstrap milestone tracking, and `research/TRANSFER_PROFILING.md`'s
+Phase 24 correction section for full detail.
+
+## Blocked this round (carried forward from Phase 23, now with a sharper gate)
+
+Bootstrap runtime re-verification remains blocked -- same test, same
+dependency set, build-ready. The threshold is now explicitly ~10GB
+Windows free RAM (not the "~2-3GB" earlier speculation), justified by
+the test file's own documented historical peak RSS. Re-attempt once
+free RAM is reliably at or above that level for the session's
+duration. Additionally, per this round's own audit: the test as
+written is single-shot/deterministic -- a genuine "independent
+repeatability across fresh encryption randomness" check (required by
+the governing directive) will need a small new driver varying seeds
+and messages, not just re-running the existing binary multiple times.
+
+## Earlier commit (Phase 23)
+
+HEAD was previously a commit on top of entry #55's commit `43d541f` (the GOD PROMPT "CKKS PHASE 23"
 round: "FULL CKKS CAPABILITY COMPLETION, APPLICATION READINESS &
 PERFORMANCE AUDIT" -- the first round of a new mission, explicitly NOT
 another isolated microbenchmark. **Section 1-2 (capability audit)**:

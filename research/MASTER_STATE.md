@@ -3,15 +3,23 @@
 **STOP -- this file's body is historical (frozen at GOD PROMPT "CKKS
 PHASE 5"). For the actual current state, read `research/NEXT_SESSION.md`
 ("## Current commit" at its top) and `research/MIGRATION_MATRIX.md`
-first.** As of GOD PROMPT "CKKS PHASE 23" (on top of commit `43d541f`),
+first.** As of GOD PROMPT "CKKS PHASE 24" (on top of commit `6ca185d`),
 the Rust/CUDA evolution has reached FIVE ported operations (NTT,
 rescale, key switching, EvalMult, and rotation -- Phase 23's own
 addition, see `EXPERIMENT_LEDGER.md` entry #56), a complete-but-
-C++-only, build-verified-not-runtime-reconfirmed CKKS bootstrap
-(`tests/test_boot.cpp`), and CUDA-registered host memory as an opt-in
-experimental encryption path (Phase 20/22) -- none of this is
-production-integrated, and the main C++ engine's own
-production/security state described below is unaffected by any of it.
+C++-only, build-verified-and-fully-architecturally-audited-but-still-
+NOT-runtime-verified CKKS bootstrap (`tests/test_boot.cpp` -- Phase 24
+raised the resource gate to ~10GB Windows free RAM, justified by the
+file's own documented 8.12-8.32GB historical peak RSS, and correctly
+did not attempt execution with only 1.8-3.6GB actually available; see
+entry #57), and CUDA-registered host memory as an opt-in experimental
+encryption path (Phase 20/22) -- none of this is production-integrated,
+and the main C++ engine's own production/security state described
+below is unaffected by any of it. Phase 24 also corrected a Phase 23
+misdiagnosis: the two "registered-memory" test failures are proven
+deterministic test-ordering artifacts (a shared global registration
+budget exhausted by one specific test), not Windows-RAM-pressure
+flakiness as previously claimed.
 
 Last updated (of the body below): this session, GOD PROMPT "CKKS PHASE 5"
 round (real encode/encrypt/decrypt proven; the real encrypted EvalMult

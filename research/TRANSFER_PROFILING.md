@@ -2438,3 +2438,38 @@ evalmult.rs` (3 new one-line accessor methods, additive),
 (additive diagnostic fields/functions, existing functions delegate
 to them unchanged), and 1 new bench file. No existing function's
 EXISTING behavior changed anywhere in this diff.
+
+## Phase 24 correction: the two "registered-memory" test failures are deterministic test-ordering artifacts, NOT memory-pressure flakiness -- Phase 23's attribution was wrong
+
+Phase 23 reported `codec::registered_tests::prewarm_is_idempotent_and_
+makes_first_encrypt_registered` and `repeated_encryption_pool_reuse_
+stays_registered_and_correct` failing in the full suite but passing in
+isolation, and attributed this to "this session's severe Windows-RAM
+pressure hitting `cudaHostRegister`'s own documented capacity
+sensitivity" -- a plausible-sounding guess given the critically low
+free RAM at the time (0.6-0.9GB), but **not independently verified**
+before being written down. Phase 24 found and proved the REAL
+mechanism directly: `budget_exhaustion_falls_back_safely_and_stays_
+correct` deliberately registers 14 distinct `(n, size_q)` keys
+totaling ~23.25MiB, specifically to exceed the C++ pool's own 16MiB
+cumulative registration budget and exercise its fallback path -- a
+process-lifetime GLOBAL counter, never reset between tests in the same
+binary. Running the full module with `--skip budget_exhaustion_falls_
+back_safely_and_stays_correct` made ALL remaining tests pass
+unconditionally; running the full module with no skip reproduced the
+identical two failures, byte-for-byte identical panic messages, fully
+reproducible regardless of current Windows free RAM (~2GB at the time,
+nowhere near the earlier 0.6-0.9GB low). This is **deterministic
+shared-global-state test ordering, not environmental flakiness** --
+the earlier attribution is hereby corrected, not left standing. It is
+also **not a production-code defect**: the pool's budget tracking and
+fallback behavior are working exactly as designed (this is the same
+fallback Phase 20/22 already proved correct) -- the issue is the test
+suite's own implicit assumption that a budget consumed by an earlier
+alphabetically-run test would not affect a later one. No production
+file was touched; per the governing Phase 24 directive, fixing test
+ordering/isolation is a test-hygiene change outside that phase's
+bootstrap-validation mission and was left for a future round rather
+than attempted opportunistically. See `EXPERIMENT_LEDGER.md` entry
+#57 for the full experiment (two independent confirmations: skip-one
+passes everything, no-skip reproduces both failures identically).
