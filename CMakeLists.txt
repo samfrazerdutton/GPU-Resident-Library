@@ -284,6 +284,30 @@ gpufhe_test(test_boot tests/test_boot.cpp)
 # explicitly.
 add_executable(test_boot_hoist_enabled tests/test_boot_hoist_enabled.cpp)
 target_link_libraries(test_boot_hoist_enabled PRIVATE gpufhe CUDA::cudart)
+# GOD PROMPT "CKKS PHASE 25": multi-input bootstrap repeatability driver.
+# Deliberately NOT registered with `gpufhe_test` / `add_test`, for the same
+# reason as test_boot_hoist_enabled above: this runs the FULL n=8192
+# bootstrap pipeline NUM_CASES times over, so its peak host RSS is in
+# test_boot's own documented 8.12-8.32GB band. Letting a plain `ctest`
+# absorb it would hand a routine regression run an 8GB+ memory
+# requirement, which this machine has never been able to satisfy (see
+# research/PHASE25_RECOVERY.md section 5). Build it explicitly, gate it on
+# research/benchmarks/bootstrap_preflight.ps1, and run it by hand:
+#   cmake --build build2 --target test_boot_multi_input -j4
+add_executable(test_boot_multi_input tests/test_boot_multi_input.cpp)
+target_link_libraries(test_boot_multi_input PRIVATE gpufhe CUDA::cudart)
+# GOD PROMPT "CKKS PHASE 25": the RUNNABLE sibling of the driver above. Unlike
+# test_boot_multi_input it is cheap (n=1024, no bootstrap stages, no key
+# switching), so it IS registered with ctest -- it is the regression gate on
+# tests/boot_driver_harness.h, the shared harness BOTH drivers include. It
+# validates the case loop, the deterministic-message profiles, the
+# test-seed/crypto-seed separation, the per-stage failure attribution (with
+# deliberate fault injection) and the JSONL emitter. It executes NO bootstrap
+# stage and must never be cited as bootstrap evidence; see the file's own
+# header for that boundary stated in full.
+add_executable(test_boot_multi_input_small tests/test_boot_multi_input_small.cpp)
+target_link_libraries(test_boot_multi_input_small PRIVATE gpufhe CUDA::cudart)
+add_test(NAME test_boot_multi_input_small COMMAND test_boot_multi_input_small)
 gpufhe_test(test_c2s_stages tests/test_c2s_stages.cpp)
 gpufhe_test(test_alpha10 tests/test_alpha10.cpp)
 gpufhe_test(test_chain tests/test_chain.cpp)

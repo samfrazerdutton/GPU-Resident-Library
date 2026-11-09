@@ -16,3 +16,16 @@ graphify-out/*
 !graphify-out/graph.json
 !graphify-out/GRAPH_REPORT.md
 !graphify-out/.graphify_analysis.json
+
+# GOD PROMPT "CKKS PHASE 25": local build tree. `build/` was already ignored
+# above but `build2/` -- the configured Release tree this project actually
+# builds in -- was not, leaving a ~30MB directory of object files and test
+# binaries one `git add -A` away from being committed. Ignoring it is pure
+# hygiene; nothing about how it is built or used changes.
+build2/
+
+# Live output of tests/test_boot_multi_input_small.cpp, which ctest runs. The
+# emitter appends, so leaving this tracked would dirty the working tree on
+# every single regression run. The committed reference copy lives at
+# research/benchmarks/baselines/ instead -- see that directory's README.
+research/benchmarks/boot_multi_input_small.jsonl
