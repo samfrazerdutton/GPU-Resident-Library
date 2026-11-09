@@ -2,6 +2,205 @@
 
 ## Current commit
 
+Check `git log -5` on resume. As of this writing HEAD is `1eae71a`, the third
+of three Phase 25 commits on top of Phase 24's `68e9f65`:
+
+- `6bbb8b6` Phase 25 (1/n) — recovery + bootstrap validation harness
+- `e2697e9` Phase 25 (2/n) — **concurrency defect found and fixed**
+- `1eae71a` Phase 25 (3/n) — hoisting A/B + residency audit
+
+**Recovery.** The session resumed in Git Bash on Windows, NOT inside WSL. WSL
+`Ubuntu` was Stopped and started on the first ordinary attempt — no
+`HCS_E_CONNECTION_TIMEOUT` recurrence, no diagnostics, no config change. The
+authoritative checkout `/home/samfrazerdutton/GPU-Resident-Library` was intact
+at `68e9f65` = `origin/main`, 0 ahead / 0 behind, zero tracked or staged
+modifications. Full detail: `research/PHASE25_RECOVERY.md`.
+
+**The shutdown had caught the previous session mid-Phase-25.** Three preflight
+PowerShell files and a 646-line `tests/test_boot_multi_input.cpp` survived as
+untracked work (Nov 5 21:23–21:29). All recovered, plus five gaps closed: the
+driver had never actually been compiled (not registered in CMakeLists despite
+its header claiming "BUILD-VERIFIED ONLY"); no machine-readable output; no
+per-stage fields; the promised `test_boot_multi_input_small.cpp` did not exist;
+and the preflight took `-BootstrapConfig` as free text it never parsed, so it
+could only apply one fixed threshold.
+
+**The headline result is a production bug nobody was looking for.**
+`src/rotate.cpp`'s `scratch()` handed THE SAME process-global device buffer to
+every caller (as did the five `xf_multi` metadata arrays), so two threads in
+`xf_multi` uploaded into the same device memory and read back each other's
+data — **silently wrong ciphertexts, no crash, no diagnostic.** Reached by
+`pt_to_eval_host` and `automorphism_eval_host` (hence `rotate_ct_host`); NOT
+reached by `rotate_ct_resident`, which allocates its own per-call scratch. Fixed
+with `thread_local`, which preserves the file's allocate-once/grow/never-free
+doctrine per thread and is byte-identical single-threaded.
+
+Measured with the new `tests/test_rotate_concurrent_cache.cpp` (9 concurrent
+fixtures, distinct (n, towers)):
+
+```
+BEFORE  phase B control (rotate_ct_resident)  PASS 6/6 runs
+        phase C (pt_to_eval_host)             FAIL 9/9, 72,704 wrong limbs
+        phase D (rotate_ct_host)              FAIL 9/9, 182,272 wrong limbs
+AFTER   all three phases                      PASS 6/6 runs
+```
+
+**Phase 24's diagnosis was half right, and the correction matters.** Phase 24
+said both Rust failures were test-order artifacts of
+`budget_exhaustion_falls_back_safely_and_stays_correct` and that "skipping that
+one test makes everything else pass unconditionally". True only in SERIAL mode.
+In the default parallel mode the failures were the `rotation::` tests, the
+failing SET varied run to run (3, then 2, then 4 — the signature of a race, not
+of ordering), and skipping the budget test did nothing for them. There were two
+independent defects.
+
+**Result — both modes now fully green, nothing skipped:**
+
+| | before | after |
+|---|---|---|
+| `cargo test --release -- --test-threads=1` | 55 passed; 2 failed; 1 ignored | **62 passed; 0 failed; 1 ignored** |
+| `cargo test --release` (parallel) | 55 passed; 2–3 failed (varying) | **62 passed; 0 failed; 1 ignored** |
+
+Phase 24's best was 56 passed/0 failed *with the budget test skipped*, in one
+mode only.
+
+**Defect 2 (test isolation), fixed properly.** The 16 MiB
+`kRegisteredBudgetBytes` is tracked by `g_registeredBytesUsed`, which only
+increases and has no release path (by design), and the pool never evicts. So the
+budget-exhaustion test permanently consumed the budget for everything sharing
+its process. Moved to
+`rust/crates/ckks-cuda/tests/registered_budget_exhaustion.rs`, where Cargo gives
+it its own process. NOT skipped, NOT weakened — every original assertion intact,
+and in a fresh process its ~23 MiB of requests still exceed the 16 MiB cap, so
+the budget still genuinely binds. No production change: in particular **no
+test-only budget-reset hook was added**, which would have put a deregistration
+path into production purely to serve a test. Regression test
+`no_unit_test_may_exhaust_the_shared_registered_budget` encodes the invariant
+(a 48 KiB fresh key must still register inside the unit-test process) and its
+failure message names the cause.
+
+**Rotation hoisting: the "why is it disabled" question is answered.** It is an
+amortisation effect, and at one rotation per decompose it is a net loss. New
+`bench/bench_hoist_ab.cpp`, at n=8192/sizeQ=30/sizeP=2/numPart=15:
+
+```
+rotations sharing one decompose:   1       2       3       4       6
+speedup upper bound, 9 trials:     0.59x   1.18x   1.43x   1.69x   1.90x
+speedup upper bound, 21 trials:    0.76x   1.18x   1.43x   1.57x   1.89x
+```
+
+Bit-exact both runs (0 of 2,949,120 limbs differ across 6 keys; the benchmark
+refuses to print timings unless that passes first). Correctness was never the
+problem. **Keep `HOIST_ROTATION_ENABLED = false`**; if ever enabled, scope it to
+a BSGS stage loop (~16 diagonals share one input half — the N≥4 regime), not
+globally. Scope caveat stated everywhere it appears: decompose+accumulate+moddown
+only, so it is an UPPER BOUND on rotation speedup and **NOT** a bootstrap
+speedup. Full writeup: `research/ROTATION_HOISTING_INVESTIGATION.md`.
+
+**Residency audit: the dominant transfer is the KEY, not the ciphertext.**
+`ks_context_create` runs INSIDE the per-diagonal loop and re-uploads the entire
+eval key every time — `upv(K.av[p])`/`upv(K.bv[p])` per part, each `sizeQlP*n`.
+At n=8192/sizeQlP=32/numPart=15 that is **60 MiB H2D per diagonal** plus 31
+cudaMalloc/cudaFree pairs, against only ~9.4 MiB of ciphertext traffic for the
+same diagonal — about **6×**. `KROT`/`KSC` do not help; they are host-side
+caches (`KSC` is explicitly a *view* cache). `src/rotate.cpp`'s own comment
+anticipated it ("if that dominates, cache contexts across calls next") and by
+static byte count it does. Six ranked opportunities with risk/test/fallback
+each: `research/BOOTSTRAP_GPU_RESIDENCY_AUDIT.md`.
+
+## Blocked this round (Phase 25) — and what is NOT blocked
+
+**The full n=8192 bootstrap was NOT executed.** Windows free RAM measured
+2.35–3.19 GiB for the entire session against the 10 GiB floor;
+`research/benchmarks/bootstrap_preflight.ps1` returned NO-GO for both n=8192 and
+n=131072, logged to `research/benchmarks/bootstrap_preflight_log.jsonl`. **No
+claim of bootstrap runtime correctness, precision or repeatability is made.**
+`tests/test_boot_multi_input.cpp` is build-verified only (it now genuinely
+compiles and links, for the first time). Also blocked by the same gate:
+`test_hoist_allstages` (~8 GB), `test_boot_n131072`, and
+`research/benchmarks/randomized_ab.sh` (~8 GB × 20 runs ≈ 37 min).
+
+**What turned out NOT to be blocked**, and this is worth internalising for next
+time: `test_hoist_single` (275 MB), `test_hoist_multi` (569 MB),
+`test_hoist_levelreduced` (260 MB) and `test_rot_resident` at full n=8192/tw=30
+(248 MB) all run comfortably. Several rounds treated "n=8192" as a proxy for
+"8 GB"; it is not. Only the full bootstrap and the all-stages C2S pass are in
+that band. Check peak RSS with `/usr/bin/time -v` before assuming a test is
+gated.
+
+## Immediate next actions, in order
+
+1. **Reconcile the Windows clone before any new residency work.**
+   `C:\Users\samca\GPU-Resident-Library` (HEAD `f425cdd`, 65 dirty entries)
+   carries commit subjects including "Fused pt-mul-accumulate kernel (acc +=
+   rot_ct * diag): bit-exact vs host ct_mul_pt + ct_add_ct" — which **is** the
+   residency audit's O2 — and "Device automorphism kernel ... Unblocks
+   stage-resident transforms", which is O3's enabler. Nothing was read out of
+   that clone this round beyond `git log`/`git status`, and nothing was copied in
+   either direction. Diff `f425cdd` + its working tree against `origin/main` and
+   decide what is genuinely new **before** re-implementing a fused accumulate
+   kernel that may already exist and be verified. Owner's call.
+
+2. **Residency audit O1: cache `DeviceKSContext` per `(k, tw)`.** Largest static
+   target (~60 MiB H2D per diagonal, ~6 GiB per bootstrap, ~3,100 malloc/free
+   pairs). **Key it on `(k, tw)`, never `k` alone** — `EXPERIMENT_LEDGER.md`
+   entry #20 records a real correctness bug from building a key at a reduced
+   tower count, and a `k`-only cache reproduces it exactly. Entries must come
+   from the trusted `rotFull` + `atLevel` path. Needs a bounded LRU (60 MiB per
+   live entry against a 6144 MiB card). Isolated test: extend
+   `tests/test_rot_resident.cpp` with a repeated-rotation loop asserting
+   bit-exactness and measuring VRAM high-water; `bench/bench_hoist_ab.cpp` is
+   the ready-made template.
+
+3. **Run the bootstrap the moment the gate clears.** Exact sequence:
+   ```
+   powershell.exe -File research/benchmarks/bootstrap_preflight.ps1
+   # only on GO (exit 0):
+   wsl -d Ubuntu -- bash -lc 'cd ~/GPU-Resident-Library && \
+     cmake --build build2 --target test_boot_multi_input -j4 && \
+     /usr/bin/time -v ./build2/test_boot_multi_input'
+   ```
+   The driver emits JSONL (params + per-case + per-stage + summary) to
+   `research/benchmarks/`, so the run is comparable afterwards without trusting
+   a commit message. Do NOT relaunch after a NO-GO without a fresh preflight.
+
+4. **Optionally fix the latent map race.** `keyswitch_resident.cpp:30`/`:106`,
+   `rotate.cpp:29`/`:130` are `find()`-then-`emplace()` on `static std::map`
+   with **no mutex in either file**. Phase B of
+   `tests/test_rotate_concurrent_cache.cpp` drives exactly that path and passed
+   6/6, so it is latent, not active — left unfixed deliberately because there is
+   no failing test and the directive forbids changing
+   `keyswitch_resident.cpp` internals without one. Phase B stays as the control:
+   **if it ever fails, reopen this.**
+
+## Environment facts worth not rediscovering
+
+- **`cmake -S . -B build2` under the WSL login shell took over 13 minutes with
+  no progress.** `find_package` walks the ~50 `/mnt/c/...` entries that shell
+  puts on `PATH`, over the 9p filesystem. With a Linux-only PATH the identical
+  configure finishes in **2.1 seconds**. Always build with:
+  ```
+  export PATH=/usr/local/cuda-13.2/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+  ```
+  (add `~/.cargo/bin` for Rust). A bare `wsl -d Ubuntu -- bash script.sh` has
+  neither `nvcc` nor `cargo` on `PATH` at all — the login shell is needed for
+  those, or set PATH explicitly as above.
+- WSL reports **10 GB total / 10 GB free** at the very moment the Windows host
+  has 2.35 GiB actually free. `memory=11GB` in `.wslconfig` is a ceiling, not a
+  reservation. This is why the gate reads `Get-CimInstance
+  Win32_OperatingSystem` and nothing else.
+- The preflight's `*RamGB` values are really **GiB** (`FreePhysicalMemory` is in
+  KB and the harness divides by 1048576). Documented and relabelled rather than
+  retuned — GiB makes the gate slightly stricter, the safe direction.
+- RTX 2060 Max-Q, 6144 MiB VRAM, driver 595.97, CUDA 13.2 (five toolkits
+  installed; `/usr/local/cuda` → 13.2), 16 CPU threads, Windows 11 host with
+  15.42 GiB total RAM. GPU clock throttling under WSL2 and thermal drift over
+  long sessions are real and measured — hence median-of-many-trials with
+  **alternating arm order** for any A/B on this machine.
+
+## Earlier commit (Phase 24)
+
+
 Check `git log -3` on resume. As of this writing, HEAD is a new commit
 on top of entry #56's commit `6ca185d` (the GOD PROMPT "CKKS PHASE 24"
 round: "CKKS BOOTSTRAP RUNTIME VALIDATION, PRECISION RECOVERY &
@@ -47,7 +246,7 @@ file changed this round -- investigation and documentation only. See
 bootstrap milestone tracking, and `research/TRANSFER_PROFILING.md`'s
 Phase 24 correction section for full detail.
 
-## Blocked this round (carried forward from Phase 23, now with a sharper gate)
+## Blocked in Phase 24 (carried forward from Phase 23, now with a sharper gate)
 
 Bootstrap runtime re-verification remains blocked -- same test, same
 dependency set, build-ready. The threshold is now explicitly ~10GB
@@ -136,7 +335,7 @@ verified (2601->2683 nodes, 5734->5915 edges, 154->159 communities; new
 `EXPERIMENT_LEDGER.md` entry #56 and `research/MIGRATION_MATRIX.md`'s
 new rotation row for full detail.
 
-## Blocked this round
+## Blocked in Phase 23
 
 **Bootstrap runtime re-verification** -- `/tmp/test_boot_build` (or an
 equivalent fresh build) is ready to run; it was NOT executed this round
