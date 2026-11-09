@@ -2,6 +2,167 @@
 
 ## Current commit
 
+Check `git log -5` on resume. As of this writing HEAD is the final Phase 27
+commit on top of Phase 26's `8cc1e12`.
+
+**Verification (Mission 1): Phase 26's experiment reproduced, with one real
+discrepancy found and quantified.** `bench/bench_ks_context_resident_ab.cpp`
+rebuilt and rerun: 60.000 MiB/context, bit-exact, 1.6871x speedup (vs Phase
+26's 1.6621x — same order, expected machine spread) all reproduced exactly.
+**But**: Arm A's measured interval charges for 48 `ks_context_create` AND 48
+matching `ks_context_destroy`; Arm B's charges for only 8 creates — the 8
+matching destroys happen in the cache's destructor, AFTER the timer stops.
+New `bench/probe_create_destroy_cost.cpp` measured `ks_context_destroy`
+directly: **36% of create's cost** (0.0080s vs 0.0219s). Corrected, the honest
+speedup is closer to **~1.6x**, not 1.69x — real, just not quite as large as
+reported.
+
+**THE CENTRAL FINDING (Mission 2): Phase 26's 1.66x does not generalize to
+the real bootstrap.** New `research/benchmarks/extract_real_key_sequence.cpp`
+replicates `tests/test_boot.cpp`'s own diagonal-finding logic (pure CPU
+arithmetic, no CUDA, no bootstrap execution) to produce the ACTUAL ordered
+sequence of rotation-key requests across a full bootstrap:
+
+```
+Total diagonal rotation accesses: 181
+Distinct (k, tw) pairs [the REAL device-context working set]: 151
+Distinct k alone [KROT's host-side working set]: 76
+```
+
+**76 independently cross-validates against a previously INSTRUMENTED
+measurement already in `EXPERIMENT_LEDGER.md`** ("evalkeygen calls total=77 =
+76+1 relin key") — strong evidence the extraction is faithful. **The "~77
+entries" Phase 26's limitations section cited for sizing a device cache was
+the WRONG quantity** (KROT's k-only count) — the real device-context working
+set is 151, not 76.
+
+**Of 181 total accesses, only 30 are repeats, and they ALL come from exactly
+one place**: S2C's stage at `g==LST-1` processes the same 30 rotation offsets
+TWICE (real branch, then imaginary branch). Every other stage (C2S's 3; S2C's
+other 2) has **zero internal reuse** — each diagonal's key is used exactly
+once, never needed again at that tower count anywhere else in the bootstrap.
+An LRU hit-rate simulation against this REAL sequence confirms: **0% hit rate
+for any cap < 30; a FLAT 16.6% ceiling for any cap ≥ 32** (confirmed again by
+an actual GPU capacity sweep, `bench/bench_realistic_ks_cache.cpp`'s Mission 6
+section: cap=4/8/16 all measure 0 hits; cap=30 measures 50% hit rate on that
+one stage's own 60 accesses). Scaling a cache past ~32 entries buys nothing.
+
+Also found: `atLevel` (the real mechanism behind every reduced-tw key) copies
+`av`/`bv` **unchanged, full-size** from the full key — only the number of
+parts shrinks with `tw`, not each array. So the full 151-entry working set's
+memory cost, **calculated (never allocated, per the directive's explicit
+instruction)**, is **~5.62 GiB** — would not safely coexist with everything
+else this project allocates on the 6144 MiB card, and would be pointless
+regardless (the hit-rate ceiling is identical at cap=32 and cap=151).
+
+**Result: a correctly-scoped cache (~30-32 entries, ~600 MiB, matching the
+ONE stage that benefits) gives a real, bit-exact 1.5-1.8x on that stage
+alone** (`bench/bench_realistic_ks_cache.cpp`, using the REAL atLevel-style
+key construction and the REAL double-pass access pattern, not a synthetic
+round-robin). **Full detail, the complete memory model, and the architecture
+built on this evidence: `research/KS_RESIDENT_CACHE_DESIGN.md`.**
+
+**Mission 3/4: `include/ks_resident_cache.h` built.** `KsResidentCache`,
+on top of the project's proven `ScopedKSContext` RAII primitive
+(`include/ks_raii.h`). Keyed `{k, tw}` (never `k` alone — entry #20's bug
+class). Bounded by BOTH entry count (default 32) and resident bytes (default
+768 MiB). Fails CLOSED on VRAM pressure (`KsResidentCacheOOM`, thrown BEFORE
+any allocation attempt, closing a gap `ks_raii.h`'s own docs flag in the
+underlying C API: neither `ks_context_create` nor `ks_work_create` reports
+allocation failure today). Enforces single-threaded access by **aborting the
+process** on a cross-thread call (not just documenting the limitation).
+Closes an in-flight safety gap found during this round's own design review:
+evicting a context while a kernel against its buffers is still in flight
+would race `cudaFree` against that kernel — closed by recording a stream per
+entry and `cudaStreamSynchronize`-ing it before any destroy. `src/
+keyswitch_resident.cpp` was NOT touched — the whole cache lives in this one
+new header.
+
+**Mission 5: `tests/test_ks_resident_cache.cpp` — 34/34 checks, confirmed
+stable across 5 repeated runs from 2 different working directories.** Three
+real methodology bugs were found and fixed WHILE WRITING these tests (kept
+documented in both the header and the ledger, not papered over):
+1. A bare `fork()` from an already-CUDA-active process is unsafe (CUDA
+   explicitly does not support it) — corrupted the child's CUDA state,
+   produced a `SIGSEGV`. Fixed with a separate helper EXECUTABLE (`tests/
+   ks_cache_thread_violation_helper.cpp`) invoked via `system()`
+   (fork+exec, safe).
+2. `system()`'s signal encoding: a child that dies by signal is reported by
+   the wrapping shell as a NORMAL exit with status 128+signal, not
+   `WIFSIGNALED` — an earlier check misread a confirmed-working abort as a
+   failure.
+3. `stdout` is fully buffered when piped — a crash discarded every
+   already-printed `[PASS]` line, making a working test look like it
+   produced no output at all. Fixed with `setvbuf(..., _IOLBF, ...)`.
+4. **A genuine intermittent failure**, caught exactly as Mission 5
+   instructs (running tests from a different working directory): the
+   thread-violation helper was invoked via a bare relative path, silently
+   resolving to nothing when run from the repo root instead of `build2/`.
+   Fixed by resolving the helper's path via `/proc/self/exe`.
+
+**Mission 6: realistic capacity sweep.** `bench/bench_realistic_ks_cache.cpp`
+tests cap=4/8/16/30 against the REAL access pattern (not Phase 26's
+round-robin): 0% hit rate below the real stage width, 50% (of that one
+stage) at cap=30, flat beyond. Confirms section 2.3's CPU-only simulation
+with an actual GPU run.
+
+**Mission 7: integration investigated, NOT performed.** Given the evidence
+above, general-purpose production integration is **not recommended** — see
+`research/KS_RESIDENT_CACHE_DESIGN.md` section 6 for the full reasoning and
+the narrowly-scoped alternative (a cache built at the start of the one S2C
+stage that benefits, torn down at its end) that WOULD be justified if ever
+pursued.
+
+**Mission 8: fused pt-mul-accumulate kernel, end-to-end STAGE-level A/B.**
+New `bench/bench_stage_acc_integration.cpp` measures the ACTUAL stage-level
+effect of wiring `LaunchPtMulAcc` in (Phase 26 only measured the isolated
+kernel, ~7.6x). Simulates one real 16-diagonal stage: current CPU
+multiply+add+per-diagonal-nothing-extra vs fused-kernel+ONE-final-download
+(pt_to_eval_host's own round trip deliberately unchanged in both arms —
+separate, larger optimization target, out of scope here). **Result:
+bit-exact (0/491520 limbs), real end-to-end stage speedup of 1.20x** — much
+smaller than the isolated kernel's 7.6x once the unchanged round trip
+dominates, exactly the correction Mission 8 warns to make. Both of Mission
+8's promotion conditions are met (correctness preserved, end-to-end latency
+improves) — this is a small, low-risk, evidence-backed candidate, UNLIKE the
+cache. Not wired into `tests/test_boot.cpp` this round (kept as a separate,
+independently-verifiable change from the cache work, per the directive's own
+instruction not to combine the two experiments). Full detail: `research/
+FUSED_KERNEL_STAGE_INTEGRATION.md`.
+
+**Mission 9: bootstrap gate.** Windows free RAM measured 1.07-2.81 GiB this
+session against the 10/6 GiB floors. Both preflight checks NO-GO, logged.
+Full bootstrap NOT executed; no claim of correctness made; gate not weakened.
+
+**Mission 10: regression.** All four Rust combinations (debug/release x
+serial/parallel): 62 passed/0 failed/1 ignored, identical to Phase 25/26's
+end state. C++ targeted: 14/14 pass (122-569 MB peak RSS), confirmed stable
+from both the repo root and `build2/`, 5 repeated runs each.
+
+## Immediate next actions, in order
+
+1. **If ever pursuing the cache**: scope it to exactly the ONE S2C stage
+   that benefits (built at that stage's start, torn down at its end, sized
+   ~30-32 entries / ~768 MiB), using `include/ks_resident_cache.h` as-is.
+   Do NOT build a general-purpose always-on cache — the evidence this round
+   built says plainly that it would not help the other five passes and
+   would add real memory/complexity risk for a narrow gain.
+2. **The fused-kernel wiring (Mission 8) is the better next move** if
+   pursuing EITHER optimization: smaller, lower-risk, already end-to-end
+   verified at the stage level. The actual edit would be in `tests/
+   test_boot.cpp`'s accumulate call sites (not `src/keyswitch_resident.cpp`,
+   so the "no internals without a reproducer" rule does not block it).
+3. **Reconsider `pt_to_eval_host`'s own round trip** (the residency audit's
+   O3) — Mission 8's stage-level result shows THIS, not the accumulate step,
+   now dominates a stage's cost once the fused kernel is in place. This is
+   the next real bottleneck to investigate, not previously quantified this
+   precisely.
+4. **Run the bootstrap the moment the gate clears** — same sequence as
+   Phase 25/26's handoff (see `research/benchmarks/bootstrap_preflight.ps1`).
+
+## Earlier commit (Phase 26)
+
+
 Check `git log -5` on resume. As of this writing HEAD is the final Phase 26
 commit on top of Phase 25's `1d73518`. Phase 26's commits, in order:
 

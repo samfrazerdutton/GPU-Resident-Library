@@ -336,6 +336,36 @@ gpufhe_benchmark(bench_hoist_ab bench/bench_hoist_ab.cpp)
 # does NOT wire anything into production -- registered as a benchmark, not a
 # test, for the same reason as bench_hoist_ab.cpp above.
 gpufhe_benchmark(bench_ks_context_resident_ab bench/bench_ks_context_resident_ab.cpp)
+# GOD PROMPT "CKKS PHASE 27", Mission 1: diagnostic probe quantifying the
+# ks_context_create vs ks_context_destroy timing asymmetry identified while
+# reconstructing bench_ks_context_resident_ab.cpp's A/B methodology (Arm A's
+# measured interval includes 48 destroys; Arm B's includes 0, deferred past
+# its timer). Not a correctness test -- a timing diagnostic, hence
+# gpufhe_benchmark not gpufhe_test.
+gpufhe_benchmark(probe_create_destroy_cost bench/probe_create_destroy_cost.cpp)
+# GOD PROMPT "CKKS PHASE 27", Missions 2+6: realistic A/B against the actual
+# bootstrap access pattern (30-key S2C double real/imaginary pass, atLevel-
+# style key construction), replacing Phase 26's toy round-robin benchmark's
+# memory model and access pattern with faithful ones extracted from
+# tests/test_boot.cpp's own source.
+gpufhe_benchmark(bench_realistic_ks_cache bench/bench_realistic_ks_cache.cpp)
+# GOD PROMPT "CKKS PHASE 27", Mission 5: full test suite for
+# include/ks_resident_cache.h -- correctness, cache behavior, concurrency
+# (including a system()-invoked-helper-process test that the enforced
+# single-thread abort actually fires -- a bare fork() was tried first and
+# found unsafe once CUDA is active, see tests/ks_cache_thread_violation_helper.cpp),
+# and memory. Cheap (n=1024), registered with gpufhe_test.
+gpufhe_test(test_ks_resident_cache tests/test_ks_resident_cache.cpp)
+# GOD PROMPT "CKKS PHASE 27", Mission 5 (C3): standalone helper executable
+# that deliberately violates KsResidentCache's single-thread contract.
+# Invoked by test_ks_resident_cache.cpp via system() (fork+exec, CUDA-safe)
+# rather than a bare fork() from an already-CUDA-active process -- see that
+# test's own comment for why a bare fork() corrupted CUDA state instead.
+# Registered WITHOUT add_test (gpufhe_benchmark, not gpufhe_test): this
+# binary is EXPECTED to abort every run, so ctest must never pick it up as
+# an independent pass/fail target -- it exists only to be invoked by name
+# from test_ks_resident_cache.cpp's own working directory.
+gpufhe_benchmark(ks_cache_thread_violation_helper tests/ks_cache_thread_violation_helper.cpp)
 gpufhe_test(test_c2s_stages tests/test_c2s_stages.cpp)
 gpufhe_test(test_alpha10 tests/test_alpha10.cpp)
 gpufhe_test(test_chain tests/test_chain.cpp)
@@ -349,6 +379,13 @@ gpufhe_test(test_stage_acc tests/test_stage_acc.cpp)
 # the real n=8192/tw=30 bootstrap case, single accumulate), so registered with
 # gpufhe_test like its sibling.
 gpufhe_test(test_stage_acc_differential tests/test_stage_acc_differential.cpp)
+# GOD PROMPT "CKKS PHASE 27", Mission 8: end-to-end STAGE-level A/B for
+# wiring LaunchPtMulAcc into the bootstrap's accumulate loop, including
+# transfers -- not just the isolated kernel (already proven bit-exact,
+# tests/test_stage_acc_differential.cpp). pt_to_eval_host's own round trip
+# is deliberately unchanged in both arms; rotation is simulated identically
+# in both arms. See the file's own header for the full scope statement.
+gpufhe_benchmark(bench_stage_acc_integration bench/bench_stage_acc_integration.cpp)
 gpufhe_test(test_ntt_batched tests/test_ntt_batched.cpp)
 gpufhe_test(test_intt_batched tests/test_intt_batched.cpp)
 gpufhe_test(test_automorph_eval_fast tests/test_automorph_eval_fast.cpp)
