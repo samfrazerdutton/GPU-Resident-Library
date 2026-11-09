@@ -23,6 +23,23 @@ static double rssMB(){ struct rusage ru; getrusage(RUSAGE_SELF,&ru); return ru.r
 namespace gpufhe {
 void encode_host(std::vector<int64_t>&, const std::vector<std::complex<double>>&, uint32_t, double);
 void decode_host(std::vector<std::complex<double>>&, const std::vector<int64_t>&, uint32_t, double);
+// GOD PROMPT "CKKS PHASE 28": encode_host/decode_host (above) are the O(N^2)
+// reference this bootstrap originally used throughout. All call sites below
+// now use these O(N log N) FFT replacements instead (src/encode_fft.cpp,
+// correctness-verified to tolerance by tests/test_encode_fft_matches_
+// reference.cpp and concurrency-hardened per tests/test_encode_fft_
+// concurrency.cpp -- see research/ENCODE_FFT_PROMOTION.md for the full
+// promotion decision). Measured stage-level speedup at this file's n=8192:
+// 2.5x (bench/bench_encode_fft_stage.cpp), with encode/decode themselves
+// being the dominant cost of that stage (bench/bench_stage_timeline.cpp).
+// NOTE: this integration compiles and links but has NOT been executed
+// end-to-end in this session -- the Windows free-RAM gate for running this
+// file's n=8192 bootstrap (>=10 GiB) was not met (measured 2.40 GiB free via
+// Get-CimInstance Win32_OperatingSystem). Re-run this file once the gate is
+// met to confirm the integrated bootstrap path produces correct output and
+// realizes the measured speedup end-to-end -- see NEXT_SESSION.md.
+void encode_host_fft(std::vector<int64_t>&, const std::vector<std::complex<double>>&, uint32_t, double);
+void decode_host_fft(std::vector<std::complex<double>>&, const std::vector<int64_t>&, uint32_t, double);
 void native_primes(std::vector<uint64_t>&, uint32_t, uint32_t, uint32_t, const std::vector<uint64_t>&);
 uint64_t native_root(uint32_t, uint64_t);
 void native_rescale_consts(std::vector<uint64_t>&, std::vector<uint64_t>&, const std::vector<uint64_t>&, uint32_t);
@@ -153,7 +170,7 @@ int main(){
     // ---- message, encrypt at the BOTTOM level (q0 only)
     std::vector<cd> z(S);
     for(uint32_t i=0;i<S;++i) z[i]={0.35*std::sin(0.02*i),0.25*std::cos(0.017*i)};
-    std::vector<int64_t> mz; gpufhe::encode_host(mz,z,n,Delta_in);
+    std::vector<int64_t> mz; gpufhe::encode_host_fft(mz,z,n,Delta_in);
     std::vector<uint64_t> c0,c1;
     gpufhe::encrypt_host(c0,c1,mz,KP1.pkA,KP1.pkB,n,mod1,root1,ns,3.19,303);
 
@@ -565,7 +582,7 @@ int main(){
         if(!stageUsesHoist) stageRotBegin(R,cs0,cs1,ctw,keyAt(offs[0],ctw));
         for(size_t x=0;x<offs.size();++x){
             auto _tp=NOW();
-            std::vector<int64_t> md; gpufhe::encode_host(md,dg[x],n,dpt);
+            std::vector<int64_t> md; gpufhe::encode_host_fft(md,dg[x],n,dpt);
             std::vector<uint64_t> dE; gpufhe::pt_to_eval_host(dE,md,ctw,n,ml,rl);
             g_tPtEval+=EL(_tp);
             std::vector<uint64_t> t0,t1;
@@ -618,7 +635,7 @@ int main(){
 
     auto peek=[&](const std::vector<uint64_t>&p0,const std::vector<uint64_t>&p1,double sc)->std::vector<cd>{
         std::vector<int64_t> d; gpufhe::decrypt_host(d,p0,p1,KPr.s,n,mf,rf);
-        std::vector<cd> v; gpufhe::decode_host(v,d,n,sc); return v; };
+        std::vector<cd> v; gpufhe::decode_host_fft(v,d,n,sc); return v; };
 
     // ---- CHECK C2S: slots must be y_k = (a_k + i a_{k+S})/q0
     { auto v=peek(y0,y1,sOut);
@@ -744,13 +761,13 @@ int main(){
             for(uint32_t k=0;k<n;++k){size_t x=(size_t)t*n+k;
                 o.c0[x]=smu(A.c0[x],B.c0[x],q); o.c1[x]=smu(A.c1[x],B.c1[x],q);}} return o; };
     auto subK=[&](Ct&A,cd v){ std::vector<cd> zc(S,v); std::vector<int64_t> m2;
-        gpufhe::encode_host(m2,zc,n,A.scale);
+        gpufhe::encode_host_fft(m2,zc,n,A.scale);
         std::vector<uint64_t> ml(mod.begin(),mod.begin()+A.tw),rl(root.begin(),root.begin()+A.tw);
         std::vector<uint64_t> e2; gpufhe::pt_to_eval_host(e2,m2,A.tw,n,ml,rl);
         for(uint32_t t=0;t<A.tw;++t){uint64_t q=mod[t];
             for(uint32_t k=0;k<n;++k){size_t x=(size_t)t*n+k; A.c0[x]=smu(A.c0[x],e2[x],q);}} };
     auto mulK=[&](const Ct&A,cd v)->Ct{ Ct o=A; std::vector<cd> zc(S,v); std::vector<int64_t> m2;
-        gpufhe::encode_host(m2,zc,n,Delta_w);
+        gpufhe::encode_host_fft(m2,zc,n,Delta_w);
         std::vector<uint64_t> ml(mod.begin(),mod.begin()+A.tw),rl(root.begin(),root.begin()+A.tw);
         std::vector<uint64_t> e2; gpufhe::pt_to_eval_host(e2,m2,A.tw,n,ml,rl);
         gpufhe::ct_mul_pt_host(o.c0,o.c1,e2,A.tw,n,ml);
@@ -794,7 +811,7 @@ int main(){
         Ct acc; acc.tw=low; acc.scale=0; bool f1=true;
         for(uint32_t k=1;k<=degC;++k){ Ct t=lvl(Tk[k],low);
             std::vector<cd> zc(S,cd{cc[k],0}); std::vector<int64_t> mc;
-            gpufhe::encode_host(mc,zc,n,Delta_w);
+            gpufhe::encode_host_fft(mc,zc,n,Delta_w);
             std::vector<uint64_t> cE; gpufhe::pt_to_eval_host(cE,mc,low,n,ml,rl);
             gpufhe::ct_mul_pt_host(t.c0,t.c1,cE,low,n,ml);
             if(f1){acc.c0=t.c0;acc.c1=t.c1;acc.scale=t.scale*Delta_w;f1=false;}
@@ -826,7 +843,7 @@ int main(){
     { std::vector<uint64_t> mo(mod.begin(),mod.begin()+oR.tw),ro(root.begin(),root.begin()+oR.tw);
       auto KO=gpufhe::keygen_host(n,mo,ro,ns,3.19,101);
       std::vector<int64_t> d; gpufhe::decrypt_host(d,oR.c0,oR.c1,KO.s,n,mo,ro);
-      std::vector<cd> v; gpufhe::decode_host(v,d,n,oR.scale);
+      std::vector<cd> v; gpufhe::decode_host_fft(v,d,n,oR.scale);
       // slots are BIT-REVERSED after the staged C2S: slot k holds a_{brev(k)}
       double e=0; for(uint32_t k=0;k<S;++k) e=std::max(e,std::abs(v[k].real()-std::sin(2*M_PI*d128(aref[brev(k)])/(double)q0)));
       std::cout<<"  EvalMod(R) err vs sin(2pi a_k/q0) = "<<e<<"\n"; }
@@ -886,7 +903,7 @@ int main(){
             auto _tp=NOW();
             std::vector<cd> dd(S);
             for(uint32_t i2=0;i2<S;++i2) dd[i2]=dg[x][i2]*srcs0[q2].second;
-            std::vector<int64_t> md; gpufhe::encode_host(md,dd,n,dpt);
+            std::vector<int64_t> md; gpufhe::encode_host_fft(md,dd,n,dpt);
             std::vector<uint64_t> dE; gpufhe::pt_to_eval_host(dE,md,stw,n,ml,rl);
             g_tPtEval+=EL(_tp);
             std::vector<uint64_t> t0,t1;
@@ -930,7 +947,7 @@ int main(){
     std::vector<uint64_t> mF(mod.begin(),mod.begin()+twF),rF(root.begin(),root.begin()+twF);
     auto KF=gpufhe::keygen_host(n,mF,rF,ns,3.19,101);
     std::vector<int64_t> dF; gpufhe::decrypt_host(dF,sa0,sa1,KF.s,n,mF,rF);
-    std::vector<cd> zF; gpufhe::decode_host(zF,dF,n,Dfinal);
+    std::vector<cd> zF; gpufhe::decode_host_fft(zF,dF,n,Dfinal);
 
     double eFin=0; for(uint32_t k=0;k<S;++k) eFin=std::max(eFin,std::abs(zF[k]-z[k]));
     double secs=std::chrono::duration<double>(std::chrono::steady_clock::now()-tBoot).count();

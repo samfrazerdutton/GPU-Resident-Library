@@ -103,3 +103,80 @@ above is the justification for a FUTURE such change, not the change itself.
 cmake --build build2 --target bench_stage_acc_integration -j4
 ./build2/bench_stage_acc_integration            # defaults: n=8192 tw=30 NDIAG=16 trials=9
 ```
+
+---
+
+## Phase 28 addendum: Objective A re-verification + promotion decision
+
+GOD PROMPT "CKKS PHASE 28", Objectives A+D. Phase 27's single-run 1.2019x
+result above is re-verified here with full statistics and an explicit check
+for the benchmark asymmetries the directive calls out by name.
+
+### Re-verification (Objective A)
+
+Re-ran `bench_stage_acc_integration` 5 times (interleaved A/B each run, as
+the benchmark already does internally): speedups observed across the 5 runs
+ranged **1.18x-1.22x**, bit-exact (0 limbs differ) every time. No
+cherry-picking — every run's number is in this range, consistent with
+Phase 27's original single measurement.
+
+**Benchmark asymmetry check**: Arm B pays `cudaMalloc`/`cudaFree` for the
+device-resident accumulator (5 allocs + 5 frees per call) INSIDE the timed
+region; Arm A, being pure CPU, structurally cannot pay this cost. Measured
+via `bench/bench_stage_timeline.cpp`'s CUDA-event decomposition: this
+alloc/free pair is ~0.98% of Arm B's total stage time. Context
+creation/destruction, transfer counts, and sync points were otherwise
+confirmed equivalent between arms (same H2D/D2H pattern per diagonal except
+for the final-only download Arm B's whole design point is). **Conclusion:
+the reported ~1.2x is a slight UNDERSTATEMENT, not overstatement, of the
+achievable production benefit** — a production integration would normally
+allocate the accumulator once outside any per-call timing, not per
+benchmark-call as this isolated A/B does for fairness.
+
+### Objective B: real bottleneck (see `research/ENCODE_FFT_PROMOTION.md`)
+
+Building the full CUDA-event + wall-clock stage timeline
+(`bench/bench_stage_timeline.cpp`) found that `pt_to_eval_host` is NOT the
+dominant cost once this fused kernel is wired in, contrary to Phase 27's own
+scope note and this benchmark's own first-draft printed conclusion —
+`encode_host` is (59-71% of stage time vs 18-19%). That finding is written
+up in full in `research/ENCODE_FFT_PROMOTION.md`; it does not change this
+fused kernel's own promotion math below, but it is the reason the larger win
+this phase found is a different, independent optimization (the encode
+swap), not this one.
+
+### Promotion decision (Objective D)
+
+All 9 conditions the directive sets were already satisfied by Phase 27
+(bit-exact, reproducible, no crypto changes, no regressions, concurrency-safe
+by construction — the fused kernel takes an explicit stream and holds no
+static state) and are RE-CONFIRMED this round with tighter statistics.
+**Decision: PROMOTE**, unchanged from Phase 27's verdict.
+
+**Still not wired into `tests/test_boot.cpp`'s real accumulate loop this
+round, and that is a deliberate scope decision, not an oversight.** Two
+reasons:
+
+1. This phase already makes one production-adjacent, compiles-but-unverified
+   (end-to-end) change to `tests/test_boot.cpp` — the `encode_host_fft` swap
+   (`research/ENCODE_FFT_PROMOTION.md`). Wiring the fused kernel into the
+   SAME file's accumulate loop in the SAME session would stack a second
+   unverified change on top of the first, directly against the governing
+   directive's "do not stack several unverified optimizations" instruction —
+   especially since the fused-kernel integration is a real structural change
+   to the per-diagonal loop (not a drop-in function-name swap like the
+   encode case), carrying meaningfully higher risk of a subtle bug that only
+   shows up at full n=8192 scale.
+2. Neither change can be executed end-to-end this session regardless: the
+   Windows free-RAM gate for `tests/test_boot.cpp` (≥10 GiB) was measured at
+   2.40 GiB free (`Get-CimInstance Win32_OperatingSystem`), a NO-GO. Making a
+   second unverifiable change provides no additional evidence this round and
+   only increases the surface a future verification pass has to untangle if
+   something fails.
+
+**Recommended order for next session** (once the memory gate is met): first
+re-run `tests/test_boot.cpp` with ONLY the encode swap applied (already
+done) to isolate and confirm its effect in isolation; only then layer in the
+fused-kernel accumulate-loop wiring as a second, separately-measured change,
+per the directive's own "do not change multiple unrelated bottlenecks at
+once" instruction. This ordering is recorded in `research/NEXT_SESSION.md`.

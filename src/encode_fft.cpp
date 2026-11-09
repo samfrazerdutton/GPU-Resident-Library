@@ -59,11 +59,36 @@
 #include <cmath>
 #include <map>
 #include <utility>
+#include <mutex>
 
 namespace gpufhe {
 namespace {
 
 using cd = std::complex<double>;
+
+// GOD PROMPT "CKKS PHASE 28": this function's cache (and slot_idx's below)
+// originally used a plain `static std::map` with no synchronization --
+// the SAME pattern class as src/keyswitch_resident.cpp's g_rtab/upc, which
+// Phase 25's own concurrency audit found to be a LATENT (tested, never
+// triggered) risk. A real std::thread-based stress test (tests/
+// test_encode_fft_concurrency.cpp) initially appeared to show this cache
+// was WORSE than latent -- reproducing heap corruption 5/5 runs. root-
+// caused with AddressSanitizer to a bug in the TEST's own inputs (it
+// called encode_host_fft with non-power-of-2 N, violating this file's
+// documented M=2N-must-be-a-power-of-2 precondition and overrunning the
+// FFT buffers -- see that test's own correctness-note comment and
+// research/ENCODE_FFT_PROMOTION.md for the full isolation). Once the test
+// was fixed to use only valid power-of-2 N, this cache's race is LATENT,
+// exactly like g_rtab/upc -- not observed to misbehave, but still
+// concurrent std::map mutation, which is undefined behavior per the C++
+// standard regardless of whether any given run happens to observe a
+// visible failure. Fixed with a single mutex guarding both this function
+// and slot_idx() below as cheap, unconditional hardening: lookups/inserts
+// are trivial relative to the FFT itself (a handful of map operations vs
+// O(M log M) arithmetic), so a lock here costs nothing that matters while
+// closing a real (if latent) hazard. Re-verified after this fix:
+// tests/test_encode_fft_concurrency.cpp, 10 consecutive runs, 0 crashes.
+std::mutex& fft_cache_mutex() { static std::mutex m; return m; }
 
 // Cached per size-M forward-FFT twiddle table: root[t] = e^{-2*pi*i*t/M}
 // for t = 0..M/2-1 (enough to index every butterfly stage via a stride),
@@ -71,8 +96,10 @@ using cd = std::complex<double>;
 // avoiding any compounding rounding drift across O(log M) stages) and
 // cached for the process lifetime, matching this codebase's established
 // pattern (src/evalkeygen.cpp's ek_dev_tab, src/encdec.cpp's enc_dev_tab).
+// Guarded by fft_cache_mutex() -- see that function's own comment for why.
 struct FftTwiddles { std::vector<cd> root; };
 FftTwiddles& fft_twiddles(uint32_t M) {
+    std::lock_guard<std::mutex> lock(fft_cache_mutex());
     static std::map<uint32_t, FftTwiddles> cache;
     auto it = cache.find(M);
     if (it != cache.end()) return it->second;
@@ -132,6 +159,11 @@ std::vector<cd> fft_unnormalized_inverse(std::vector<cd> Z) {
 // read-only data depending only on N.
 struct SlotIdx { std::vector<uint64_t> r, gidx; };
 SlotIdx& slot_idx(uint32_t N) {
+    // Guarded by fft_cache_mutex() -- same confirmed-active race as
+    // fft_twiddles() above (see that function's comment); this cache has
+    // the identical find()-then-emplace() pattern and is exercised by the
+    // same concurrency reproducer (tests/test_encode_fft_concurrency.cpp).
+    std::lock_guard<std::mutex> lock(fft_cache_mutex());
     static std::map<uint32_t, SlotIdx> cache;
     auto it = cache.find(N);
     if (it != cache.end()) return it->second;

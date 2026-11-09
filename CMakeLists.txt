@@ -173,6 +173,14 @@ gpufhe_test(test_encrypt_host_fast_matches_sequential tests/test_encrypt_host_fa
 # decode_host -- see research/FFT_ENCODING_DERIVATION.md and research/
 # EXPERIMENT_LEDGER.md entry #45.
 gpufhe_test(test_encode_fft_matches_reference tests/test_encode_fft_matches_reference.cpp)
+# GOD PROMPT "CKKS PHASE 28": concurrency stress test for encode_host_fft/
+# decode_host_fft, found necessary before any production-integration
+# decision -- these functions lazily populate an UNSYNCHRONIZED
+# static std::map cache (fft_twiddles, slot_idx in src/encode_fft.cpp),
+# the same pattern class as keyswitch_resident.cpp's g_rtab/upc. Uses REAL
+# std::thread, never fork() -- Phase 27 found fork() after CUDA init unsafe;
+# this file touches no CUDA, but the discipline is followed regardless.
+gpufhe_test(test_encode_fft_concurrency tests/test_encode_fft_concurrency.cpp)
 # GOD PROMPT "CKKS PHASE 13": correctness tests for the Shoup-modmul
 # (encrypt_host_shoup) and Shoup+pooled-buffer (encrypt_host_shoup_
 # pooled) encrypt_host variants against the EXISTING, untouched
@@ -386,6 +394,37 @@ gpufhe_test(test_stage_acc_differential tests/test_stage_acc_differential.cpp)
 # is deliberately unchanged in both arms; rotation is simulated identically
 # in both arms. See the file's own header for the full scope statement.
 gpufhe_benchmark(bench_stage_acc_integration bench/bench_stage_acc_integration.cpp)
+# GOD PROMPT "CKKS PHASE 28", Objectives A+B: full-statistics re-verification
+# of Phase 27's stage-level fused-kernel A/B (mean/median/stddev/min/max/all
+# samples, not just median+min/max), an explicit measurement of the
+# Arm-A-vs-Arm-B allocation/deallocation asymmetry, and a CUDA-event-based
+# decomposition of the stage into its cost components (alloc, encode,
+# pt_to_eval_host, H2D, kernel execution, D2H, free).
+gpufhe_benchmark(bench_stage_timeline bench/bench_stage_timeline.cpp)
+# GOD PROMPT "CKKS PHASE 28": isolated stage-level A/B for swapping
+# encode_host for encode_host_fft at tests/test_boot.cpp's two per-diagonal
+# hot-loop call sites. A SEPARATE experiment from the fused
+# pt-mul-accumulate kernel -- only the encode call differs between arms.
+gpufhe_benchmark(bench_encode_fft_stage bench/bench_encode_fft_stage.cpp)
+# GOD PROMPT "CKKS PHASE 28", Objective C: standalone, additive-only probe for
+# the "make pt_to_eval_host's output device-resident, skip its D2H and the
+# fused kernel's subsequent re-upload of that plaintext" hypothesis. Touches
+# NO production file (not even src/rotate.cpp) -- times only a raw
+# cudaMemcpy of the exact buffer size pt_to_eval_host moves, to put a ceiling
+# on the hypothesis before risking any change. Result: ~2.2% of stage time
+# at most, an order of magnitude below the encode_host_fft swap's measured
+# 2.5x -- NOT pursued further this round; see
+# research/BOOTSTRAP_GPU_RESIDENCY_AUDIT.md's Phase 28 addendum.
+gpufhe_benchmark(bench_residency_hypothesis bench/bench_residency_hypothesis.cpp)
+# GOD PROMPT "CKKS PHASE 28", Objective E: the first real consumer-GPU CKKS
+# workload through the actual library API only (keygen_host/encode_host_fft/
+# encrypt_host/ct_add_ct_host/decrypt_host/decode_host_fft -- no private
+# kernels). Privacy-preserving aggregation of K client-held values, needing
+# no relin/rotation/rescale (a pure ciphertext sum consumes no depth) --
+# see the file's own header for why this workload was chosen over a
+# weighted-sum/EvalMult variant. Registered with ctest: cheap (n=8192,
+# sizeQ=4, no bootstrap machinery, ~seconds).
+gpufhe_test(bench_private_aggregation_workload bench/bench_private_aggregation_workload.cpp)
 gpufhe_test(test_ntt_batched tests/test_ntt_batched.cpp)
 gpufhe_test(test_intt_batched tests/test_intt_batched.cpp)
 gpufhe_test(test_automorph_eval_fast tests/test_automorph_eval_fast.cpp)
