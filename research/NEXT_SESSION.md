@@ -2,6 +2,103 @@
 
 ## Current commit
 
+Check `git log -5` on resume. As of this writing HEAD is the Phase 28 commit
+(on top of Phase 27's final commit, see "Earlier commit (Phase 27)" below).
+
+**Objective A (re-verify Phase 27's fused-kernel 1.2x), re-confirmed with
+full statistics, no cherry-picking**: 5 fresh interleaved runs of `bench/
+bench_stage_acc_integration.cpp`, speedups 1.18x-1.22x every time, bit-exact
+every time. New `bench/bench_stage_timeline.cpp` (CUDA-event-based
+decomposition, mean/median/stddev/min/max) found Arm B pays a real
+`cudaMalloc`/`cudaFree` cost (0.86-0.98% of its total) that Arm A structurally
+cannot — meaning the reported ~1.2x is a slight UNDERSTATEMENT, not
+overstatement, of the achievable production benefit.
+
+**Objective B (the real bottleneck) corrected Phase 27's own hypothesis**:
+Phase 27 expected `pt_to_eval_host` to dominate once the fused kernel is
+wired in. The stage timeline's own numbers show otherwise: `encode_host`
+(src/encode.cpp's O(N²) parallel host loop) is 62-75% of stage time;
+`pt_to_eval_host` is only 16%. (This was caught as a self-inflicted
+mistake first — the benchmark's own hardcoded printed conclusion claimed
+`pt_to_eval_host` dominated, contradicting its own numbers; fixed in the
+benchmark's source, not just noted.) A completely independent,
+already-derived-and-tested O(N log N) FFT replacement,
+`encode_host_fft`/`decode_host_fft` (`src/encode_fft.cpp`), already existed
+in the tree but was unused by `tests/test_boot.cpp`. Full writeup, promotion
+decision, and the concurrency-bug story (an apparent active race that
+AddressSanitizer proved was actually invalid test inputs, not a real
+cache defect) are in `research/ENCODE_FFT_PROMOTION.md`.
+
+**Objective C (safe residency experiment for `pt_to_eval_host`)**:
+quantified, not implemented. `bench/bench_residency_hypothesis.cpp`
+(standalone, touches zero production files) measured a hard ceiling of
+~2.3% of stage time for fully eliminating `pt_to_eval_host`'s own D2H plus
+the stage's redundant plaintext re-upload — an order of magnitude below the
+encode swap's 2.5x, and not worth the implementation risk this round. Full
+writeup: `research/BOOTSTRAP_GPU_RESIDENCY_AUDIT.md` section 8.
+
+**Objective D (promotion decisions)**: the fused kernel's Phase 27 "promote"
+verdict is reconfirmed, but deliberately NOT wired into `tests/
+test_boot.cpp`'s accumulate loop this round (see item 1 below for why).
+`encode_host_fft`/`decode_host_fft` ARE promoted and wired into all 10 of
+`tests/test_boot.cpp`'s call sites — compiles and links cleanly, but **has
+NOT been executed end-to-end**: the memory gate for running this file
+(n=8192, needs ≥10 GiB free Windows RAM) was measured at 2.40 GiB free
+(`Get-CimInstance Win32_OperatingSystem`, `FreePhysicalMemory`=2,520,264 KB)
+— a NO-GO, consistent with this project's recent history. **This is the
+single most important follow-up** (item 1 below).
+
+**Objective E (first real consumer-GPU workload)**: `bench/
+bench_private_aggregation_workload.cpp` — privacy-preserving aggregation of
+32 client-held values via `keygen_host`/`encode_host_fft`/`encrypt_host`/
+`ct_add_ct_host`/`decrypt_host`/`decode_host_fft` only (no private kernels,
+no relin/rotation/rescale needed since a pure ciphertext sum consumes no
+depth — a weighted-sum/EvalMult variant was deliberately avoided because it
+would need the rescale pathway `tests/test_rescale_n1024.cpp` documents a
+real, unresolved bug in). 10 repetitions, fresh randomized client values and
+fresh per-client encryption randomness each time. Registered with ctest.
+
+**Regression**: ran the full suite (115 registered tests, excluding
+`test_boot`/`test_boot_a`/`test_boot_n131072`/`test_hoist_allstages`/
+`test_n131072_gpu_lifecycle` per the memory gate) — 104/115 passed. The 11
+failures were individually checked against `NEXT_SESSION.md`/
+`MASTER_STATE.md`/`EXPERIMENT_LEDGER.md` and confirmed PRE-EXISTING and
+unrelated to this round's changes (none of the failing tests reference
+`encode_fft`/`encode_host_fft`; the `test_rescale_n1024*` family and
+`test_polyeval` are the long-documented native-rescale-at-small-n bug;
+`test_evalkeygen_isolated`/`test_keyswitch_stage_trace` are deliberately
+invalid-configuration tests; `test_boot_multi_input_small`'s one failing
+check is a relative-path JSONL write that resolves against ctest's `build/`
+cwd, where `research/benchmarks/` doesn't exist — pre-existing, unrelated).
+
+## Immediate next actions, in order
+
+1. **Run `tests/test_boot.cpp` (with the `encode_host_fft` swap already
+   applied) the moment the memory gate clears** (`Get-CimInstance
+   Win32_OperatingSystem`, need ≥10 GiB free). This is the only way to
+   confirm the integrated bootstrap path is correct and actually realizes
+   the measured 2.5x stage-level speedup at full scale, not just in
+   isolation. Do this BEFORE anything else below — it is this round's one
+   unverified production change.
+2. **Only after (1) passes**, wire the fused kernel into `tests/
+   test_boot.cpp`'s real accumulate loop (Phase 27's and Phase 28's own
+   verdict: promote). Keep it a SEPARATE, separately-measured change from
+   (1) — do not land both in the same untested commit.
+3. **The `pt_to_eval_host` residency idea is now a quantified, low-priority
+   backlog item** (~2.3% ceiling) — worth a proper design (an ownership
+   contract for exposing `src/rotate.cpp`'s `thread_local` scratch pointer
+   across a function boundary) only after (1) and (2) land, not before.
+4. **Extend Objective E's workload** once rescale's n=1024 bug
+   (`research/EXPERIMENT_LEDGER.md` entries #25-26, `test_rescale_n1024.cpp`)
+   is actually root-caused — a weighted-sum variant (EvalMult by a plaintext
+   weight vector, not just addition) is the natural next workload and only
+   avoided this round for that reason.
+5. Re-run the Windows free-RAM gate check before any of the above — it
+   changes session to session and was NOT re-checked at the moment this
+   file was written versus when work actually resumes.
+
+## Earlier commit (Phase 27)
+
 Check `git log -5` on resume. As of this writing HEAD is the final Phase 27
 commit on top of Phase 26's `8cc1e12`.
 
