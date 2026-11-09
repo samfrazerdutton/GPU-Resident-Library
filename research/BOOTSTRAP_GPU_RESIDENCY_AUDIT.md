@@ -324,3 +324,68 @@ grep -n 'C.d_av.push_back' src/keyswitch_resident.cpp
 # resource gate (NO-GO all session)
 powershell.exe -File research/benchmarks/bootstrap_preflight.ps1
 ```
+
+---
+
+## 8. Phase 28 addendum: the `pt_to_eval_host` residency hypothesis, quantified
+
+GOD PROMPT "CKKS PHASE 28", Objective C. This round's stage-timeline
+instrumentation (`bench/bench_stage_timeline.cpp`) measured `pt_to_eval_host`
+at 16.0-16.3% of the fused-kernel stage's total time (see
+`research/ENCODE_FFT_PROMOTION.md` for why it is NOT the dominant cost —
+`encode_host` is, at 62-75%). `pt_to_eval_host` (`src/rotate.cpp`'s
+`xf_multi`) does its own H2D, a batched NTT kernel launch, and its own D2H,
+into a `thread_local` scratch device buffer that already persists across
+calls (never freed, grown on demand) but is still round-tripped to host
+every call. The fused-kernel stage then separately re-uploads that same
+plaintext (as `d_d`, alongside the simulated ciphertext's `d_b0`/`d_b1`) for
+`LaunchPtMulAcc`. **Hypothesis**: if `pt_to_eval_host` exposed its already-
+resident device buffer directly instead of copying it back to host, both
+that D2H and the stage's subsequent re-upload of the same data could be
+skipped.
+
+### The experiment (standalone, zero production changes)
+
+`bench/bench_residency_hypothesis.cpp` — touches no production file, not
+even `src/rotate.cpp`. It times a raw `cudaMemcpy` (CUDA-event-timed, 200
+reps) of exactly the buffer size `pt_to_eval_host`'s `xf_multi` moves
+(towers×n×8 bytes = 1.875 MiB at n=8192, towers=30), to put a hard ceiling on
+the hypothesis before risking any change to crypto-adjacent code.
+
+### Result
+
+```
+H2D (this buffer size): 0.4384 ms
+D2H (this buffer size): 0.4467 ms
+pt_to_eval_host per diagonal (measured, Arm B, this round): 6.475 ms
+  -> this D2H alone is 6.9% of pt_to_eval_host's own time
+  -> the remaining 93.1% is H2D-in + the batched NTT kernel itself, which a
+     residency change CANNOT remove (the transform still has to run)
+plaintext's share of the stage's separate H2D (1 of 3 equal-size buffers
+per diagonal: b0, b1, d): 0.438 ms, 1.11% of the stage's per-diagonal total
+UPPER BOUND if BOTH were eliminated: ~2.24% of stage time
+```
+
+### Decision: not pursued further this round
+
+~2.2% is real but an order of magnitude below the encode swap's measured
+2.5x stage-level speedup (`research/ENCODE_FFT_PROMOTION.md`), and actually
+implementing it is not a trivial change: it means exposing
+`src/rotate.cpp`'s `thread_local` scratch pointer across a function
+boundary (a new `pt_to_eval_device` variant returning a raw device pointer
+instead of copying to host), which raises real ownership/lifetime questions
+for a buffer this file currently guarantees is only ever touched by its own
+internal functions. Given the governing directive's explicit "do not stack
+several unverified optimizations" instruction, and that this phase already
+has one compiles-but-unverified change in `tests/test_boot.cpp` (the encode
+swap) pending the memory-gate re-verification, spending the remaining
+accuracy budget on a ~2% ceiling is not a good trade. **Recorded as a
+future candidate, not implemented**: `research/NEXT_SESSION.md` carries this
+forward, explicitly gated on the encode swap's own end-to-end verification
+landing first (per the "do not change multiple unrelated bottlenecks at
+once" instruction) and on a deliberate design for the new function's
+ownership contract, not a quick patch.
+
+This updates section 6's "no claim that removing the key re-upload yields
+any particular end-to-end speedup" — it is no longer unquantified: ~2.2% of
+stage time is the measured ceiling, not a guess.
