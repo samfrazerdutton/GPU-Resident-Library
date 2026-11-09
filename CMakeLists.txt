@@ -327,11 +327,28 @@ add_test(NAME test_rotate_concurrent_cache COMMAND test_rotate_concurrent_cache)
 # explains why timing targets must never be absorbed into a `ctest` run.
 # It self-verifies bit-exactness before reporting any timing.
 gpufhe_benchmark(bench_hoist_ab bench/bench_hoist_ab.cpp)
+# GOD PROMPT "CKKS PHASE 26", Mission 4: standalone experiment for a resident
+# eval-key DeviceKSContext cache, keyed (k, tw) -- never k alone (see
+# EXPERIMENT_LEDGER.md entry #20). Verifies the per-diagonal eval-key upload
+# size independently (measured from a live KeySwitchConstants, not re-derived
+# from source) and measures the actual transfer-volume/time reduction from
+# reusing resident contexts. Does NOT modify src/keyswitch_resident.cpp and
+# does NOT wire anything into production -- registered as a benchmark, not a
+# test, for the same reason as bench_hoist_ab.cpp above.
+gpufhe_benchmark(bench_ks_context_resident_ab bench/bench_ks_context_resident_ab.cpp)
 gpufhe_test(test_c2s_stages tests/test_c2s_stages.cpp)
 gpufhe_test(test_alpha10 tests/test_alpha10.cpp)
 gpufhe_test(test_chain tests/test_chain.cpp)
 gpufhe_test(test_rot_resident tests/test_rot_resident.cpp)
 gpufhe_test(test_stage_acc tests/test_stage_acc.cpp)
+# GOD PROMPT "CKKS PHASE 26", Mission 2: extended differential test for the
+# fused pt-mul-accumulate kernel (LaunchPtMulAcc) -- multiple sizes, boundary
+# values, multi-diagonal accumulation, repeated executions, and concurrent
+# independent chains. Does NOT replace tests/test_stage_acc.cpp's existing
+# single-shot gate; both stay in the default suite. Cheap (largest config is
+# the real n=8192/tw=30 bootstrap case, single accumulate), so registered with
+# gpufhe_test like its sibling.
+gpufhe_test(test_stage_acc_differential tests/test_stage_acc_differential.cpp)
 gpufhe_test(test_ntt_batched tests/test_ntt_batched.cpp)
 gpufhe_test(test_intt_batched tests/test_intt_batched.cpp)
 gpufhe_test(test_automorph_eval_fast tests/test_automorph_eval_fast.cpp)

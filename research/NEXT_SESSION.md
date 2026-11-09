@@ -2,6 +2,187 @@
 
 ## Current commit
 
+Check `git log -5` on resume. As of this writing HEAD is the final Phase 26
+commit on top of Phase 25's `1d73518`. Phase 26's commits, in order:
+
+- Windows-clone reconciliation report (no code changes)
+- Mission 2: extended differential test for the fused pt-mul-accumulate kernel
+- Mission 4: resident eval-key context cache A/B + Mission 3 writeup
+- Documentation (this file, the experiment ledger)
+
+**Recovery.** Session resumed in Git Bash on Windows, NOT inside WSL. WSL
+`Ubuntu` was Stopped and started on the first ordinary attempt. Both
+checkouts verified unchanged since Phase 25: WSL HEAD `1d73518` =
+`origin/main` exactly; Windows clone HEAD `f425cdd`, same 65 dirty entries.
+
+**THE CENTRAL RECONCILIATION FINDING: the Windows clone contains ZERO
+genuinely novel, unported code.** `git merge-base --is-ancestor f425cdd HEAD`
+returns true — the clone's committed history is 82 commits BEHIND main, not
+a divergent branch. Both commits the Phase 26 directive named as prototypes
+("Fused pt-mul-accumulate kernel", "Device automorphism kernel") are
+confirmed ancestors of main's current HEAD — already fully merged, long ago.
+Every one of the clone's 65 dirty working-tree entries was then checked
+content-by-content against current main (controlling for CRLF-vs-LF noise,
+which inflated several apparent diffs from 0 real lines to hundreds): 29 of
+33 comparable untracked files are byte-identical; the other 4 and every
+tracked-modified file differ for exactly one of two reasons — predating the
+`P>=Q_part_max` hybrid key-switch validation fix (Phase 10, entries #42/#43),
+or predating Phase 25's own `thread_local` concurrency fix. Full detail and
+the reconciliation matrix: `research/PHASE26_RECONCILIATION.md`. **Nothing
+was ported** — there was nothing to port. No recovery branch was needed. The
+Windows clone itself was not modified.
+
+**This reframed Missions 2-3 from "port a prototype" to "validate
+already-merged code that may not be wired into the bootstrap's hot path"** —
+exactly Phase 25's own residency-audit finding about `LaunchPtMulAcc`
+(`kernels/stage_acc.cu`): the fused kernel exists, has its own bit-exact
+test, but `tests/test_boot.cpp`'s actual per-diagonal loop still calls
+`ct_mul_pt_host`/`ct_add_ct_host` on the CPU.
+
+**Mission 2 — extended differential test for `LaunchPtMulAcc`.** New
+`tests/test_stage_acc_differential.cpp`, 26/26 checks pass (142 MB peak RSS,
+~1s wall): boundary coefficient values (0, 1, q-1, q-2, (q-1)/2, (q+1)/2,
+q/2) mixed with random; 5 (n, towers) pairs including the real n=8192/tw=30
+bootstrap config; 16-sequential-diagonal accumulation on one stream with one
+sync at the end (mirrors the real BSGS stage structure); 3 full repeated
+sweeps with distinct seeds; 6 independent concurrent accumulation chains on
+disjoint streams/buffers with **zero cross-contamination confirmed**. Noted
+explicitly: `LaunchPtMulAcc` holds no static/global device state at all
+(confirmed by reading `kernels/stage_acc.cu`) — a materially safer design
+than `xf_multi`'s `scratch()` buffer, the actual root cause of Phase 25's
+concurrency bug. Isolated-op benchmark: fused kernel-only 0.69ms vs CPU host
+pair 5.26ms (~7.6x on the compute alone) at n=8192/tw=30 — explicitly scoped
+as an isolated-op figure, not a bootstrap number.
+
+**Mission 4 — eval-key transfer estimate independently verified, and a
+bit-exact resident-context experiment.** New `bench/bench_ks_context_resident_ab.cpp`
+measures (not re-derives) the per-`ks_context_create`-call eval-key upload
+from a LIVE `KeySwitchConstants` object: **60.000 MiB exactly**, matching
+Phase 25's static estimate. Confirmed by full code reading that
+`ks_context_destroy` frees ONLY `d_av`/`d_bv`/`d_keyRow` — everything else a
+context holds is already process-lifetime shared state keyed on chain
+SHAPE, not on the rotation key — so the eval key is the ENTIRE marginal cost
+of reusing an already-built key. A/B experiment: 48 simulated diagonal calls
+drawing from 8 distinct rotation keys (mirroring KROT's real measured reuse
+pattern — Phase 24's ledger: ~77 entries reused with zero evictions), against
+a bounded LRU cache of `DeviceKSContext` keyed **(k, tw)** — never `k` alone,
+per `EXPERIMENT_LEDGER.md` entry #20's documented bug class. Bit-exact
+checked PER CALL before any timing (0/48 differ). Result: **1.66x measured
+speedup**, **83.3% measured H2D traffic reduction (2400 MiB avoided)** — not
+estimated: byte counts come from actual cache-miss counts times the measured
+60 MiB figure. `src/keyswitch_resident.cpp` was NOT touched — this is a
+standalone experiment offered as evidence for a future integration decision,
+not an integration. Explicit limitations stated in the file and the report:
+single-threaded only (no lock; untested under concurrency), cache sized to
+exactly fit this run's working set (a production cap needs its own study
+against KROT's real ~77-entry reuse and the 6144 MiB card), key-switch-adjacent
+scope only (not end-to-end). Full detail:
+`research/EVAL_KEY_TRANSFER_VERIFICATION.md`.
+
+**Mission 3 — device automorphism / stage residency, sharpened beyond
+Phase 25's file-level audit.** `tests/test_rot_resident` re-run fresh this
+round (0/491520 mismatches, bit-exact, 4.00x vs host-orchestrated, 253 MB
+peak RSS) — the existing standalone correctness test already meets the
+directive's bar; it was not rebuilt. New: a FUNCTION-level call-site tally
+(not file-level) comparing `rotate_ct_resident` against `rotate_ct_host`
+directly, by reading both bodies and `keyswitch_core_resident`'s full
+166-line body. **The "resident" path has nearly 3x the H2D call sites (33 vs
+12) and more than 3x the malloc/free call sites (47 vs 14) of the "host"
+path it replaces** — every one of them from `ks_context_create` re-uploading
+the eval key fresh every call. What it genuinely wins: D2H count (3 vs 10)
+and sync count (2 vs 8), because the ciphertext and the keyswitch kernels
+themselves ARE genuinely resident (confirmed zero transfers/allocations/syncs
+inside `automorphism_eval_fast_device` and `keyswitch_resident` by direct
+reading). The phase breakdown confirms this isn't academic:
+**`ks_context_create` + its matching `destroy` are 63% of `rotate_ct_resident`'s
+own total time** at the bootstrap's parameters — more than the automorphism
+and actual keyswitch kernels combined. So "GPU-resident" is accurate for the
+ciphertext and kernel execution, and false for the eval key — stated
+precisely rather than left implicit. Full detail:
+`research/MISSION3_DEVICE_AUTOMORPHISM_RESIDENCY.md`.
+
+**Mission 5 — bootstrap memory gate.** Windows free RAM measured 1.75-1.94
+GiB for the entire session against the 10 GiB (n=8192) and 6 GiB (n=131072)
+floors. Both preflight checks returned NO-GO, logged to
+`research/benchmarks/bootstrap_preflight_log.jsonl`. The full bootstrap was
+NOT executed. No claim of bootstrap runtime correctness is made. The gate
+was not weakened in any way.
+
+**Mission 6 — security/correctness guardrails.** No cryptographic parameter
+touched: h=64, sigma=3.19, the modulus chain, `KROT_CAP`, `KSC_CAP`, and the
+centralized `P>=Q_part_max` validation are all untouched (and, per the
+reconciliation finding, the Windows clone's stale `numPart=2` default was
+explicitly REJECTED as a port target precisely because adopting it would
+have reintroduced a known-invalid parameter). No production source file was
+modified this round — `src/keyswitch_resident.cpp` and `src/rotate.cpp`
+were read extensively but not edited.
+
+**Mission 7 — regression.** C++ targeted suite: 13/13 pass (123-569 MB peak
+RSS each) — `test_stage_acc`, `test_stage_acc_differential` (new),
+`test_rotate_concurrent_cache`, `test_rot_resident`, `test_ks_resident`,
+`test_hoist_single`, `test_hoist_multi`, `test_hoist_levelreduced`,
+`test_boot_multi_input_small`, `test_encdec`, `test_encode`, `test_evalmod`,
+`test_cheb`. Rust: **all four combinations** (debug/release x
+serial/parallel) give **62 passed / 0 failed / 1 ignored**, identical to
+Phase 25's end state — confirming Phase 25's `thread_local` concurrency fix
+remains solid under this round's work. Preflight mocked unit tests: 20/20
+pass.
+
+## Immediate next actions, in order
+
+1. **Decide on the O1 integration** (cache `DeviceKSContext` per `(k, tw)`
+   inside `src/keyswitch_resident.cpp`, or inside `tests/test_boot.cpp`'s own
+   `stageRotDiag`). Mission 4's experiment is the evidence (1.66x,
+   83.3% traffic reduction, bit-exact), but it is single-threaded and sized
+   to a toy working set. Before integrating: (a) design the cache's
+   concurrency story if `test_boot.cpp`'s single-threaded bootstrap is truly
+   the only caller (likely fine as-is) or add a lock/test if not; (b) size
+   the production cap against KROT's real ~77-entry reuse pattern and the
+   6144 MiB card (77 x 60 MiB = ~4.6 GiB would NOT fit alongside everything
+   else — a much smaller cap, LRU-evicted like KROT_CAP itself, is needed in
+   practice); (c) build the integration as a small, reviewable change with a
+   bit-exact test at each step, per the directive's own standing instruction.
+
+2. **Decide on wiring `LaunchPtMulAcc` into `test_boot.cpp`'s hot loop.**
+   Mission 2 proved it bit-exact across sizes/boundaries/multi-diagonal/
+   concurrency and ~7.6x faster in isolation. It is NOT currently used there.
+   Wiring it in would need: the ciphertext accumulator kept device-resident
+   across the diagonal loop (it currently round-trips via `pt_to_eval_host`
+   and `ct_mul_pt_host`/`ct_add_ct_host`), which is a larger structural change
+   than swapping one call — see `research/BOOTSTRAP_GPU_RESIDENCY_AUDIT.md`
+   section 4's O2/O3 for the shape of that work.
+
+3. **Run the bootstrap the moment the gate clears.** Same exact sequence as
+   Phase 25's handoff:
+   ```
+   powershell.exe -File research/benchmarks/bootstrap_preflight.ps1
+   # only on GO (exit 0):
+   wsl -d Ubuntu -- bash -lc 'cd ~/GPU-Resident-Library && \
+     cmake --build build2 --target test_boot_multi_input -j4 && \
+     /usr/bin/time -v ./build2/test_boot_multi_input'
+   ```
+
+4. **The latent `std::map` race (Phase 25's falsified-but-recorded
+   hypothesis) remains unfixed, deliberately** — `keyswitch_resident.cpp:30`/
+   `:106`, `rotate.cpp:29`/`:130`. No change this round.
+
+## Environment facts (unchanged from Phase 25, re-confirmed)
+
+- Build with a Linux-only `PATH`
+  (`export PATH=/usr/local/cuda-13.2/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`)
+  — `cmake` configure under the full WSL login `PATH` is pathologically slow
+  (9p filesystem walk over ~50 `/mnt/c/...` entries).
+- WSL's own `free -h` is NOT the memory gate — it reports a ceiling
+  (`.wslconfig`'s `memory=11GB`), not actual Windows host availability. Only
+  `Get-CimInstance Win32_OperatingSystem` is trustworthy.
+- RTX 2060 Max-Q, 6144 MiB VRAM, driver 595.97, CUDA 13.2, 16 CPU threads,
+  Windows 11 host with 15.42 GiB total RAM. ~30% run-to-run timing spread on
+  this machine — always use median-of-many-trials with alternating arm order
+  for any A/B.
+
+## Earlier commit (Phase 25)
+
+
 Check `git log -5` on resume. As of this writing HEAD is `1eae71a`, the third
 of three Phase 25 commits on top of Phase 24's `68e9f65`:
 
