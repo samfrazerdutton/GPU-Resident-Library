@@ -319,6 +319,14 @@ add_test(NAME test_boot_multi_input_small COMMAND test_boot_multi_input_small)
 add_executable(test_rotate_concurrent_cache tests/test_rotate_concurrent_cache.cpp)
 target_link_libraries(test_rotate_concurrent_cache PRIVATE gpufhe CUDA::cudart)
 add_test(NAME test_rotate_concurrent_cache COMMAND test_rotate_concurrent_cache)
+# GOD PROMPT "CKKS PHASE 25": controlled A/B for rotation hoisting
+# (decompose-sharing) at a runnable scale -- ~600MB, unlike the full-bootstrap
+# A/B (research/benchmarks/randomized_ab.sh) which needs ~8GB x 20 runs and has
+# been memory-blocked since Phase 23. Registered with `gpufhe_benchmark`, NOT
+# `gpufhe_test`: it is a timing diagnostic, and this file's own Phase 19 comment
+# explains why timing targets must never be absorbed into a `ctest` run.
+# It self-verifies bit-exactness before reporting any timing.
+gpufhe_benchmark(bench_hoist_ab bench/bench_hoist_ab.cpp)
 gpufhe_test(test_c2s_stages tests/test_c2s_stages.cpp)
 gpufhe_test(test_alpha10 tests/test_alpha10.cpp)
 gpufhe_test(test_chain tests/test_chain.cpp)
