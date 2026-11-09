@@ -45,8 +45,38 @@ DevTab& dev_tab(uint32_t n, uint64_t q, uint64_t root){
 // n) and per-call cudaMalloc/Free of a ~250KB block costs far more than many
 // small ones -- that regressed the bootstrap 53 -> 101 s. Allocate once, grow
 // on demand, never free.
+//
+// GOD PROMPT "CKKS PHASE 25": `thread_local`, not plain `static`. As a plain
+// process-global this handed THE SAME device buffer to every thread, so two
+// concurrent xf_multi calls uploaded into the same memory and read back each
+// other's data -- silently wrong ciphertexts, no crash, no diagnostic. That is
+// not a narrow timing window; it is unconditional corruption whenever the calls
+// overlap. Measured before this change, with
+// tests/test_rotate_concurrent_cache.cpp: 9 of 9 concurrent fixtures wrong from
+// pt_to_eval_host (72,704 differing limbs) and 9 of 9 from rotate_ct_host
+// (182,272 differing limbs), while the GPU-resident path -- which allocates its
+// own per-call scratch and never comes through here -- stayed bit-exact.
+//
+// `thread_local` keeps the entire performance doctrine above intact, just
+// per-thread: still allocate once, still grow on demand, still never free. The
+// single-threaded behaviour every existing test, benchmark and the bootstrap
+// itself relies on is byte-for-byte identical -- one thread means one buffer,
+// exactly as before.
+//
+// The trade-off, stated plainly: VRAM now scales with the number of threads
+// that actually call this (towers*n*8 each -- about 1.9 MiB at n=8192,
+// towers=30), and the deliberate never-free doctrine is preserved, so a
+// thread's buffer is not reclaimed when that thread exits. For this project's
+// usage (single-threaded bootstrap; short-lived test threads) that is a good
+// trade against silently incorrect crypto. A long-lived process that churns
+// through very many threads would want pooled buffers with explicit lifetime
+// instead -- noted as the follow-up rather than guessed at here, since no
+// current caller needs it. cudaFree is NOT called from a thread_local
+// destructor on purpose: freeing device memory during thread/process teardown,
+// after the CUDA runtime may already be torn down, is its own hazard, and
+// avoiding it is exactly why this file said "never free" to begin with.
 uint64_t* scratch(size_t bytes){
-    static uint64_t* buf=nullptr; static size_t cap=0;
+    static thread_local uint64_t* buf=nullptr; static thread_local size_t cap=0;
     if(bytes>cap){ if(buf) cudaFree(buf); cudaMalloc(&buf,bytes); cap=bytes; }
     return buf;
 }
@@ -71,8 +101,13 @@ void xf_multi(std::vector<uint64_t>& h, uint32_t towers, uint32_t n,
     // per-tower loop of LaunchNTT_CT/LaunchINTT_GS -- this call (pt_to_eval_host's
     // transform) measured as 30s of a ~118s bootstrap, the dominant unbatched
     // leftover from before this session's NTT/INTT batching work.
-    static uint64_t **d_rA=nullptr,**d_rB=nullptr; static size_t capA=0,capB=0;
-    static uint64_t *d_md=nullptr,*d_ni=nullptr,*d_nip=nullptr; static size_t capMd=0,capNi=0,capNip=0;
+    // GOD PROMPT "CKKS PHASE 25": thread_local for the same reason as
+    // scratch() above -- these five device arrays carry the per-tower root
+    // pointers, moduli and ninv constants for the batched launch, so sharing
+    // them across threads corrupts the launch parameters themselves, not just
+    // the data. Same doctrine otherwise: grow on demand, never free.
+    static thread_local uint64_t **d_rA=nullptr,**d_rB=nullptr; static thread_local size_t capA=0,capB=0;
+    static thread_local uint64_t *d_md=nullptr,*d_ni=nullptr,*d_nip=nullptr; static thread_local size_t capMd=0,capNi=0,capNip=0;
     scratchPtrArr(d_rA,capA,towers); scratchPtrArr(d_rB,capB,towers);
     scratchU64Arr(d_md,capMd,towers); scratchU64Arr(d_ni,capNi,towers); scratchU64Arr(d_nip,capNip,towers);
     std::vector<const uint64_t*> hrA(towers),hrB(towers);

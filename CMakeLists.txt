@@ -308,6 +308,17 @@ target_link_libraries(test_boot_multi_input PRIVATE gpufhe CUDA::cudart)
 add_executable(test_boot_multi_input_small tests/test_boot_multi_input_small.cpp)
 target_link_libraries(test_boot_multi_input_small PRIVATE gpufhe CUDA::cudart)
 add_test(NAME test_boot_multi_input_small COMMAND test_boot_multi_input_small)
+# GOD PROMPT "CKKS PHASE 25": standalone reproducer for the concurrency defect
+# in the unsynchronized process-global device-table caches on the resident
+# rotation path (src/keyswitch_resident.cpp's upc()/g_rtab and src/rotate.cpp's
+# dev_tab()/autoPermMap()). Required by the governing directive before any
+# change to src/keyswitch_resident.cpp internals. Cheap (n<=4096, tw<=6, ~9
+# small keygens), so it IS registered with ctest. Its race window is the first
+# concurrent round in a fresh process, while the caches are still cold --
+# see the file's own header for why a single pass is evidence, not proof.
+add_executable(test_rotate_concurrent_cache tests/test_rotate_concurrent_cache.cpp)
+target_link_libraries(test_rotate_concurrent_cache PRIVATE gpufhe CUDA::cudart)
+add_test(NAME test_rotate_concurrent_cache COMMAND test_rotate_concurrent_cache)
 gpufhe_test(test_c2s_stages tests/test_c2s_stages.cpp)
 gpufhe_test(test_alpha10 tests/test_alpha10.cpp)
 gpufhe_test(test_chain tests/test_chain.cpp)

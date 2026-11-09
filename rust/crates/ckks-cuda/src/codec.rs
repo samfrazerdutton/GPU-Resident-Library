@@ -449,61 +449,84 @@ mod registered_tests {
         assert_eq!(r.c1, c1_ref);
     }
 
-    /// Items 6/7: budget exhaustion and the resulting safe fallback,
-    /// observed from Rust. Mirrors the C++ concurrency audit's own
-    /// scenario 6 (16 distinct large keys, ~27MiB total, deliberately
-    /// over the 16MiB C++-side budget) but exercised through the FFI
-    /// boundary this time, confirming the diagnostic out-params
-    /// propagate correctly across it.
+    /// Items 6/7 (budget exhaustion and safe fallback) NO LONGER LIVE HERE.
+    ///
+    /// GOD PROMPT "CKKS PHASE 25": `budget_exhaustion_falls_back_safely_and_stays_correct`
+    /// moved to `tests/registered_budget_exhaustion.rs`. It was NOT skipped,
+    /// NOT disabled and NOT weakened -- plain `cargo test` still runs it, with
+    /// every original assertion intact. It simply needs its own PROCESS.
+    ///
+    /// The reason, in one sentence: the C++ pool's 16 MiB
+    /// `kRegisteredBudgetBytes` is tracked by a process-global counter
+    /// (`g_registeredBytesUsed`) that only ever increases and has no release
+    /// path, so a test that deliberately exhausts the budget permanently
+    /// consumes it for every other test sharing the process -- and `cargo test`
+    /// runs all of a crate's unit tests in one process. Under
+    /// `--test-threads=1` that reliably broke
+    /// `prewarm_is_idempotent_and_makes_first_encrypt_registered` and
+    /// `repeated_encryption_pool_reuse_stays_registered_and_correct`, both of
+    /// which legitimately require a small fresh key to register successfully.
+    ///
+    /// See that file's module docs for the full reasoning and for the
+    /// alternatives that were rejected. The invariant it leaves behind is
+    /// enforced by `no_unit_test_may_exhaust_the_shared_registered_budget`
+    /// below.
+
+    /// GOD PROMPT "CKKS PHASE 25" REGRESSION TEST for the test-isolation defect
+    /// described above.
+    ///
+    /// The hazard is not a product bug -- it is that a future test added to
+    /// THIS module could again consume the shared, never-released 16 MiB
+    /// registered-memory budget and silently break its neighbours. This test
+    /// encodes that invariant directly: within the unit-test process, a small
+    /// fresh `(n, size_q)` key must still be able to register.
+    ///
+    /// It is deliberately written to be robust against the harness's
+    /// nondeterministic test order. It does not assume it runs first; it uses a
+    /// ring dimension and tower count no other test in this module touches, so
+    /// the only way it can fail is if some other test has eaten the budget --
+    /// which is exactly the condition worth catching. Its failure message names
+    /// the cause, so the next person does not have to re-derive this
+    /// investigation from a bare `assert!(ready)`.
     #[test]
-    fn budget_exhaustion_falls_back_safely_and_stays_correct() {
-        // GOD PROMPT "CKKS PHASE 22" NOTE (NOT a registered-memory
-        // finding -- a separate, narrow, pre-existing defect this
-        // test's own fixture sweep surfaced): `KeySwitchContext::new`/
-        // `gpufhe_ks_fixture_create` crashes with `std::bad_alloc`
-        // (NOT a clean `Err`) at `size_q=5, size_p=2, num_part=4`,
-        // reproducibly, regardless of `n`, confirmed via a standalone
-        // diagnostic sweeping `size_q` 1..=11 with `num_part=4.min(size_q)`
-        // at a fixed `n=8192` (size_q=1-4,6-8 -> Ok; size_q=5 ->
-        // `std::bad_alloc`; size_q=9-11 -> a CLEAN, EXPECTED
-        // `P < Q_part_max` rejection, not a crash -- `num_part=4` with
-        // `size_p=2` simply does not scale past `size_q=8`, the same
-        // well-known boundary from entries #42/#43). `size_q=5` is
-        // EXCLUDED below for exactly this reason -- this is a real,
-        // separate, narrow bug worth recording (see research/
-        // EXPERIMENT_LEDGER.md), but out of THIS phase's scope to fix
-        // (the governing directive's own "do not modify
-        // keyswitch_resident.cpp internals without a standalone test
-        // proving the proposed path first" applies, and this phase's
-        // mission is registered-memory validation, not a general
-        // eval-keygen bug hunt).
-        //
-        // Packed bytes = 4*size_q*n*8. These 7 SAFE size_q values at
-        // BOTH n=8192 and n=16384 (14 fixtures total) sum to ~23.25MiB,
-        // comfortably over the C++ pool's 16MiB budget -- enough to
-        // genuinely bind without size_q=5 or size_q>=9.
-        let sizes_q: [u32; 7] = [1, 2, 3, 4, 6, 7, 8];
-        let mut saw_registered = 0usize;
-        let mut saw_budget_skipped = 0usize;
-        for &size_q in &sizes_q {
-            for &n in &[8192u32, 16384u32] {
-                let f = make_fixture(n, size_q, 8000 + n as u64 + size_q as u64);
-                let m = test_message(f.n, 3);
-                let (c0_ref, c1_ref) = encrypt(&m, f.n, &f.pk_a, &f.pk_b, &f.mods, &f.roots, 1, 3.19, 3).unwrap();
-                let r = encrypt_registered(&m, f.n, &f.pk_a, &f.pk_b, &f.mods, &f.roots, 1, 3.19, 3).unwrap();
-                assert_eq!(r.c0, c0_ref, "n={n} size_q={size_q}: c0 must be bit-exact regardless of which path ran");
-                assert_eq!(r.c1, c1_ref, "n={n} size_q={size_q}: c1 must be bit-exact regardless of which path ran");
-                if r.used_registered {
-                    saw_registered += 1;
-                    assert!(!r.budget_skipped && r.last_error_code == 0);
-                } else if r.budget_skipped {
-                    saw_budget_skipped += 1;
-                    assert_eq!(r.last_error_code, 0, "a budget skip is not a registration failure -- error code must stay 0");
-                }
-            }
-        }
-        assert!(saw_registered > 0, "expected at least some keys to register before the budget bound");
-        assert!(saw_budget_skipped > 0, "expected the budget to genuinely bind for at least one of these 14 keys -- otherwise this test is not exercising the fallback path at all");
+    fn no_unit_test_may_exhaust_the_shared_registered_budget() {
+        // n=512, size_q=3 -> packed bytes = 4*3*512*8 = 48 KiB. Trivial against
+        // a 16 MiB budget, and unused by any other test in this module.
+        let f = make_fixture(512, 3, 7_025);
+        let size_q = f.mods.len() as u32;
+
+        let (ready, budget_skipped, err) = prewarm_registered_buffer(f.n, size_q);
+        assert!(
+            !budget_skipped,
+            "A 48 KiB registration was BUDGET-SKIPPED against a 16 MiB cap, which means \
+             something else in this unit-test process already consumed the shared, \
+             never-released registered-memory budget (g_registeredBytesUsed only ever \
+             increases -- there is no release path). That is the exact test-isolation \
+             defect Phase 25 fixed by moving the budget-exhaustion test into its own \
+             process (rust/crates/ckks-cuda/tests/registered_budget_exhaustion.rs). If a \
+             new budget-heavy test was just added to codec.rs's test module, move it to \
+             its own integration-test file too rather than relaxing this assertion."
+        );
+        assert_eq!(
+            err, 0,
+            "a small fresh key must not produce a registration ERROR (as distinct from a \
+             budget skip, which is asserted separately above)"
+        );
+        assert!(
+            ready,
+            "a 48 KiB fresh key must register successfully in a non-exhausted process"
+        );
+
+        // And the registered path must still be bit-exact against production --
+        // the invariant above is worthless if the fast path it protects is wrong.
+        let m = test_message(f.n, 17);
+        let (c0_ref, c1_ref) =
+            encrypt(&m, f.n, &f.pk_a, &f.pk_b, &f.mods, &f.roots, 1, 3.19, 17).unwrap();
+        let r =
+            encrypt_registered(&m, f.n, &f.pk_a, &f.pk_b, &f.mods, &f.roots, 1, 3.19, 17).unwrap();
+        assert!(r.used_registered, "after a successful prewarm the encrypt must use the registered path");
+        assert_eq!(r.c0, c0_ref, "registered-path c0 must be bit-exact vs production encrypt");
+        assert_eq!(r.c1, c1_ref, "registered-path c1 must be bit-exact vs production encrypt");
     }
 
     /// Item 8: FFI error propagation parity -- the SAME Rust-side
