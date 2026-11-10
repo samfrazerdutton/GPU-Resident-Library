@@ -1,7 +1,25 @@
 // GOD PROMPT "CKKS PHASE 28", Objective E: the first real consumer-GPU CKKS
 // use case, through the actual library API only (keygen_host/encode_host_fft
-// /encrypt_host/ct_add_ct_host/decrypt_host/decode_host_fft -- no private
-// kernels, no direct NTT/rotation/keyswitch calls).
+// /encrypt_host_shoup_pooled_barrett_batched/ct_add_ct_host/decrypt_host/
+// decode_host_fft -- no private kernels, no direct NTT/rotation/keyswitch
+// calls).
+//
+// GOD PROMPT "CKKS PHASE 29", Objectives E+G: Phase 28's original version of
+// this file called plain `encrypt_host` -- the Phase-11 REFERENCE
+// implementation, not what this project's own Rust bridge actually calls
+// (`gpufhe_encrypt` in rust/crates/ckks-cuda/cpp_bridge/encdec_bridge.cpp
+// calls `encrypt_host_shoup_pooled_barrett_batched`, already bit-exact
+// verified against encrypt_host and measured 1.57x-2.78x faster in
+// isolation -- research/ENCRYPT_PROFILING.md, research/
+// EMBED_AND_POOL_HARDENING.md). Phase 29's bench/
+// bench_aggregation_decomposed.cpp measured whether that isolated gain
+// survives inside this actual K-client application: encrypt is 86-91% of
+// end-to-end time in both arms, and swapping to the production path gave a
+// REAL 1.52x end-to-end speedup (144.3ms -> 95.1ms median at K=32, 10
+// interleaved reps) with the SAME worst-case error (3.347e-9) -- promoted
+// here as this workload's default. Plain `encrypt_host` remains reachable
+// (unchanged, still tested) for any future A/B; see bench_aggregation_
+// decomposed.cpp for the full comparison this promotion is based on.
 //
 // WORKLOAD: privacy-preserving aggregation of K client-held values (e.g. a
 // secure sum over K parties' private readings -- the building block behind
@@ -36,7 +54,7 @@ void encode_host_fft(std::vector<int64_t>&, const std::vector<std::complex<doubl
 void decode_host_fft(std::vector<std::complex<double>>&, const std::vector<int64_t>&, uint32_t, double);
 void native_primes(std::vector<uint64_t>&, uint32_t, uint32_t, uint32_t, const std::vector<uint64_t>&);
 uint64_t native_root(uint32_t, uint64_t);
-void encrypt_host(std::vector<uint64_t>&, std::vector<uint64_t>&, const std::vector<int64_t>&,
+void encrypt_host_shoup_pooled_barrett_batched(std::vector<uint64_t>&, std::vector<uint64_t>&, const std::vector<int64_t>&,
                    const std::vector<uint64_t>&, const std::vector<uint64_t>&, uint32_t,
                    const std::vector<uint64_t>&, const std::vector<uint64_t>&, uint64_t, double, uint64_t);
 void decrypt_host(std::vector<int64_t>&, const std::vector<uint64_t>&, const std::vector<uint64_t>&,
@@ -73,7 +91,7 @@ int main() {
     auto KP = gpufhe::keygen_host(n, mod, root, ns, sigma, 101);   // ONE key pair, shared (realistic deployment)
     double keygenMs = std::chrono::duration<double, std::milli>(clk::now() - t0).count();
 
-    std::printf("=== Phase 28, Objective E: private aggregation over %u clients, n=%u, sizeQ=%u ===\n",
+    std::printf("=== Phase 28/29: private aggregation over %u clients, n=%u, sizeQ=%u (production encrypt path) ===\n",
                 K, n, sizeQ);
     std::printf("keygen: %.2f ms (once, amortized across every aggregation below)\n\n", keygenMs);
 
@@ -102,8 +120,8 @@ int main() {
             std::vector<int64_t> m;
             gpufhe::encode_host_fft(m, z, n, Delta);
             std::vector<uint64_t> c0, c1;
-            gpufhe::encrypt_host(c0, c1, m, KP.pkA, KP.pkB, n, mod, root, ns, sigma,
-                                  (uint32_t)(5000 + rep * 100 + k));  // own encryption randomness per client
+            gpufhe::encrypt_host_shoup_pooled_barrett_batched(c0, c1, m, KP.pkA, KP.pkB, n, mod, root, ns, sigma,
+                                  5000 + rep * 100 + k);  // own encryption randomness per client
             if (first) { acc0 = c0; acc1 = c1; first = false; }
             else gpufhe::ct_add_ct_host(acc0, acc1, c0, c1, sizeQ, n, mod);
         }

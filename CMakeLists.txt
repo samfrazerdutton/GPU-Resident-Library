@@ -425,6 +425,29 @@ gpufhe_benchmark(bench_residency_hypothesis bench/bench_residency_hypothesis.cpp
 # weighted-sum/EvalMult variant. Registered with ctest: cheap (n=8192,
 # sizeQ=4, no bootstrap machinery, ~seconds).
 gpufhe_test(bench_private_aggregation_workload bench/bench_private_aggregation_workload.cpp)
+# GOD PROMPT "CKKS PHASE 29", Objectives C+D+E: decomposes the aggregation
+# workload into per-stage wall-clock times (encode/encrypt/aggregate/
+# decrypt/decode), full statistics (mean/median/stddev/min/max), and
+# compares Phase 28's actual encrypt_host call against the real production
+# path the Rust bridge uses, encrypt_host_shoup_pooled_barrett_batched --
+# already bit-exact verified, already measured faster in isolation; this
+# checks whether that holds inside the real K-client application.
+gpufhe_test(bench_aggregation_decomposed bench/bench_aggregation_decomposed.cpp)
+# GOD PROMPT "CKKS PHASE 29", Objective D: independent CPU-only baseline
+# (OpenFHE, OPENFHE_GPU=0) for the aggregation workload -- gpufhe itself has
+# no CPU-only encrypt path (every encrypt_host variant uses CUDA for its
+# NTT step), so this is a DIFFERENT library's implementation, not this
+# project's own CPU mode. See the file's own header for the full caveat.
+gpufhe_test(bench_aggregation_openfhe_cpu_baseline bench/bench_aggregation_openfhe_cpu_baseline.cpp)
+# GOD PROMPT "CKKS PHASE 29", Objective F: VRAM/RSS/runtime scaling across
+# client counts (1,2,4,8,16,32,64), production encrypt path.
+gpufhe_test(bench_aggregation_client_scaling bench/bench_aggregation_client_scaling.cpp)
+# GOD PROMPT "CKKS PHASE 29", Objective A: extends the Phase 12/28 FFT
+# encode/decode differential test with different scales (Delta) and
+# near-numerical-boundary values -- the two dimensions that test did not
+# cover. See the file's own header for why "different modulus/tower
+# configurations" does not apply to these particular functions.
+gpufhe_test(test_encode_fft_scale_and_boundary tests/test_encode_fft_scale_and_boundary.cpp)
 gpufhe_test(test_ntt_batched tests/test_ntt_batched.cpp)
 gpufhe_test(test_intt_batched tests/test_intt_batched.cpp)
 gpufhe_test(test_automorph_eval_fast tests/test_automorph_eval_fast.cpp)
