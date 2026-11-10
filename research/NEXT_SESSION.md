@@ -2,6 +2,105 @@
 
 ## Current commit
 
+Check `git log -5` on resume. As of this writing HEAD is the Phase 29
+commit (verified: `ff6a253` matched `origin/main` exactly at Phase 29
+start, confirmed via `git fetch` + `git rev-parse HEAD origin/main`).
+
+**Repository/hardware verification**: all of Phase 28's reported claims
+(3 commits, final `ff6a253`, clean fast-forward push) independently
+re-verified correct. Hardware re-confirmed unchanged: RTX 2060 Max-Q,
+6144 MiB, cc7.5, driver 595.97, CUDA 13.2, cargo/rustc 1.94.0.
+
+**Memory gate: still NO-GO.** Windows free RAM measured 3.54 GiB then
+4.41 GiB across this session (`Get-CimInstance Win32_OperatingSystem`,
+`FreePhysicalMemory`) -- both below the 10 GiB gate for `tests/
+test_boot.cpp`'s n=8192 bootstrap. WSL's own `free -h` showed "10Gi
+available" the whole time -- exactly the trap the governing directive
+warns about (WSL2's VM allocation, not true host pressure); GPU VRAM
+was never the constraint (5942-5103/6144 MiB free throughout). **The
+encode_host_fft bootstrap integration from Phase 28 remains UNEXECUTED
+end-to-end** -- still only compile/link-verified. This is the single
+most important remaining proof obligation, unchanged from Phase 28's own
+handoff.
+
+**Objective A (encoding promotion, extended verification)**: `tests/
+test_encode_fft_matches_reference.cpp` and `tests/test_encode_fft_
+concurrency.cpp` re-run fresh, both clean. New `tests/
+test_encode_fft_scale_and_boundary.cpp` extends coverage to different
+Delta scales (2^20 to 2^60) and near-numerical-boundary values the
+original test didn't cover -- found and fixed TWO tolerance-design bugs
+in this new test itself along the way (an over-aggressive Delta-scaled
+decode tolerance, and an under-provisioned encode tolerance for a
+sparse/alternating large-magnitude pattern the original test's own
+formula was never exercised against), landing at 32/32 passing with a
+properly-derived, not-weakened bound. Call-graph verified: all 10 of
+`tests/test_boot.cpp`'s call sites genuinely call `encode_host_fft`/
+`decode_host_fft` (not merely linked), confirmed by direct grep.
+
+**Objectives C+D+E+F+G (the aggregation workload)**: found that Phase
+28's `bench_private_aggregation_workload.cpp` called plain `encrypt_host`
+(the Phase-11 reference), NOT this project's own production path
+(`encrypt_host_shoup_pooled_barrett_batched`, what the Rust bridge
+actually calls, already bit-exact verified, already measured 1.57x-2.78x
+faster in isolation). New `bench/bench_aggregation_decomposed.cpp`
+decomposed the workload stage-by-stage and confirmed the gain survives
+end-to-end: 1.52x (144.3ms -> 95.1ms median, K=32, 10 interleaved reps),
+encrypt remaining 86-91% of total in both arms. Promoted this path into
+`bench_private_aggregation_workload.cpp` itself (100.27ms mean, same
+error profile). New `bench/bench_aggregation_openfhe_cpu_baseline.cpp`
+established the CPU comparison point gpufhe's architecture cannot supply
+natively (~4x GPU speedup vs OpenFHE CPU-only, explicitly caveated as a
+different implementation). New `bench/bench_aggregation_client_scaling.cpp`
+confirmed VRAM stays flat across K=1..64 (pool-based reuse, no per-client
+growth) while runtime scales linearly. Full writeup: `research/
+AGGREGATION_WORKLOAD_PROMOTION.md`.
+
+**Regression (Section 12, all 11 failures individually investigated,
+not just re-cited)**: 109/120 passing (5 new Phase 29 tests all pass).
+Every one of the 11 failures reproduced identically to Phase 28 and was
+individually classified: 3 expected-negative/parameter-sweep-boundary
+tests, 6 known pre-existing defects (`test_polyeval` and the
+`test_rescale_n1024` family -- documented root cause, `EXPERIMENT_LEDGER.md`
+#25-26), 1 environment-dependent failure (relative-path JSONL write),
+and 1 **genuinely new finding**: `test_ks_graph` (CUDA-graph capture of
+`keyswitch_resident` produces a fully-wrong result, not a small
+numerical error) was never previously documented anywhere and had never
+been revisited since its single creation commit -- confirmed NOT a
+Phase 28/29 regression (neither touched anything CUDA-graph or
+keyswitch-related) and confirmed NOT a general CUDA-graph environment
+problem (`bench_evalmult_resident.cpp`'s own graph path works and is
+measured 172x-22634x faster). Root cause not yet isolated -- a real
+candidate for a dedicated future investigation. Full classification:
+`research/PHASE29_REGRESSION_CLASSIFICATION.md`. Rust `cargo test` (both
+debug and release): 57 passed, 0 failed, 1 ignored (documented negative
+case) in each.
+
+## Immediate next actions, in order (Phase 29 handoff)
+
+1. **Re-run `tests/test_boot.cpp` the moment the memory gate clears**
+   (`Get-CimInstance Win32_OperatingSystem`, need >=10 GiB free) -- this
+   is now TWO phases running without this verification. Confirm the
+   integrated `encode_host_fft` bootstrap path is correct and realizes
+   its measured speedup at full n=8192 scale.
+2. **Investigate `test_ks_graph`'s CUDA-graph-capture defect** -- a
+   genuinely new finding this round, not yet root-caused. Requires
+   careful, isolated work inside `src/keyswitch_resident.cpp`'s
+   internals (this test IS the reproducer the governing directive
+   requires first); do not combine with any other change.
+3. **Only after (1) passes**, wire the fused kernel into `tests/
+   test_boot.cpp`'s real accumulate loop (Phase 27/28's "promote"
+   verdict, never yet executed in the real file) as a SEPARATE,
+   separately-measured change.
+4. Consider whether the aggregation workload's own encrypt-dominance
+   (86% of end-to-end even on the production path) is worth a further
+   pass -- `research/ENCRYPT_PROFILING.md`'s own closing note mentions a
+   pinned-memory variant that was reverted for single-call latency but
+   might behave differently in a steady-state many-calls-same-key pattern
+   like this one; not attempted this round, a legitimate next candidate.
+5. Re-run the Windows free-RAM gate check before any of the above.
+
+## Earlier commit (Phase 28)
+
 Check `git log -5` on resume. As of this writing HEAD is the Phase 28 commit
 (on top of Phase 27's final commit, see "Earlier commit (Phase 27)" below).
 
