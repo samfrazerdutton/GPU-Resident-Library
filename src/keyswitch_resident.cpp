@@ -10,7 +10,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <map>
-#include <map>
+#include <mutex>
 #include <utility>
 
 namespace gpufhe {
@@ -23,10 +23,30 @@ uint64_t* upv(const std::vector<uint64_t>& h, cudaStream_t s=0){ uint64_t* d;
     cudaMalloc(&d,h.size()*8);
     cudaMemcpyAsync(d,h.data(),h.size()*8,cudaMemcpyHostToDevice,s);
     return d; }
+// GOD PROMPT "CKKS PHASE 30": g_ks_cache_mutex() guards BOTH this function's
+// `m` cache and g_rtab below (ks_context_create). Both are plain
+// process-lifetime `static std::map`s populated via an unsynchronized
+// find()-then-emplace() -- the same latent-race pattern class Phase 25
+// found and FIXED as a genuinely active bug in src/rotate.cpp's dev_tab(),
+// and separately found HERE (this exact file) via test_rotate_concurrent_
+// cache.cpp but characterized as latent (that test's access pattern never
+// triggered it). Phase 30's own concurrency testing of the CUDA-graph fix
+// below (tests/test_ks_graph_lifecycle.cpp: 8 threads, each building its
+// OWN KeySwitchConstants from the SAME native_primes-derived moduli, so
+// all 8 race g_rtab/upc's cold-start insert for the SAME (n,q) keys
+// simultaneously) DID trigger it for real: only 4-1 of 8 threads produced
+// correct output, run to run, the classic signature of concurrent
+// std::map corruption. Fixed with the SAME minimal, already-established
+// pattern this project used for src/encode_fft.cpp's analogous cache
+// (GOD PROMPT "CKKS PHASE 28"): lookups/inserts are cheap relative to the
+// actual keyswitch work, so a lock here costs nothing that matters.
+std::mutex& g_ks_cache_mutex(){ static std::mutex m; return m; }
 // These constants depend only on (n,sizeQl,numPart) -- NOT on the key -- yet
 // every rotation rebuilt ~135 identical allocations. Cache by that tuple; only
 // av/bv stay per-key. Contexts do not own these (destroy must not free them).
+// Guarded by g_ks_cache_mutex() -- see that function's comment for why.
 uint64_t* upc(uint64_t key, const std::vector<uint64_t>& h){
+    std::lock_guard<std::mutex> lock(g_ks_cache_mutex());
     static std::map<uint64_t,uint64_t*> m;
     auto it=m.find(key); if(it!=m.end()) return it->second;
     uint64_t* d=upv(h); m.emplace(key,d); return d; }
@@ -107,6 +127,13 @@ DeviceKSContext ks_context_create(const KeySwitchConstants& K, cudaStream_t s){
     for(size_t r=0;r<K.rootModList.size();++r){
         uint64_t q=K.rootModList[r], root=K.rootValList[r];
         auto key=std::make_pair(n,q);
+        // GOD PROMPT "CKKS PHASE 30": guarded by g_ks_cache_mutex() -- see
+        // that function's comment (near upc(), above) for why this cache
+        // needed it. Held across both the lookup/insert AND the read of
+        // it->second into C's vectors, for simplicity; the work inside is
+        // small (one size-n fill on a true cache miss, a few pointer reads
+        // otherwise) relative to real keyswitch work.
+        std::lock_guard<std::mutex> lock(g_ks_cache_mutex());
         auto it=g_rtab.find(key);
         if(it==g_rtab.end()){
             uint64_t rootInv=invmod(root,q);
@@ -174,6 +201,43 @@ DeviceKSWork ks_work_create(const DeviceKSContext& C){
     cudaMalloc(&W.d_towerMods,(size_t)C.sizeQlP*8);
     cudaMalloc(&W.d_nInv,(size_t)C.sizeQlP*8);
     cudaMalloc(&W.d_nInvPrecon,(size_t)C.sizeQlP*8);
+    // GOD PROMPT "CKKS PHASE 30": one dedicated, persistent host buffer per
+    // (part, role) -- see keyswitch_resident.h's own comment on these
+    // fields for the full story (a CUDA-graph-capture dangling-pointer bug
+    // AND a separate value-aliasing bug, both proven via standalone
+    // reproducers, research/KS_GRAPH_CAPTURE_INVESTIGATION.md).
+    //
+    // Sized DEFENSIVELY, not from C.numPart/C.sizeCompl directly: some
+    // existing callers (tests/test_hoist_stage0.cpp's stageRotBegin) build
+    // a deliberate "shape-only" placeholder DeviceKSContext to size a
+    // long-lived W once, setting only n/sizeQl/sizeP/sizeQlP/sizePart --
+    // numPart and sizeCompl are left at their default (0 / empty) on that
+    // placeholder, since the ORIGINAL flat, sizeQlP-worst-case-sized
+    // scratch buffers never needed them. Indexing by C.numPart (0 on that
+    // placeholder) or C.sizeCompl[part] (empty) segfaulted the very first
+    // time ks_accumulate_qp ran against the REAL per-diagonal context --
+    // caught by the full regression suite, not by this phase's own new
+    // tests (which always build a complete DeviceKSContext). Using
+    // C.sizePart.size() for the part count (every known caller, including
+    // this placeholder, DOES populate sizePart with one real entry per
+    // part) and C.sizeQlP as a uniform worst-case inner size (every part's
+    // slice or complement is, by construction, never larger than the
+    // whole) gives buffers that are always large enough and never depend
+    // on a field a shape-only context doesn't set.
+    const uint32_t numPartSafe = (uint32_t)C.sizePart.size();
+    W.h_rootsA_part.resize(numPartSafe); W.h_rootsB_part.resize(numPartSafe);
+    W.h_towerMods_part.resize(numPartSafe); W.h_nInv_part.resize(numPartSafe); W.h_nInvPrecon_part.resize(numPartSafe);
+    W.h_rootsA_compl.resize(numPartSafe); W.h_rootsB_compl.resize(numPartSafe); W.h_towerMods_compl.resize(numPartSafe);
+    W.h_digPtrs_part.resize(numPartSafe);
+    for (uint32_t part = 0; part < numPartSafe; ++part) {
+        W.h_rootsA_part[part].resize(C.sizeQlP); W.h_rootsB_part[part].resize(C.sizeQlP);
+        W.h_towerMods_part[part].resize(C.sizeQlP); W.h_nInv_part[part].resize(C.sizeQlP); W.h_nInvPrecon_part[part].resize(C.sizeQlP);
+        W.h_rootsA_compl[part].resize(C.sizeQlP); W.h_rootsB_compl[part].resize(C.sizeQlP); W.h_towerMods_compl[part].resize(C.sizeQlP);
+        W.h_digPtrs_part[part].resize(C.sizeQlP);
+    }
+    W.h_rootsA_pwork.resize(C.sizeP); W.h_rootsB_pwork.resize(C.sizeP);
+    W.h_towerMods_pwork.resize(C.sizeP); W.h_nInv_pwork.resize(C.sizeP); W.h_nInvPrecon_pwork.resize(C.sizeP);
+    W.h_rootsA_qsw.resize(C.sizeQl); W.h_rootsB_qsw.resize(C.sizeQl); W.h_towerMods_qsw.resize(C.sizeQl);
     return W;
 }
 
@@ -227,18 +291,25 @@ void ks_accumulate_qp(const uint64_t* d_a, const DeviceKSContext& C, DeviceKSWor
         cudaMemcpyAsync(W.d_part, d_a+(size_t)st*n, (size_t)sp*n*8,
                         cudaMemcpyDeviceToDevice, s);
         {
-            std::vector<const uint64_t*> hir(sp),hip(sp);
-            std::vector<uint64_t> hmod(sp),hninv(sp),hninvp(sp);
+            // GOD PROMPT "CKKS PHASE 30": writes into a buffer DEDICATED to
+            // this (part, role) combination -- see keyswitch_resident.h's
+            // long comment on these fields. A single buffer shared across
+            // every part's INTT-the-slice role (the first fix attempt) is
+            // NOT enough: during graph replay, every one of this loop's
+            // numPart memcpy nodes would read whatever was written LAST
+            // during capture, not its own part's value.
+            auto& hrA=W.h_rootsA_part[part]; auto& hrB=W.h_rootsB_part[part];
+            auto& htm=W.h_towerMods_part[part]; auto& hni=W.h_nInv_part[part]; auto& hnip=W.h_nInvPrecon_part[part];
             for(uint32_t i=0;i<sp;++i){
                 uint64_t q=C.qModHost[st+i]; int r=row_of(C,q);
-                hir[i]=C.d_ir[r]; hip[i]=C.d_ip[r];
-                hmod[i]=q; hninv[i]=C.ninv[r]; hninvp[i]=C.ninv_p[r];
+                hrA[i]=C.d_ir[r]; hrB[i]=C.d_ip[r];
+                htm[i]=q; hni[i]=C.ninv[r]; hnip[i]=C.ninv_p[r];
             }
-            cudaMemcpyAsync(W.d_rootsA,hir.data(),sp*sizeof(uint64_t*),cudaMemcpyHostToDevice,s);
-            cudaMemcpyAsync(W.d_rootsB,hip.data(),sp*sizeof(uint64_t*),cudaMemcpyHostToDevice,s);
-            cudaMemcpyAsync(W.d_towerMods,hmod.data(),sp*8,cudaMemcpyHostToDevice,s);
-            cudaMemcpyAsync(W.d_nInv,hninv.data(),sp*8,cudaMemcpyHostToDevice,s);
-            cudaMemcpyAsync(W.d_nInvPrecon,hninvp.data(),sp*8,cudaMemcpyHostToDevice,s);
+            cudaMemcpyAsync(W.d_rootsA,hrA.data(),sp*sizeof(uint64_t*),cudaMemcpyHostToDevice,s);
+            cudaMemcpyAsync(W.d_rootsB,hrB.data(),sp*sizeof(uint64_t*),cudaMemcpyHostToDevice,s);
+            cudaMemcpyAsync(W.d_towerMods,htm.data(),sp*8,cudaMemcpyHostToDevice,s);
+            cudaMemcpyAsync(W.d_nInv,hni.data(),sp*8,cudaMemcpyHostToDevice,s);
+            cudaMemcpyAsync(W.d_nInvPrecon,hnip.data(),sp*8,cudaMemcpyHostToDevice,s);
             LaunchINTT_GS_Batched(W.d_part, W.d_rootsA, W.d_rootsB, W.d_towerMods,
                                   W.d_nInv, W.d_nInvPrecon, sp, n, s);
         }
@@ -249,15 +320,17 @@ void ks_accumulate_qp(const uint64_t* d_a, const DeviceKSContext& C, DeviceKSWor
             sp, sc, n, s);
         // 3. NTT each complement tower back to eval
         {
-            std::vector<const uint64_t*> hfr(sc),hfp(sc);
-            std::vector<uint64_t> hmod(sc);
+            // GOD PROMPT "CKKS PHASE 30": see the long comment above -- a
+            // buffer dedicated to (part, "complement" role), distinct from
+            // this same part's "part slice" role buffer above.
+            auto& hrA=W.h_rootsA_compl[part]; auto& hrB=W.h_rootsB_compl[part]; auto& htm=W.h_towerMods_compl[part];
             for(uint32_t j=0;j<sc;++j){
                 uint64_t q=C.complModHost[part][j]; int r=row_of(C,q);
-                hfr[j]=C.d_fr[r]; hfp[j]=C.d_fp[r]; hmod[j]=q;
+                hrA[j]=C.d_fr[r]; hrB[j]=C.d_fp[r]; htm[j]=q;
             }
-            cudaMemcpyAsync(W.d_rootsA,hfr.data(),sc*sizeof(uint64_t*),cudaMemcpyHostToDevice,s);
-            cudaMemcpyAsync(W.d_rootsB,hfp.data(),sc*sizeof(uint64_t*),cudaMemcpyHostToDevice,s);
-            cudaMemcpyAsync(W.d_towerMods,hmod.data(),sc*8,cudaMemcpyHostToDevice,s);
+            cudaMemcpyAsync(W.d_rootsA,hrA.data(),sc*sizeof(uint64_t*),cudaMemcpyHostToDevice,s);
+            cudaMemcpyAsync(W.d_rootsB,hrB.data(),sc*sizeof(uint64_t*),cudaMemcpyHostToDevice,s);
+            cudaMemcpyAsync(W.d_towerMods,htm.data(),sc*8,cudaMemcpyHostToDevice,s);
             LaunchNTT_CT_Batched(W.d_compl, W.d_rootsA, W.d_rootsB, W.d_towerMods, sc, n, s);
         }
         // 4. accumulate: digit tower i = d_a (in range) or d_compl (else).
@@ -279,7 +352,17 @@ void ks_accumulate_qp(const uint64_t* d_a, const DeviceKSContext& C, DeviceKSWor
                                 q, n, s);
             }
         } else
-        {   std::vector<const uint64_t*> hp(sizeQlP);
+        {   // GOD PROMPT "CKKS PHASE 30": per-part dedicated buffer, same
+            // reasoning as the two blocks above -- this one, uniquely, also
+            // depends on the caller's `d_a` pointer VALUE, not just
+            // context-fixed data; still safe to stage through a W-owned
+            // buffer, since a graph capturing this call is bound to that
+            // exact d_a pointer identity for the life of the graph
+            // regardless (see research/KS_GRAPH_CAPTURE_INVESTIGATION.md's
+            // execution-model section) -- but MUST be indexed by part, or
+            // replay would reuse only the LAST part's digit-pointer array
+            // for every part's kernel launch.
+            auto& hp=W.h_digPtrs_part[part];
             for(uint32_t i=0;i<sizeQlP;++i)
                 hp[i] = (i>=st && i<en) ? d_a+(size_t)i*n
                       : (i<st)          ? W.d_compl+(size_t)i*n
@@ -302,18 +385,24 @@ void ks_moddown(const DeviceKSContext& C, DeviceKSWork& W,
     cudaMemcpyAsync(W.d_pwork, d_res+(size_t)sizeQl*n, (size_t)sizeP*n*8,
                     cudaMemcpyDeviceToDevice, s);
     {
-        std::vector<const uint64_t*> hir(sizeP),hip(sizeP);
-        std::vector<uint64_t> hmod(sizeP),hninv(sizeP),hninvp(sizeP);
+        // GOD PROMPT "CKKS PHASE 30": dedicated "pwork" (P-part INTT) role
+        // buffer -- see keyswitch_resident.h's long comment. Distinct from
+        // the "qsw" (Ql NTT) role buffer below: this function's TWO roles
+        // must not share one buffer, for the same reason ks_accumulate_qp's
+        // per-part roles must not. Safe to reuse unchanged across this
+        // function's two call sites per keyswitch_resident (d_ba0, d_ba1):
+        // the computed value depends only on the fixed context C, never on
+        // d_res/d_out, so both calls always (re)write the IDENTICAL value.
         for(uint32_t j=0;j<sizeP;++j){
             uint64_t q=C.pModHost[j]; int r=row_of(C,q);
-            hir[j]=C.d_ir[r]; hip[j]=C.d_ip[r];
-            hmod[j]=q; hninv[j]=C.ninv[r]; hninvp[j]=C.ninv_p[r];
+            W.h_rootsA_pwork[j]=C.d_ir[r]; W.h_rootsB_pwork[j]=C.d_ip[r];
+            W.h_towerMods_pwork[j]=q; W.h_nInv_pwork[j]=C.ninv[r]; W.h_nInvPrecon_pwork[j]=C.ninv_p[r];
         }
-        cudaMemcpyAsync(W.d_rootsA,hir.data(),sizeP*sizeof(uint64_t*),cudaMemcpyHostToDevice,s);
-        cudaMemcpyAsync(W.d_rootsB,hip.data(),sizeP*sizeof(uint64_t*),cudaMemcpyHostToDevice,s);
-        cudaMemcpyAsync(W.d_towerMods,hmod.data(),sizeP*8,cudaMemcpyHostToDevice,s);
-        cudaMemcpyAsync(W.d_nInv,hninv.data(),sizeP*8,cudaMemcpyHostToDevice,s);
-        cudaMemcpyAsync(W.d_nInvPrecon,hninvp.data(),sizeP*8,cudaMemcpyHostToDevice,s);
+        cudaMemcpyAsync(W.d_rootsA,W.h_rootsA_pwork.data(),sizeP*sizeof(uint64_t*),cudaMemcpyHostToDevice,s);
+        cudaMemcpyAsync(W.d_rootsB,W.h_rootsB_pwork.data(),sizeP*sizeof(uint64_t*),cudaMemcpyHostToDevice,s);
+        cudaMemcpyAsync(W.d_towerMods,W.h_towerMods_pwork.data(),sizeP*8,cudaMemcpyHostToDevice,s);
+        cudaMemcpyAsync(W.d_nInv,W.h_nInv_pwork.data(),sizeP*8,cudaMemcpyHostToDevice,s);
+        cudaMemcpyAsync(W.d_nInvPrecon,W.h_nInvPrecon_pwork.data(),sizeP*8,cudaMemcpyHostToDevice,s);
         LaunchINTT_GS_Batched(W.d_pwork, W.d_rootsA, W.d_rootsB, W.d_towerMods,
                               W.d_nInv, W.d_nInvPrecon, sizeP, n, s);
     }
@@ -322,15 +411,14 @@ void ks_moddown(const DeviceKSContext& C, DeviceKSWork& W,
         C.d_pHatModq, C.d_qMod, C.d_mdMuLo, C.d_mdMuHi,
         sizeP, sizeQl, n, s);
     {
-        std::vector<const uint64_t*> hfr(sizeQl),hfp(sizeQl);
-        std::vector<uint64_t> hmod(sizeQl);
+        // GOD PROMPT "CKKS PHASE 30": dedicated "qsw" (Ql NTT) role buffer.
         for(uint32_t i=0;i<sizeQl;++i){
             uint64_t q=C.qModHost[i]; int r=row_of(C,q);
-            hfr[i]=C.d_fr[r]; hfp[i]=C.d_fp[r]; hmod[i]=q;
+            W.h_rootsA_qsw[i]=C.d_fr[r]; W.h_rootsB_qsw[i]=C.d_fp[r]; W.h_towerMods_qsw[i]=q;
         }
-        cudaMemcpyAsync(W.d_rootsA,hfr.data(),sizeQl*sizeof(uint64_t*),cudaMemcpyHostToDevice,s);
-        cudaMemcpyAsync(W.d_rootsB,hfp.data(),sizeQl*sizeof(uint64_t*),cudaMemcpyHostToDevice,s);
-        cudaMemcpyAsync(W.d_towerMods,hmod.data(),sizeQl*8,cudaMemcpyHostToDevice,s);
+        cudaMemcpyAsync(W.d_rootsA,W.h_rootsA_qsw.data(),sizeQl*sizeof(uint64_t*),cudaMemcpyHostToDevice,s);
+        cudaMemcpyAsync(W.d_rootsB,W.h_rootsB_qsw.data(),sizeQl*sizeof(uint64_t*),cudaMemcpyHostToDevice,s);
+        cudaMemcpyAsync(W.d_towerMods,W.h_towerMods_qsw.data(),sizeQl*8,cudaMemcpyHostToDevice,s);
         LaunchNTT_CT_Batched(W.d_qsw, W.d_rootsA, W.d_rootsB, W.d_towerMods, sizeQl, n, s);
     }
     for(uint32_t i=0;i<sizeQl;++i){

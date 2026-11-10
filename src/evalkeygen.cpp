@@ -13,6 +13,7 @@
 #include <random>
 #include <cmath>
 #include <map>
+#include <mutex>
 #include <cuda_runtime.h>
 
 namespace gpufhe {
@@ -40,7 +41,15 @@ EkDevTab build_ek_tab(uint32_t n, uint64_t q, uint64_t root){
     EkDevTab T; T.fr=up(fr); T.fp=up(fp);
     return T;
 }
+// GOD PROMPT "CKKS PHASE 30": guarded -- the same latent-race pattern class
+// Phase 25 fixed as genuinely active in src/rotate.cpp and Phase 30 found
+// genuinely active (via tests/test_ks_graph_lifecycle.cpp's 8-thread
+// concurrency check: multiple threads building independent KeySwitchConstants
+// from identical (n,q) moduli race this cache's cold-start insert) in
+// src/keyswitch_resident.cpp's g_rtab/upc. Fixed with the same minimal mutex.
+std::mutex& ek_cache_mutex(){ static std::mutex m; return m; }
 EkDevTab& ek_dev_tab(uint32_t n, uint64_t q, uint64_t root){
+    std::lock_guard<std::mutex> lock(ek_cache_mutex());
     static std::map<std::pair<uint32_t,uint64_t>,EkDevTab> ekCache;
     auto key=std::make_pair(n,q);
     auto it=ekCache.find(key);

@@ -63,9 +63,16 @@ int main(){
     std::vector<uint64_t> g0((size_t)sizeQ*n),g1((size_t)sizeQ*n);
     cudaMemcpy(g0.data(),d_b0,g0.size()*8,cudaMemcpyDeviceToHost);
     cudaMemcpy(g1.data(),d_b1,g1.size()*8,cudaMemcpyDeviceToHost);
-    uint32_t bad=0;
-    for(size_t x=0;x<g0.size();++x){ if(g0[x]!=ref0[x])++bad; if(g1[x]!=ref1[x])++bad; }
-    std::cout<<"graph-vs-direct mismatches="<<bad<<"\n";
+    uint32_t bad=0, bad0=0, bad1=0;
+    for(size_t x=0;x<g0.size();++x){ if(g0[x]!=ref0[x]){++bad;++bad0;} if(g1[x]!=ref1[x]){++bad;++bad1;} }
+    std::cout<<"graph-vs-direct mismatches="<<bad<<" (b0="<<bad0<<"/"<<g0.size()<<" b1="<<bad1<<"/"<<g1.size()<<")\n";
+    std::cout<<"ref0[0..3]="<<ref0[0]<<","<<ref0[1]<<","<<ref0[2]<<","<<ref0[3]<<"\n";
+    std::cout<<"g0  [0..3]="<<g0[0]<<","<<g0[1]<<","<<g0[2]<<","<<g0[3]<<"\n";
+    std::cout<<"ref1[0..3]="<<ref1[0]<<","<<ref1[1]<<","<<ref1[2]<<","<<ref1[3]<<"\n";
+    std::cout<<"g1  [0..3]="<<g1[0]<<","<<g1[1]<<","<<g1[2]<<","<<g1[3]<<"\n";
+    bool g0AllZero=true,g1AllZero=true;
+    for(size_t x=0;x<g0.size();++x){ if(g0[x]!=0)g0AllZero=false; if(g1[x]!=0)g1AllZero=false; }
+    std::cout<<"g0 all-zero="<<g0AllZero<<"  g1 all-zero="<<g1AllZero<<"\n";
     if(!bad){std::cout<<"[PASS] graph-replayed keyswitch bit-exact vs direct\n";return 0;}
     std::cout<<"[FAIL]\n"; return 1;
 }
