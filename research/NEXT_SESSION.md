@@ -2,6 +2,97 @@
 
 ## Current commit
 
+Check `git log -8 --oneline` on resume. As of this writing HEAD is the
+Phase 30 commit. Verified: `b09ba1b` matched `origin/main` exactly at
+Phase 30 start (confirmed via `git fetch` + `git rev-parse HEAD
+origin/main`). Hardware re-confirmed unchanged: RTX 2060 Max-Q, 6144 MiB,
+cc7.5, driver 595.97, CUDA 13.2.
+
+**`test_ks_graph`'s CUDA-graph-capture defect: FIXED, rigorously
+validated.** Root cause: `ks_accumulate_qp`/`ks_moddown` built small
+host-side root-table/modulus-selector arrays in function-local
+`std::vector`s, then `cudaMemcpyAsync(..., HostToDevice, s)`'d them --
+safe for direct calls (pageable H2D is synchronously staged) but a
+captured graph node stores the host *pointer*, re-read at every future
+replay, long after the local vector was destroyed (proven with a
+minimal, gpufhe-independent reproducer: a captured graph read back the
+literal bytes `0xDEADBEEF` of an unrelated vector allocated AFTER
+capture ended). A first fix (move the buffers into `DeviceKSWork`,
+giving them a stable address) was NECESSARY but NOT SUFFICIENT: it
+exposed a second, distinct bug -- multiple (part, role) combinations
+within one call shared ONE such buffer, and since replay never re-runs
+the host C++ loops that fill it with each role's own value, every shared
+memcpy node read whatever was written LAST during capture. Fixed with
+one dedicated, persistent host buffer per (part, role), sized in
+`ks_work_create`. `tests/test_ks_graph.cpp` now passes bit-exact, 5/5
+runs, 0 compute-sanitizer memcheck errors. Full story, including the two
+reproducers, the exact mechanism, and all validation (lifecycle, memory,
+concurrency, performance): `research/KS_GRAPH_CAPTURE_INVESTIGATION.md`.
+
+**Found and fixed two REAL, separate, previously-undocumented
+concurrency bugs** while stress-testing the fix: `src/
+keyswitch_resident.cpp`'s `g_rtab`/`upc` caches and `src/evalkeygen.cpp`'s
+`ek_dev_tab` cache were plain unsynchronized `static std::map`s, actively
+(not just latently) racing when multiple threads build independent
+`KeySwitchConstants` from identical moduli. Fixed with a mutex each,
+matching this project's own established pattern (Phase 28's `src/
+encode_fft.cpp` fix).
+
+**A THIRD, deeper concurrency issue remains, found but deliberately NOT
+fixed this round**: even after both cache fixes, many threads
+simultaneously building FRESH contexts from scratch can still show a
+direct (non-graph) execution disagreeing with itself across two
+back-to-back calls on the same thread -- the residual race is in the
+key-generation/context-setup pipeline, not in `keyswitch_resident` or its
+now-fixed graph-capture path. Per the governing directive's explicit
+instruction not to let this phase become an open-ended concurrency audit
+of the whole keygen pipeline, this is documented as a known limitation
+with a precise, committed, standalone reproducer
+(`tests/test_ks_graph_setup_concurrency_diagnostic.cpp`, deliberately NOT
+registered with ctest since it is non-deterministic) and handed off.
+
+**Performance (honest, not forced)**: at n=8192/tw=30 (bootstrap scale),
+warm graph replay measured 1.49x faster than direct execution (median
+4.32ms vs 6.43ms), one-time capture+instantiate+first-launch overhead
+breaking even after ~4 replays. `bench/bench_ks_graph_perf.cpp`.
+
+**New tests registered with ctest**: `test_ks_graph_lifecycle` (14
+checks: capture/instantiate/first-launch/10x-repeated-replay/updated-
+input-replay/multi-graph/multi-context/destruction-order/leak-check, all
+100% reliable across 8+ repeated runs), `bench_ks_graph_perf`.
+**Deliberately NOT registered** (non-deterministic by design):
+`test_ks_graph_setup_concurrency_diagnostic`.
+
+## Immediate next actions, in order (Phase 30 handoff)
+
+1. **Investigate the residual key-generation/context-setup concurrency
+   race** -- the single most important carry-over. Start with
+   `tests/test_ks_graph_setup_concurrency_diagnostic.cpp` (already
+   reproduces it) and the hypothesis noted in `research/
+   KS_GRAPH_CAPTURE_INVESTIGATION.md` section 7 (legacy default stream
+   `0` usage in `keygen_host`/`evalkeygen_host_sold` across concurrent
+   threads is plausible but UNCONFIRMED -- verify before fixing, per the
+   governing directive's explicit "do not add a mutex without proof"
+   instruction).
+2. **Re-run `tests/test_boot.cpp` the moment the memory gate clears**
+   (`Get-CimInstance Win32_OperatingSystem`, need >=10 GiB free) -- this
+   is now THREE phases running without this verification (Phase 28's
+   `encode_host_fft` bootstrap integration remains unexecuted at full
+   scale).
+3. **Only after (2) passes**, wire the fused kernel into `tests/
+   test_boot.cpp`'s real accumulate loop (Phase 27/28's "promote"
+   verdict, never yet executed in the real file) as a SEPARATE,
+   separately-measured change.
+4. Consider whether `keyswitch_resident`'s now-measured 1.49x graph-replay
+   speedup is worth wiring into a real multi-call site (e.g. a bootstrap
+   stage's rotation-key-switch loop, which calls it many times per stage
+   with the same context) -- a genuine, newly-available optimization
+   candidate, not attempted this round (this phase's mandate was the
+   correctness defect, not a new performance initiative).
+5. Re-run the Windows free-RAM gate check before any of the above.
+
+## Earlier commit (Phase 29)
+
 Check `git log -5` on resume. As of this writing HEAD is the Phase 29
 commit (verified: `ff6a253` matched `origin/main` exactly at Phase 29
 start, confirmed via `git fetch` + `git rev-parse HEAD origin/main`).
