@@ -118,14 +118,34 @@ EncDevTab& enc_dev_tab_batched(uint32_t n, uint64_t q, uint64_t root) {
 // Pooled device state, keyed by (n,sizeQ) -- same lifetime/ownership
 // model as Phase 13/14's EncryptBufPool, EXCEPT the four separate
 // per-call data buffers are now ONE packed allocation of 4x the size,
-// laid out [v|e0|e1|m]. d_fr/d_fp/d_mod are UNCHANGED from Phase 14
-// (still sizeQ-length -- reused by all four kernel launches via
-// pointer offsets into d_packed, exactly as before via four separate
-// buffers).
+// laid out [v|e0|e1|m].
+//
+// GOD PROMPT "CKKS PHASE 34": d_fr/d_fp/d_mod are now 4*sizeQ-length,
+// not sizeQ-length -- holding the SAME sizeQ per-tower tables repeated
+// 4 times (v's towers, then e0's, then e1's, then m's), so the four
+// separate LaunchNTT_CT_Batched calls below (one per buffer, towers=
+// sizeQ each -- 20 total kernel launches: 4 calls x ~5 internal stage
+// launches each) can be replaced by ONE call over the whole packed
+// buffer with towers=4*sizeQ (5 total kernel launches). This is an
+// EXACT reorganization of identical work, not an approximation --
+// verified bit-exact (0 differing limbs) against the original
+// four-separate-calls pattern in a standalone, CUDA-only probe before
+// this change (research/benchmarks/bench_ntt_merge_experiment.cpp),
+// by direct reading of kernels/ntt_ct.cu's ct_stage_b/ct_shared_tail_b
+// (tower index is blockIdx.y; each tower independently indexes
+// x+tw*n, roots[tw], precon[tw], mods[tw] -- so repeating the real
+// per-tower tables 4 times and widening the grid's y-dimension from
+// sizeQ to 4*sizeQ produces identical per-element results). Measured
+// ~1.2x on the transfer+kernel portion via interleaved A/B (same
+// methodology as every prior encrypt-path phase); full detail,
+// evidence, and the end-to-end aggregation-workload re-measurement:
+// research/PHASE34_PERFORMANCE_INVESTIGATION.md. The tables are built
+// ONCE per (n,sizeQ) pool entry below, not per call -- this adds no
+// new per-call host-side work.
 struct EncryptBufPoolBatched {
     uint64_t* d_packed = nullptr; // [v | e0 | e1 | m], each sizeQ*n elements
-    uint64_t **d_fr = nullptr, **d_fp = nullptr;
-    uint64_t* d_mod = nullptr;
+    uint64_t **d_fr = nullptr, **d_fp = nullptr; // 4*sizeQ-length (Phase 34)
+    uint64_t* d_mod = nullptr;                   // 4*sizeQ-length (Phase 34)
     uint32_t sizeQ = 0;
 };
 EncryptBufPoolBatched& encrypt_buf_pool_batched(uint32_t n, uint32_t sizeQ) {
@@ -136,9 +156,9 @@ EncryptBufPoolBatched& encrypt_buf_pool_batched(uint32_t n, uint32_t sizeQ) {
     EncryptBufPoolBatched P; P.sizeQ = sizeQ;
     const size_t T8 = (size_t)sizeQ * n * 8;
     cudaMalloc(&P.d_packed, 4 * T8);
-    cudaMalloc(&P.d_fr, sizeQ * sizeof(uint64_t*));
-    cudaMalloc(&P.d_fp, sizeQ * sizeof(uint64_t*));
-    cudaMalloc(&P.d_mod, sizeQ * 8);
+    cudaMalloc(&P.d_fr, 4 * sizeQ * sizeof(uint64_t*));
+    cudaMalloc(&P.d_fp, 4 * sizeQ * sizeof(uint64_t*));
+    cudaMalloc(&P.d_mod, 4 * sizeQ * 8);
     return cache.emplace(key, P).first->second;
 }
 } // anon
@@ -180,29 +200,34 @@ void encrypt_host_shoup_pooled_barrett_batched(std::vector<uint64_t>& c0, std::v
         }
     }
 
-    std::vector<uint64_t*> h_fr(sizeQ), h_fp(sizeQ);
-    for (uint32_t t = 0; t < sizeQ; ++t) { EncDevTab& Tt = enc_dev_tab_batched(n, mod[t], root[t]); h_fr[t] = Tt.fr; h_fp[t] = Tt.fp; }
+    // GOD PROMPT "CKKS PHASE 34": 4*sizeQ-length, repeating the sizeQ
+    // real per-tower tables 4 times (v,e0,e1,m each get the SAME
+    // per-tower modulus/root tables) -- see the pool struct's own
+    // comment above for why this enables merging the 4 kernel calls
+    // below into 1.
+    std::vector<uint64_t*> h_fr(4 * sizeQ), h_fp(4 * sizeQ);
+    std::vector<uint64_t> h_mod4(4 * sizeQ);
+    for (uint32_t t = 0; t < sizeQ; ++t) {
+        EncDevTab& Tt = enc_dev_tab_batched(n, mod[t], root[t]);
+        for (uint32_t r = 0; r < 4; ++r) { h_fr[r * sizeQ + t] = Tt.fr; h_fp[r * sizeQ + t] = Tt.fp; h_mod4[r * sizeQ + t] = mod[t]; }
+    }
 
     EncryptBufPoolBatched& P = encrypt_buf_pool_batched(n, sizeQ);
-    cudaMemcpy(P.d_fr, h_fr.data(), sizeQ * sizeof(uint64_t*), cudaMemcpyHostToDevice);
-    cudaMemcpy(P.d_fp, h_fp.data(), sizeQ * sizeof(uint64_t*), cudaMemcpyHostToDevice);
-    cudaMemcpy(P.d_mod, mod.data(), sizeQ * 8, cudaMemcpyHostToDevice);
+    cudaMemcpy(P.d_fr, h_fr.data(), 4 * sizeQ * sizeof(uint64_t*), cudaMemcpyHostToDevice);
+    cudaMemcpy(P.d_fp, h_fp.data(), 4 * sizeQ * sizeof(uint64_t*), cudaMemcpyHostToDevice);
+    cudaMemcpy(P.d_mod, h_mod4.data(), 4 * sizeQ * 8, cudaMemcpyHostToDevice);
 
     const size_t T8 = T * 8;
     // ONE upload of the whole packed region (was 4 separate calls).
     cudaMemcpy(P.d_packed, packed.data(), 4 * T8, cudaMemcpyHostToDevice);
 
-    uint64_t* d_v = P.d_packed;
-    uint64_t* d_e0 = P.d_packed + T;
-    uint64_t* d_e1 = P.d_packed + 2 * T;
-    uint64_t* d_m = P.d_packed + 3 * T;
-    // Kernel launches UNCHANGED from Phase 14 -- same signature, same
-    // tables, same tower count, only the buffer pointers are now
-    // offsets into one packed allocation instead of four separate ones.
-    LaunchNTT_CT_Batched(d_v, (const uint64_t* const*)P.d_fr, (const uint64_t* const*)P.d_fp, P.d_mod, sizeQ, n, 0);
-    LaunchNTT_CT_Batched(d_e0, (const uint64_t* const*)P.d_fr, (const uint64_t* const*)P.d_fp, P.d_mod, sizeQ, n, 0);
-    LaunchNTT_CT_Batched(d_e1, (const uint64_t* const*)P.d_fr, (const uint64_t* const*)P.d_fp, P.d_mod, sizeQ, n, 0);
-    LaunchNTT_CT_Batched(d_m, (const uint64_t* const*)P.d_fr, (const uint64_t* const*)P.d_fp, P.d_mod, sizeQ, n, 0);
+    // GOD PROMPT "CKKS PHASE 34": ONE call over the whole packed buffer
+    // (towers=4*sizeQ) replaces what was four separate per-buffer calls
+    // (Phase 15's v/e0/e1/m offsets, each towers=sizeQ) -- was 20 total
+    // kernel launches (4 calls x ~5 internal stage launches each), now
+    // 5. See the pool struct's own comment above for why this is exact,
+    // not an approximation.
+    LaunchNTT_CT_Batched(P.d_packed, (const uint64_t* const*)P.d_fr, (const uint64_t* const*)P.d_fp, P.d_mod, 4 * sizeQ, n, 0);
     cudaDeviceSynchronize();
 
     // ONE download of the whole packed region (was 4 separate calls).
