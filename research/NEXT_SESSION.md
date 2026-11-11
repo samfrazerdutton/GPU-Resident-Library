@@ -3,6 +3,110 @@
 ## Current commit
 
 Check `git log -8 --oneline` on resume. As of this writing HEAD should be
+the Phase 34 commit(s), on top of Phase 33's `f95eb74` (verified matching
+`origin/main` exactly, 0 ahead/0 behind, at Phase 34 start). Hardware
+re-confirmed unchanged: RTX 2060 Max-Q, 6144 MiB, driver 595.97, CUDA
+13.2, cmake 3.28.3, Rust/cargo 1.94.0. Windows free RAM fluctuated
+2.08-5.14 GiB across this session (competing desktop load, not this
+phase's own commands).
+
+**Both n=131072 tests Phase 33 deferred are now closed, genuinely
+passing, not just attempted**: `test_n131072_keysize` (peak RSS 1314 MB,
+matches history exactly) and `test_n131072_cache_churn` (peak RSS
+3232-3233 MB, matches history's documented plateau exactly). Phase 33's
+own "same memory-gate class as `test_boot_n131072` (6 GiB)" characterization
+was corrected this round: each test has its own much smaller,
+already-measured requirement (~1.3 GB and ~3.2 GB respectively,
+documented in `research/MEMORY_FEASIBILITY.md` and
+`research/EXPERIMENT_LEDGER.md` entry #22) — both ran successfully well
+below the blanket 6 GiB figure that actually applies only to the full
+bootstrap scenario.
+
+**Regression, re-run before and after this round's production change**:
+C++ `ctest` (excluding the 5 always-excluded full-bootstrap tests):
+**115/125 passing both times**, the exact same 10 pre-existing
+documented failures as every prior phase, zero new regressions — this
+count now includes BOTH n=131072 tests as passing members, not
+exclusions. Rust: 62 passed/0 failed/1 ignored, both debug-serial and
+release-parallel, unchanged before and after.
+
+**Performance: the historical bottleneck (encrypt, ~86% of end-to-end)
+was re-verified still current (86.3-86.4% fresh, vs. 86.9% historical —
+within noise), then genuinely reduced by ~1.1x end-to-end with a real,
+evidence-backed, bit-exact-preserving experiment.** Three new standalone,
+non-invasive probes (zero production code touched for the measurement
+itself) decomposed WHY encrypt dominates, fresh: CPU-side work
+(RNG+Barrett-embed+Shoup-combine) is now only 1.2-2.5% of one encrypt
+call (Phases 13/14's optimizations fully succeeded); the remaining
+97.5-98.8% is GPU-side transfer+kernel. Reading `kernels/ntt_ct.cu`
+directly found `LaunchNTT_CT_Batched` issues ~5 internal kernel launches
+per call, and production calls it 4 separate times (v/e0/e1/m) = 20
+total launches/encrypt-call. Verified (bit-exact, 0/131072 limbs differ)
+that merging those 4 calls into 1 (towers=4*sizeQ, exact reorganization
+of identical work, not an approximation) is valid, then measured its
+real impact with a properly INTERLEAVED A/B (a non-interleaved first
+attempt gave wildly inconsistent 2.3x-5.5x readings across repeated
+runs — tracked to this laptop GPU's clock ramp-up/down behavior over
+millisecond-scale kernels, a real methodology lesson, not a flaw in the
+underlying effect) — stable, reproducible **~1.2x** on the transfer+kernel
+portion (1.206x, 1.240x across two runs).
+
+**Implemented in production** (`src/encrypt_host_shoup_pooled_barrett_batched.cpp`):
+the pool's per-tower tables are now 4*sizeQ-length (repeating the real
+sizeQ tables 4 times, built ONCE per (n,sizeQ) pool entry — zero new
+per-call host work), and the hot path issues 1 merged
+`LaunchNTT_CT_Batched` call instead of 4. All 4 directly-relevant
+existing tests (2 correctness, 2 concurrency-audit) re-run immediately
+after and PASSED completely (832 total checks, 0 mismatches) before
+anything else proceeded. Real end-to-end re-measurement (not an
+extrapolation): `bench_aggregation_decomposed` encrypt-stage median
+83.76-84.61ms → 75.05-75.64ms (~1.11-1.13x), end-to-end median
+97.05-97.91ms → 87.84-88.82ms (~1.09-1.12x); `bench_private_aggregation_workload`
+mean 98.97ms → 91.13ms (~1.086x), correctness (`worst abs err`)
+identical. Full regression re-confirmed clean after the change (same
+115/125, same Rust 62/0/1).
+
+**`DeviceBuffer<T>` (Part 6)**: not reopened — no new genuine second
+caller was found or sought; the kernel-merge change touches only table
+shape/launch-count inside `EncryptBufPoolBatched`, a type Phase 33
+already found unsuitable for migration without a redesign.
+
+**Left genuinely uncommitted and out of scope** (carried forward
+unchanged): `graphify-out/GRAPH_REPORT.md`/`graph.json`, `.claude/agents/`,
+`.claude/skills/scrum-orchestrator/`, `.scrum-orchestrator/`,
+`tools/__pycache__/`.
+
+## Immediate next actions, in order (Phase 34 handoff)
+
+1. **Encode is now, in relative terms, a larger share of end-to-end**
+   (~12% of the new, smaller total, up from ~11% before this round's
+   encrypt win) — purely because encrypt shrank, not because encode
+   itself changed. It remains a pure-CPU FFT stage
+   (`encode_host_fft`/`decode_host_fft`, confirmed zero CUDA calls) —
+   if performance work continues on this exact workload, encode is the
+   next largest single stage after encrypt, and has not been
+   re-profiled since Phase 11/28's own work.
+2. **The non-interleaved-vs-interleaved GPU clock-drift lesson** (this
+   round's section 6) should be written up as a reusable methodology
+   note if another sub-millisecond GPU micro-benchmark is ever built on
+   this hardware — right now it exists only inside
+   `research/PHASE34_PERFORMANCE_INVESTIGATION.md`, not anywhere more
+   general.
+3. **Run `tests/test_boot.cpp` the moment the 10 GiB memory gate
+   clears** — now SEVEN phases running without this verification; this
+   round's own gate checks never saw free RAM above 5.14 GiB.
+4. **Re-run the 4 standalone probes this round left in
+   `research/benchmarks/`** (`bench_encrypt_cpu_gpu_split.cpp`,
+   `bench_transfer_only.cpp`, `bench_ntt_merge_experiment.cpp`,
+   `bench_full_sequence_v2.cpp` — all genuinely standalone, not wired
+   into `CMakeLists.txt`, zero risk to the main build) if revisiting the
+   encrypt path again, rather than re-deriving the CPU/GPU split or
+   transfer-floor numbers from scratch.
+5. Re-run the Windows free-RAM gate check before any of the above.
+
+## Earlier commit (Phase 33)
+
+Check `git log -8 --oneline` on resume. As of this writing HEAD should be
 the Phase 33 commit(s), on top of Phase 32's `f6ab541` (verified matching
 `origin/main` exactly, 0 ahead/0 behind, at Phase 33 start). Hardware
 re-confirmed unchanged: RTX 2060 Max-Q, 6144 MiB, driver 595.97, CUDA
