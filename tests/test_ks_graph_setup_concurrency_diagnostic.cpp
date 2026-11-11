@@ -1,21 +1,60 @@
-// GOD PROMPT "CKKS PHASE 30", Objective F: NOT a regular regression test --
-// deliberately NOT registered with ctest (same convention as
-// tests/test_boot_hoist_enabled.cpp: build/run explicitly). This is the
-// standalone reproducer for a REAL, SEPARATE concurrency issue found while
-// testing the keyswitch_resident CUDA-graph fix (tests/test_ks_graph.cpp,
-// now fixed -- see research/KS_GRAPH_CAPTURE_INVESTIGATION.md): when many
-// threads simultaneously build FRESH (cold-cache) KeySwitchConstants from
-// scratch, DIRECT (non-graph) execution can already disagree with itself
-// across two back-to-back calls on the SAME thread -- proving this race is
-// in the key-generation/context-setup pipeline, not in keyswitch_resident or
-// its graph-capture path. Two caches in this exact class (src/
-// keyswitch_resident.cpp's g_rtab/upc, src/evalkeygen.cpp's ek_dev_tab) were
-// found and fixed (mutex-guarded) during this investigation; this probe still
-// shows a residual, not-yet-isolated race beyond those two, reported here as
-// a diagnostic, not asserted as a required pass -- a precise, reproducible
-// starting point for a dedicated future investigation, per the governing
-// directive's explicit instruction not to let this phase become an open-ended
-// concurrency audit of the entire keygen pipeline.
+// GOD PROMPT "CKKS PHASE 30/31": originally a non-ctest diagnostic for a
+// seemingly separate "setup/keygen-path" concurrency race, surfaced while
+// testing the keyswitch_resident CUDA-graph fix (tests/test_ks_graph.cpp --
+// see research/KS_GRAPH_CAPTURE_INVESTIGATION.md). Phase 31 root-caused it:
+// there is NO race in keygen_host/evalkeygen_host/ks_context_create. Both
+// symptoms this file used to show were artifacts of this file's OWN
+// multi-threaded use of CUDA stream capture, not a defect in gpufhe:
+//
+//   1. "DIRECT-ONLY mismatch vs itself" (non-captured keyswitch_resident
+//      disagreeing with itself on the SAME thread) was caused by ANOTHER
+//      thread's cudaStreamBeginCapture(..., cudaStreamCaptureModeGlobal)
+//      (on a plain blocking stream). Global capture mode's documented
+//      semantics treat ALL stream activity in the WHOLE PROCESS as
+//      relevant to that capture; concurrent direct (non-captured) use of
+//      the shared legacy stream 0 by OTHER threads then fails with
+//      cudaErrorStreamCaptureUnsupported / cudaErrorStreamCaptureImplicit.
+//      This file never checked CUDA return codes, so the failure was
+//      silent: the destination buffer simply kept its pre-existing
+//      content, which reads exactly like a key-generation data race but
+//      isn't one. Fix: cudaStreamCaptureModeThreadLocal + a non-blocking
+//      capture stream (cudaStreamCreateWithFlags(..., cudaStreamNonBlocking)).
+//
+//   2. "GRAPH mismatch despite self-consistent direct ref" persisted even
+//      after fix (1), via a SECOND, independent mechanism: cudaMalloc/
+//      cudaFree (including the ones inside ks_context_create/ks_work_create/
+//      ks_context_destroy/ks_work_destroy, and this file's own b0/b1/d_a)
+//      are "potentially unsafe" CUDA APIs whose restriction during stream
+//      capture is NOT fully scoped away by ThreadLocal capture mode -- it
+//      is a platform-level restriction independent of capture mode.
+//      Another thread's cudaMalloc/cudaFree landing inside THIS thread's
+//      capture window produces cudaErrorStreamCaptureInvalidated, which
+//      cascades through cudaStreamEndCapture/cudaGraphInstantiate/
+//      cudaGraphLaunch as "invalid argument" -- again silent, again
+//      reading like a real-work regression. Fix: two spin-barriers so no
+//      thread's allocate/free calls can execute while ANY other thread has
+//      an active capture in progress.
+//
+// Evidence for both: see research/SETUP_PATH_CONCURRENCY_INVESTIGATION.md
+// (bisected every setup-pipeline stage for self-consistency under the same
+// 8-way load -- all clean; cross-thread-compared native_primes/native_root
+// -- clean; a gpufhe-independent pure-CUDA malloc/free churn probe against
+// a stable buffer -- clean; then used compute-sanitizer plus explicit
+// cudaError_t capture around every call in the capture/instantiate/launch
+// sequence to catch the exact two silently-failing CUDA API calls above).
+// With both fixes applied, this file is now deterministic: 25/25 plain
+// runs and 3/3 compute-sanitizer --tool memcheck runs, 8/8 threads clean
+// every time (was previously 3-8/8 direct-self-consistent and 4-8/8
+// graph-matches, nondeterministic run to run). Promoted to a real,
+// ctest-registered regression test; no changes were needed to keygen_host,
+// evalkeygen_host, ks_context_create, ks_work_create, or keyswitch_resident
+// -- the entire fix is in how THIS FILE uses the CUDA stream-capture API,
+// which is also the real-world usage contract: any caller that captures
+// keyswitch_resident from multiple concurrent host threads must use
+// cudaStreamCaptureModeThreadLocal with a non-blocking stream, and must not
+// allocate/free device memory (directly, or via ks_context_create/
+// ks_work_create/ks_context_destroy/ks_work_destroy) on any thread while
+// another thread has an active capture in progress.
 #include "keyswitch.h"
 #include "keyswitch_resident.h"
 #include "keygen.h"
@@ -91,32 +130,30 @@ static uint32_t countDiff(const std::vector<uint64_t>&a,const std::vector<uint64
 
 int main(){
     const uint32_t n=1024, tw=4;
-    std::cout<<"=== Phase 30: keyswitch_resident SETUP-PATH concurrency diagnostic (known, separate, unresolved issue) ===\n";
+    std::cout<<"=== Phase 31: keyswitch_resident setup-path + multi-threaded graph-capture concurrency (fixed, deterministic) ===\n";
     // --- Concurrency: independent (C,W) pairs from independent THREADS ---
-    // GOD PROMPT "CKKS PHASE 30", Objective F: this probe found a REAL,
-    // SEPARATE concurrency issue beyond the CUDA-graph-capture defect this
-    // phase was asked to fix -- see the printed diagnostics and research/
-    // KS_GRAPH_CAPTURE_INVESTIGATION.md's "known limitation" section for the
-    // full story. Summary: when many threads simultaneously build FRESH
-    // (cold-cache) KeySwitchConstants/contexts from scratch, DIRECT (non-
-    // graph) execution can ALREADY disagree with itself across two
-    // back-to-back calls on the SAME thread -- proving the remaining race
-    // is in the key-generation/context-setup pipeline, not in
-    // keyswitch_resident or its graph-capture path (which this phase DID
-    // fix and verify). Two caches in this exact class (src/
-    // keyswitch_resident.cpp's g_rtab/upc, src/evalkeygen.cpp's ek_dev_tab)
-    // were found and fixed with a mutex during this investigation; a
-    // further, not-yet-isolated source remains. Per the governing
-    // directive's explicit instruction not to let this phase become an
-    // unrelated, open-ended concurrency audit of the entire keygen
-    // pipeline, this is reported as a DIAGNOSTIC (not asserted as a
-    // required pass) and handed off as a precisely-reproducible, separate
-    // investigation for a future phase.
+    // See file header: both symptoms this test used to show (direct-path
+    // self-mismatch; graph-path mismatch vs. a self-consistent direct ref)
+    // were CUDA stream-capture API misuse in this file, not a gpufhe data
+    // race. Fixed here via (1) cudaStreamCaptureModeThreadLocal + a
+    // non-blocking capture stream, and (2) barriers keeping every thread's
+    // cudaMalloc/cudaFree (direct and via ks_context_create/ks_work_create/
+    // ks_context_destroy/ks_work_destroy) out of every OTHER thread's
+    // active capture window. Every CUDA call in the capture/instantiate/
+    // launch sequence is now explicitly checked; any regression here must
+    // fail loudly instead of silently returning stale buffer content.
     {
         std::cout<<"\n-- Concurrency: independent context+work pairs, real std::thread (never fork()) --\n";
-        std::cout<<"   (diagnostic only -- see comment above and research/KS_GRAPH_CAPTURE_INVESTIGATION.md)\n";
         const int NTHREADS=8;
         std::atomic<int> directSelfConsistent{0}, graphMatchesWhenDirectWas{0};
+        // Spin-barriers enforcing the usage contract documented above: no
+        // thread may allocate/free device memory while another thread has
+        // an active stream capture in progress (cudaMalloc/cudaFree are
+        // "potentially unsafe" CUDA APIs whose capture restriction is NOT
+        // scoped away by ThreadLocal capture mode -- see file header).
+        std::atomic<int> allocBarrier{0}, freeBarrier{0};
+        auto spinBarrier=[&](std::atomic<int>& b){ b.fetch_add(1); while(b.load()<NTHREADS) std::this_thread::yield(); };
+        std::atomic<int> cudaErrors{0};
         std::vector<std::thread> threads;
         for(int t=0;t<NTHREADS;++t){
             threads.emplace_back([&,t](){
@@ -128,24 +165,33 @@ int main(){
                 std::vector<uint64_t> ref0,ref1; runDirect(F,C,W,d_a,ref0,ref1);
                 std::vector<uint64_t> ref0b,ref1b; runDirect(F,C,W,d_a,ref0b,ref1b);
                 uint32_t directSelfDiff = countDiff(ref0,ref0b)+countDiff(ref1,ref1b);
-                if (directSelfDiff) std::printf("  [thread %d] DIRECT-ONLY mismatch vs itself: %u diffs (setup/keygen-path race, separate from the graph-capture fix)\n", t, directSelfDiff);
+                if (directSelfDiff) std::printf("  [thread %d] DIRECT-ONLY mismatch vs itself: %u diffs (unexpected -- would be a real regression)\n", t, directSelfDiff);
                 else directSelfConsistent.fetch_add(1);
 
                 uint64_t *b0,*b1; cudaMalloc(&b0,(size_t)tw*n*8); cudaMalloc(&b1,(size_t)tw*n*8);
-                cudaStream_t s; cudaStreamCreate(&s);
+                cudaStream_t s; cudaStreamCreateWithFlags(&s,cudaStreamNonBlocking);
                 cudaGraph_t g; cudaGraphExec_t ge;
-                cudaStreamBeginCapture(s,cudaStreamCaptureModeGlobal);
+                spinBarrier(allocBarrier); // no thread begins capture until ALL threads' setup-time allocs are done
+                cudaError_t e1=cudaStreamBeginCapture(s,cudaStreamCaptureModeThreadLocal);
                 gpufhe::keyswitch_resident(d_a,b0,b1,C,W,s);
-                cudaStreamEndCapture(s,&g);
-                cudaGraphInstantiate(&ge,g,nullptr,nullptr,0);
-                cudaGraphLaunch(ge,s); cudaStreamSynchronize(s);
+                cudaError_t e2=cudaStreamEndCapture(s,&g);
+                cudaError_t e3=cudaGraphInstantiate(&ge,g,nullptr,nullptr,0);
+                cudaError_t e4=cudaGraphLaunch(ge,s);
+                cudaError_t e5=cudaStreamSynchronize(s);
                 std::vector<uint64_t> o0((size_t)tw*n),o1((size_t)tw*n);
-                cudaMemcpy(o0.data(),b0,o0.size()*8,cudaMemcpyDeviceToHost);
-                cudaMemcpy(o1.data(),b1,o1.size()*8,cudaMemcpyDeviceToHost);
+                cudaError_t e6=cudaMemcpy(o0.data(),b0,o0.size()*8,cudaMemcpyDeviceToHost);
+                cudaError_t e7=cudaMemcpy(o1.data(),b1,o1.size()*8,cudaMemcpyDeviceToHost);
+                if (e1||e2||e3||e4||e5||e6||e7) {
+                    cudaErrors.fetch_add(1);
+                    std::printf("  [thread %d] CUDA error in capture/launch sequence: begin=%s end=%s inst=%s launch=%s sync=%s cpy0=%s cpy1=%s\n", t,
+                        cudaGetErrorString(e1), cudaGetErrorString(e2), cudaGetErrorString(e3),
+                        cudaGetErrorString(e4), cudaGetErrorString(e5), cudaGetErrorString(e6), cudaGetErrorString(e7));
+                }
                 uint32_t graphDiff = countDiff(ref0b,o0)+countDiff(ref1b,o1);
                 if (!directSelfDiff) { if (!graphDiff) graphMatchesWhenDirectWas.fetch_add(1);
-                                       else std::printf("  [thread %d] GRAPH mismatch despite self-consistent direct ref: %u diffs (a graph-path regression, would be a real finding)\n", t, graphDiff); }
+                                       else std::printf("  [thread %d] GRAPH mismatch despite self-consistent direct ref: %u diffs (unexpected -- would be a real regression)\n", t, graphDiff); }
 
+                spinBarrier(freeBarrier); // no thread frees/destroys until ALL threads finished their own capture+launch+readback
                 cudaGraphExecDestroy(ge); cudaGraphDestroy(g); cudaStreamDestroy(s);
                 gpufhe::ks_work_destroy(W); gpufhe::ks_context_destroy(C);
                 cudaFree(d_a); cudaFree(b0); cudaFree(b1);
@@ -154,12 +200,15 @@ int main(){
         for(auto& th:threads) th.join();
         std::cout<<"   direct-only self-consistent: "<<directSelfConsistent.load()<<"/"<<NTHREADS
                  <<"  (of those, graph also matched: "<<graphMatchesWhenDirectWas.load()<<"/"<<directSelfConsistent.load()<<")\n";
+        check(cudaErrors.load()==0, "no CUDA API errors in the multi-threaded capture/instantiate/launch sequence");
+        check(directSelfConsistent.load()==NTHREADS,
+              "setup path: direct (non-captured) keyswitch_resident is self-consistent on every thread ("
+              + std::to_string(directSelfConsistent.load()) + "/" + std::to_string(NTHREADS) + ")");
         check(graphMatchesWhenDirectWas.load()==directSelfConsistent.load(),
               "concurrency: whenever direct execution was self-consistent, the graph path ALSO matched it "
-              "(" + std::to_string(graphMatchesWhenDirectWas.load()) + "/" + std::to_string(directSelfConsistent.load()) +
-              ") -- this is what this phase's fix covers; the separate setup-path race above is NOT");
+              "(" + std::to_string(graphMatchesWhenDirectWas.load()) + "/" + std::to_string(directSelfConsistent.load()) + ")");
     }
 
-    std::cout<<"\n=== TOTAL: "<<g_pass<<" passed, "<<g_fail<<" failed (diagnostic -- see file header) ===\n";
-    return 0;
+    std::cout<<"\n=== TOTAL: "<<g_pass<<" passed, "<<g_fail<<" failed ===\n";
+    return g_fail==0 ? 0 : 1;
 }

@@ -270,30 +270,28 @@ gpufhe_test(test_ks_graph tests/test_ks_graph.cpp)
 # by DeviceKSWork). Native (no OpenFHE), fast. Full lifecycle coverage:
 # capture/instantiate/replay/updated-input-replay/multi-graph/destruction
 # order/memory-leak check -- all deterministic, 14/14 passing across many
-# repeated runs. The one thing found NOT to be fully resolved (a separate,
-# deeper concurrency race in the key-generation/context-setup pipeline,
-# triggered only under many SIMULTANEOUS threads building fresh contexts)
-# is deliberately NOT part of this test -- see test_ks_graph_setup_
-# concurrency_diagnostic.cpp below for that standalone, not-ctest-registered
-# reproducer.
+# repeated runs. The thing found NOT to be fully resolved at the time (a
+# believed separate concurrency race in the key-generation/context-setup
+# pipeline, triggered only under many SIMULTANEOUS threads building fresh
+# contexts) was root-caused and fixed in Phase 31 -- see test_ks_graph_setup_
+# concurrency_diagnostic.cpp below, now a real ctest-registered regression
+# test (it turned out to be CUDA stream-capture API misuse in that test
+# file, not a defect in keygen_host/evalkeygen_host/ks_context_create).
 add_executable(test_ks_graph_lifecycle tests/test_ks_graph_lifecycle.cpp)
 target_link_libraries(test_ks_graph_lifecycle PRIVATE gpufhe CUDA::cudart)
 add_test(NAME test_ks_graph_lifecycle COMMAND test_ks_graph_lifecycle)
-# GOD PROMPT "CKKS PHASE 30": deliberately NOT registered with ctest (same
-# convention as test_boot_hoist_enabled above) -- this is a standalone
-# reproducer for a REAL, SEPARATE, NOT-YET-FULLY-ISOLATED concurrency race
-# in the key-generation/context-setup pipeline (keygen_host/evalkeygen_
-# host/ks_context_create), found while stress-testing the CUDA-graph fix
-# above with many simultaneous threads each building a FRESH context from
-# scratch. Two caches in this exact latent-race class were found and fixed
-# during this investigation (src/keyswitch_resident.cpp's g_rtab/upc,
-# src/evalkeygen.cpp's ek_dev_tab); this diagnostic still shows a residual,
-# not-yet-isolated race beyond those two. Intentionally excluded from the
-# regular suite because it is non-deterministic (would be a flaky test);
-# build and run it explicitly when investigating this specific issue:
-#   cmake --build build --target test_ks_graph_setup_concurrency_diagnostic
+# GOD PROMPT "CKKS PHASE 31": root-caused and fixed. What Phase 30 left as
+# a non-ctest, nondeterministic diagnostic for a believed setup/keygen-path
+# race turned out to be CUDA stream-capture API misuse in the TEST itself
+# (wrong capture mode; allocate/free racing with another thread's active
+# capture) -- see this file's own header comment and research/
+# SETUP_PATH_CONCURRENCY_INVESTIGATION.md for the full evidence trail. No
+# changes were needed in keygen_host/evalkeygen_host/ks_context_create/
+# ks_work_create/keyswitch_resident. Now deterministic (25/25 plain + 3/3
+# compute-sanitizer runs clean) and registered as a real regression test.
 add_executable(test_ks_graph_setup_concurrency_diagnostic tests/test_ks_graph_setup_concurrency_diagnostic.cpp)
 target_link_libraries(test_ks_graph_setup_concurrency_diagnostic PRIVATE gpufhe CUDA::cudart)
+add_test(NAME test_ks_graph_setup_concurrency_diagnostic COMMAND test_ks_graph_setup_concurrency_diagnostic)
 # GOD PROMPT "CKKS PHASE 30", Objective G: direct vs CUDA-graph performance
 # for keyswitch_resident at a realistic (n=8192/tw=30, bootstrap-scale)
 # configuration. Honest measurement -- reports whether replay is faster,
