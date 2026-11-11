@@ -3,6 +3,142 @@
 ## Current commit
 
 Check `git log -8 --oneline` on resume. As of this writing HEAD should be
+the Phase 33 commit(s), on top of Phase 32's `f6ab541` (verified matching
+`origin/main` exactly, 0 ahead/0 behind, at Phase 33 start). Hardware
+re-confirmed unchanged: RTX 2060 Max-Q, 6144 MiB, driver 595.97, CUDA
+13.2, Rust/cargo 1.94.0.
+
+**All four caches Phase 32 flagged as unguarded are now resolved** — not
+with a blind mutex sweep, but with real reachability tracing, real
+mechanism-level proof via ThreadSanitizer, and a real before/after
+performance measurement. `research/PHASE33_CACHE_CONCURRENCY_AUDIT.md`
+has the full evidence trail; summary:
+
+**Inventory**: Phase 32's "4 of 13 unguarded" was 4 FILES, 5 cache
+INSTANCES (`src/rotate.cpp` has two). All 5 traced to their real callers
+this round, not assumed: `rotate.cpp`'s `dev_tab()` (host-orchestrated
+automorphism path) and `autoPermMap()` (resident-fast automorphism path)
+are both reachable via `tests/test_rotate_concurrent_cache.cpp`'s
+existing Phases D and B respectively (9 real concurrent threads each,
+with genuine identical-key collisions for `autoPermMap` since the
+fixture's rotation amount is fixed across each 3-thread group).
+`keyswitch.cpp`'s `dev_tab()` (inside `keyswitch_core_resident` — a
+DIFFERENT function from the already-fixed `keyswitch_resident.cpp`;
+an initial hypothesis that `rotate_ct_resident` reaches it was checked
+directly against the function body and found FALSE) is reachable via
+the same test's Phase D AND via the Rust FFI bridge's
+`gpufhe_ks_fixture_run_reference` oracle. `encdec.cpp`'s `enc_dev_tab()`
+is reachable via `tests/test_encrypt_host_shoup_pooled_thread_safety.cpp`'s
+own concurrent reference computation (8 threads, same key, incidental
+but real). `encrypt_host_shoup.cpp`'s `enc_dev_tab_shoup()` had NO
+existing concurrent reproducer at all — the one genuine gap, closed with
+a new test this round.
+
+**Mechanism proof**: ThreadSanitizer cannot run directly against this
+project's CUDA-linked binaries in this WSL2 environment (`FATAL:
+ThreadSanitizer: unexpected memory mapping`, reproduced even against a
+trivial CUDA-free program under default ASLR — resolved with `setarch
+$(uname -m) -R` for the one invocation, a documented TSan/high-entropy-
+ASLR interaction on modern kernels, not a system config change). A
+faithful, CUDA-free extraction of the exact `find()`-then-`emplace()`
+pattern, stressed with the identical 9-thread/3-colliding-key-groups
+shape as the real test, produced **confirmed ThreadSanitizer data
+races** in `std::map`'s internal `_Rb_tree` (concurrent `find()` vs.
+`emplace()`-driven tree rebalancing, and a heap-allocation race). The
+identical reproducer with only a mutex added: zero races. This is real
+proof the pattern is unsafe and real proof the fix resolves it — not a
+theoretical C++-memory-model argument.
+
+**Fix**: the established, already-proven-low-risk pattern from Phases
+28/30 (one `std::mutex` per file, `std::lock_guard` around the whole
+find+build+emplace+return sequence) applied to all 5 instances across
+`src/rotate.cpp`, `src/keyswitch.cpp`, `src/encrypt_host_shoup.cpp`,
+`src/encdec.cpp`. Zero lines of existing cache-building logic altered.
+**13/13 process-lifetime caches in this codebase are now mutex-guarded**
+(up from 9/13).
+
+**New regression test**: `tests/test_encrypt_host_shoup_concurrency.cpp`
+(8 threads x 8 iters, same-seed same-key double-call agreement check) —
+closes `encrypt_host_shoup.cpp`'s previously-nonexistent coverage.
+Registered with `ctest`.
+
+**Performance**: real `git stash`-based before/after A/B (not assumed) —
+`bench_evalmult`, `bench_hoist_ab`, `bench_encrypt_shoup_vs_reference`,
+3 runs each, before and after. No systematic difference in either
+direction; both sit inside this machine's own already-documented ~30%
+run-to-run spread.
+
+**`DeviceBuffer<T>` second-caller evaluation**: audited for a genuine
+production migration candidate. None of the five just-fixed caches'
+value types (`DevTab`, `EncDevTab` — each holding MULTIPLE distinct
+device pointers per entry) fit `DeviceBuffer<T>`'s current
+single-pointer/single-type-array shape without a non-trivial redesign;
+`DeviceCiphertext` remains narrower-contracted (synchronous-only,
+fixed two-array role) and migrating it would risk a proven-correct type
+for no measurable benefit. **Deferred, by evidence, not oversight** —
+the missing capability (a documented multi-buffer-per-cache-entry
+convention) is named in
+`research/PHASE33_CACHE_CONCURRENCY_AUDIT.md` section 7.
+
+**Regression (re-run fresh this round)**: C++ `ctest` (same memory-gate
+exclusions since Phase 28): **115/125 passing**, the exact same 10
+pre-existing documented failures as Phase 32's baseline
+(`test_evalkeygen_isolated`, `test_keyswitch_stage_trace`,
+`test_polyeval`, `test_stage2`, `test_boot_multi_input_small`, and the
+five `test_rescale_*_n1024*` family), zero new regressions, plus the new
+`test_encrypt_host_shoup_concurrency` passing. Run in 5 smaller batches
+rather than one monolithic invocation: the Windows host's free RAM was
+unusually tight this round (2.2-5.1 GiB across the session, likely
+competing desktop load on the user's machine, not caused by this
+phase's own commands — confirmed via `Get-Process`: Opera, Spotify, and
+Memory Compression were the largest consumers alongside `vmmemWSL`), and
+three single-invocation full-suite attempts were killed by the harness's
+own low-memory guard before completing. Splitting into ~20-45-test
+batches let each individual `ctest` invocation finish before the next
+spike. **Two tests were honestly deferred, not run and not claimed
+passing or failing**: `test_n131072_keysize` and
+`test_n131072_cache_churn` are n=131072-scale tests that fall under this
+project's own established 6 GiB memory gate (same class as
+`test_boot_n131072`); measured free RAM when attempting them was 4.84-5.1
+GiB, below that gate. Both passed cleanly in Phase 31/32's runs when
+memory was sufficient, and neither is touched by this phase's changes
+(no cache fixed this round sits on their call path) — re-run them the
+moment the gate clears, before claiming the suite complete. Rust
+(debug-serial, release-parallel): **62 passed, 0 failed, 1 ignored**,
+both modes, identical to the established baseline since Phase 25.
+
+**Left genuinely uncommitted and out of this round's scope** (carried
+forward unchanged): `graphify-out/GRAPH_REPORT.md`/`graph.json`,
+`.claude/agents/`, `.claude/skills/scrum-orchestrator/`,
+`.scrum-orchestrator/`, `tools/__pycache__/`. This round's `build_tsan/`
+directory (the ThreadSanitizer build tree used for the standalone
+reproducer in section 3) was removed after its evidence was captured —
+a local build artifact, never staged, not needed going forward.
+
+## Immediate next actions, in order (Phase 33 handoff)
+
+1. **Re-run `test_n131072_keysize` and `test_n131072_cache_churn`** the
+   moment Windows free RAM clears the established 6 GiB gate — deferred
+   this round due to a live, momentary host memory constraint (section
+   above), not run, not claimed passing or failing. Both passed cleanly
+   last time memory was sufficient (Phase 31/32) and neither is on this
+   round's changed call path, but re-verify rather than assume.
+2. **`DeviceBuffer<T>`'s multi-buffer-per-entry gap** (section 7 of
+   `research/PHASE33_CACHE_CONCURRENCY_AUDIT.md`): design a documented
+   convention (small fixed-size array of `DeviceBuffer<T>` members, or a
+   `DeviceBufferGroup` type) before attempting any of these 5 caches'
+   `DevTab`/`EncDevTab` value types as a migration target.
+3. **Re-run `tests/test_boot.cpp` the moment the memory gate clears** —
+   now SIX phases running without this verification.
+4. **The generic synchronized-cache-template follow-up** (de-prioritized
+   this round, since the actual safety gap is closed): revisit only if a
+   14th cache of this exact shape gets added and the duplication becomes
+   a real maintenance cost.
+5. Re-run the Windows free-RAM gate check before any of the above.
+
+## Earlier commit (Phase 32)
+
+Check `git log -8 --oneline` on resume. As of this writing HEAD should be
 the Phase 32 commit(s), on top of Phase 31's `42944c7` (verified matching
 `origin/main` exactly, 0 ahead/0 behind, at Phase 32 start). Hardware
 re-confirmed unchanged: RTX 2060 Max-Q, 6144 MiB, driver 595.97, CUDA

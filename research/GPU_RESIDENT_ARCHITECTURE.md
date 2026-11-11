@@ -75,6 +75,23 @@ operation-specific patterns, each reinvented by hand:
   actually calls," implying `encrypt_host_shoup.cpp`/`encdec.cpp` are
   not on the hot production path), but this was not independently
   re-verified this round and should not be assumed safe.
+  **Update (Phase 33): all 13/13 are now mutex-guarded.** The remaining
+  four were independently re-traced (not assumed): `rotate.cpp`'s two
+  caches and `keyswitch.cpp`'s are reachable via real, already-existing
+  concurrent test paths (`tests/test_rotate_concurrent_cache.cpp`'s
+  Phases B/D) plus, for `keyswitch.cpp`'s cache specifically, the Rust
+  FFI bridge's `gpufhe_ks_fixture_run_reference`; `encdec.cpp`'s is
+  reachable via `tests/test_encrypt_host_shoup_pooled_thread_safety.cpp`'s
+  own concurrent reference computation; `encrypt_host_shoup.cpp`'s had
+  no prior concurrent reproducer and got a new one
+  (`tests/test_encrypt_host_shoup_concurrency.cpp`). The exact
+  find()-then-emplace() pattern was proven racing by ThreadSanitizer
+  (a faithful, CUDA-free standalone extraction, since TSan cannot run
+  directly against this project's CUDA-linked binaries in this
+  environment) and proven fixed by the identical mutex pattern already
+  used for the other 9. Zero measurable performance impact (real
+  before/after A/B, not assumed). Full evidence:
+  `research/PHASE33_CACHE_CONCURRENCY_AUDIT.md`.
 - **Raw, unwrapped CUDA elsewhere**: 89 `cudaMalloc`, 40 `cudaFree`, 103
   synchronous `cudaMemcpy`, and 53 `cudaMemcpyAsync` call sites across
   `src/`+`include/` (counts from this round's own grep), the large
@@ -106,7 +123,7 @@ operation-specific patterns, each reinvented by hand:
 | `DeviceKSWork`'s 12 owned pointers | the work object | work-object lifetime | per-object single-thread |
 | `KsResidentCache` entries | the cache object | LRU-evicted or cache destruction | single-thread enforced by `abort()` on violation; not integrated anywhere |
 | `RegisteredHostBuffer` | the buffer object | object lifetime, stream-aware release | single-owner; move-only |
-| most `encrypt_host_*`/`encode_fft`/`evalkeygen` static caches | the cache itself (process-lifetime) | process lifetime | 9/13 mutex-guarded, 4/13 unguarded (see above) |
+| most `encrypt_host_*`/`encode_fft`/`evalkeygen` static caches | the cache itself (process-lifetime) | process lifetime | 13/13 mutex-guarded as of Phase 33 (see above) |
 
 **No object in this codebase currently represents "the application's
 handle to a unit of GPU work" in a reusable, cross-feature way.** Each
@@ -296,11 +313,13 @@ justified by a second real use case):
 - Generalizing CUDA graph capture into a reusable facility: only one
   operation uses it; a second real caller should come first.
 - A generic synchronized-cache template to replace the 13 hand-rolled
-  `static std::map` caches: real pain (4/13 unguarded), but rewriting 13
-  existing, mostly-working call sites is a larger, riskier change than
-  this phase's budget justifies without a dedicated investigation —
-  flagged here as the single highest-value **follow-up**, not undertaken
-  now.
+  `static std::map` caches: Phase 33 closed the actual safety gap (all
+  13/13 now individually mutex-guarded, proven by ThreadSanitizer, not
+  assumed) without this generalization — rewriting 13 existing,
+  mostly-working call sites into a shared template remains a larger,
+  riskier change than either phase's budget justified, and is no longer
+  blocking on a correctness gap, only a maintainability one. Still a
+  reasonable future follow-up, now lower priority.
 
 ## 10. Migration strategy
 
