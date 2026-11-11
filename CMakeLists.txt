@@ -68,6 +68,7 @@ add_library(gpufhe STATIC
   kernels/automorph.cu
   kernels/automorph_eval.cu
   kernels/stage_acc.cu
+  kernels/finance_resident.cu
 )
 find_package(CUDAToolkit REQUIRED)
 # GOD PROMPT "CKKS PHASE 11": src/encode.cpp's encode_host/decode_host now
@@ -807,3 +808,17 @@ add_test(NAME test_polyeval_kl_rebuild_diff COMMAND test_polyeval_kl_rebuild_dif
 # production call site is touched. Uses n=8192 (proven scale), deliberately
 # avoiding the unrelated small-n rescale bug found this same round.
 gpufhe_test(test_ks_raii tests/test_ks_raii.cpp)
+
+# GOD PROMPT "CKKS PHASE 32", Work Package B: a real, non-FHE GPU-resident
+# streaming simulation (EWMA volatility + vectorized Black-Scholes pricing)
+# built on the two new general-purpose primitives this phase proposed and
+# implemented (include/device_buffer.h's DeviceBuffer<T>, include/
+# cuda_check.h's cuda_check) instead of CKKS-specific types -- proof the
+# architecture work generalizes beyond FHE. No OpenFHE dependency needed
+# (manual registration, not the gpufhe_test macro, mirroring tests/
+# test_ks_graph_setup_concurrency_diagnostic.cpp's own OpenFHE-free pattern).
+# Self-checks its own GPU-vs-CPU-reference correctness and exits non-zero on
+# mismatch, so add_test doubles as both the demo and a regression test.
+add_executable(resident_finance examples/resident_finance/main.cpp)
+target_link_libraries(resident_finance PRIVATE gpufhe CUDA::cudart)
+add_test(NAME resident_finance COMMAND resident_finance)
