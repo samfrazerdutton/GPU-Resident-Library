@@ -2,6 +2,92 @@
 
 ## Current commit
 
+Check `git log -8 --oneline` on resume. As of this writing HEAD should be
+the Phase 31 commit(s), on top of Phase 30's `c43b721` (verified matching
+`origin/main` exactly, 0 ahead/0 behind, at Phase 31 start). Hardware
+re-confirmed unchanged: RTX 2060 Max-Q, 6144 MiB, cc7.5, driver 595.97,
+CUDA 13.2, Rust/cargo 1.94.0.
+
+**The one item every Phase 30 handoff flagged as the top carry-over —
+the residual key-generation/setup-path concurrency race — is RESOLVED.**
+Resumed with the fix already substantially drafted, uncommitted, by an
+interrupted prior session (`tests/test_ks_graph_setup_concurrency_diagnostic.cpp`
+rewritten, `CMakeLists.txt` updated to register it with `ctest`). This
+round's actual contribution was **independently re-verifying every claim
+before trusting it** (never assume a prior session's uncommitted work is
+correct just because it reads well), completing the regression matrix,
+and writing it up. Re-extracted and re-compiled the original committed
+(`c43b721`) version of the diagnostic standalone and re-ran it 10 times:
+confirmed genuinely, severely non-deterministic (1–6/8 threads
+self-consistent, varying run to run, full-tower-scale diffs) — the
+baseline really was broken, independent of any claim in the carried-over
+comments. **Root cause: two CUDA stream-capture API misuses in the
+REPRODUCER ITSELF, not a gpufhe defect** — (1) `cudaStreamCaptureModeGlobal`
+makes ALL process-wide stream activity (including other threads'
+concurrent use of the shared legacy default stream, which
+`evalkeygen_host`/`ks_context_create` both default to when callers omit
+a stream, as the reproducer's own `buildFixture`/`runDirect` did) subject
+to a capture's exclusion rules, and the committed file checked zero CUDA
+return codes, so the resulting failures were silent; (2) `cudaMalloc`/
+`cudaFree` restrictions during an active capture are not fully scoped
+away by `cudaStreamCaptureModeThreadLocal` alone, so unordered teardown
+could invalidate another thread's in-flight capture, also silently. This
+confirms, but relocates, Phase 30's own "legacy default stream 0...
+plausible but unconfirmed" hypothesis: real, but in the test's own
+scheduling, not inside `keygen_host`/`evalkeygen_host_sold`. **Fix,
+confined entirely to the test file**: two spin-barriers excluding
+alloc/free from any other thread's active capture window,
+`cudaStreamCaptureModeThreadLocal` + a non-blocking stream, and explicit
+`cudaError_t` checking throughout. No mutex was added to any production
+function — there was no shared host state there to protect. Full
+evidence trail, ownership map, and the resulting supported/unsupported
+concurrency contract: `research/SETUP_PATH_CONCURRENCY_INVESTIGATION.md`.
+
+**Verified, not assumed**: fixed reproducer 25/25 plain + 3/3
+compute-sanitizer memcheck clean; old version re-run 10x for contrast,
+0/10 clean. Full `ctest` suite (same memory-gate exclusions as every
+phase since 28): **113/123 passing** (up from 112/122 — the newly
+promoted test), the exact same 10 pre-existing documented failures as
+every prior baseline, zero new regressions. Rust (debug-serial,
+release-parallel): 62 passed/0 failed/1 ignored both modes, matching
+Phase 25–30's end state exactly (this fix does not cross the Rust FFI
+boundary). No production source file modified. No cryptographic
+parameter touched. Phase 30's CUDA-graph fix and its two cache mutexes
+(`g_rtab`/`upc`, `ek_dev_tab`) all confirmed intact and unchanged.
+
+**Left genuinely uncommitted and out of this round's scope**:
+`graphify-out/GRAPH_REPORT.md` and `graphify-out/graph.json` carried
+pre-existing local modifications (from an earlier, unrelated `/graphify`
+run) when this round started. Not touched, not committed — unrelated to
+Phase 31; the next session should decide whether to commit or discard
+them on their own merits.
+
+## Immediate next actions, in order (Phase 31 handoff)
+
+1. **Re-run `tests/test_boot.cpp` the moment the memory gate clears**
+   (`Get-CimInstance Win32_OperatingSystem`, need >=10 GiB free) — this
+   is now FOUR phases running without this verification (Phase 28's
+   `encode_host_fft` bootstrap integration remains unexecuted at full
+   scale). Windows free RAM measured 2.23 GiB this round — still NO-GO.
+2. **Only after (1) passes**, wire the fused kernel into `tests/
+   test_boot.cpp`'s real accumulate loop (Phase 27/28's "promote"
+   verdict, never yet executed in the real file) as a SEPARATE,
+   separately-measured change.
+3. Consider whether `keyswitch_resident`'s measured 1.49x graph-replay
+   speedup (Phase 30) is worth wiring into a real multi-call site (e.g.
+   a bootstrap stage's rotation-key-switch loop) — now that the
+   multi-threaded capture contract is also proven (section 14 of
+   `research/SETUP_PATH_CONCURRENCY_INVESTIGATION.md`), a genuine
+   optimization candidate, not attempted this round (this phase's
+   mandate was the one documented correctness/concurrency carry-over,
+   not a new performance initiative).
+4. **Decide on `graphify-out/` artifacts** left modified by an earlier,
+   unrelated `/graphify` run (see "Current commit" above) — commit,
+   regenerate fresh, or discard; not evaluated this round.
+5. Re-run the Windows free-RAM gate check before any of the above.
+
+## Earlier commit (Phase 30)
+
 Check `git log -8 --oneline` on resume. As of this writing HEAD is the
 Phase 30 commit. Verified: `b09ba1b` matched `origin/main` exactly at
 Phase 30 start (confirmed via `git fetch` + `git rev-parse HEAD
