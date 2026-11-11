@@ -30,6 +30,7 @@
 #include <utility>
 #include <random>
 #include <cmath>
+#include <mutex>
 #include <cuda_runtime.h>
 
 namespace gpufhe {
@@ -68,7 +69,14 @@ EncDevTab build_enc_tab_shoup(uint32_t n, uint64_t q, uint64_t root) {
     EncDevTab T; T.fr = up(fr); T.fp = up(fp);
     return T;
 }
+// GOD PROMPT "CKKS PHASE 33": PROVEN-unsafe find()-then-emplace() pattern
+// (research/PHASE33_CACHE_CONCURRENCY_AUDIT.md) -- not reachable from the
+// Rust FFI production path, but a public gpufhe:: function any future
+// multi-threaded caller or benchmark can reach, matching the shape already
+// fixed in the 9 sibling caches since Phases 28/30.
+std::mutex& g_encrypt_host_shoup_cache_mutex(){ static std::mutex m; return m; }
 EncDevTab& enc_dev_tab_shoup(uint32_t n, uint64_t q, uint64_t root) {
+    std::lock_guard<std::mutex> lock(g_encrypt_host_shoup_cache_mutex());
     static std::map<std::pair<uint32_t, uint64_t>, EncDevTab> cache;
     auto key = std::make_pair(n, q);
     auto it = cache.find(key);

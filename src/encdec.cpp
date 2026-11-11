@@ -11,6 +11,7 @@
 #include <utility>
 #include <random>
 #include <cmath>
+#include <mutex>
 #include <cuda_runtime.h>
 
 namespace gpufhe {
@@ -67,7 +68,15 @@ EncDevTab build_enc_tab(uint32_t n, uint64_t q, uint64_t root){
     EncDevTab T; T.fr=up(fr); T.fp=up(fp);
     return T;
 }
+// GOD PROMPT "CKKS PHASE 33": PROVEN-unsafe find()-then-emplace() pattern
+// (research/PHASE33_CACHE_CONCURRENCY_AUDIT.md). Confirmed REACHABLE under
+// real concurrency: tests/test_encrypt_host_shoup_pooled_thread_safety.cpp
+// calls encrypt_host (which reaches this cache) from 8 threads x 6 iters at
+// the IDENTICAL (n,sizeQ) key, as its own single-threaded reference
+// computation inside the concurrent loop.
+std::mutex& g_encdec_cache_mutex(){ static std::mutex m; return m; }
 EncDevTab& enc_dev_tab(uint32_t n, uint64_t q, uint64_t root){
+    std::lock_guard<std::mutex> lock(g_encdec_cache_mutex());
     static std::map<std::pair<uint32_t,uint64_t>,EncDevTab> cache;
     auto key=std::make_pair(n,q);
     auto it=cache.find(key);

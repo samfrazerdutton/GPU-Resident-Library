@@ -5,6 +5,7 @@
 #include <vector>
 #include <map>
 #include <utility>
+#include <mutex>
 #include <cuda_runtime.h>
 #include "ntt.h"
 #include "intt.h"
@@ -25,7 +26,19 @@ uint64_t* up(const std::vector<uint64_t>&h){uint64_t*d;cudaMalloc(&d,h.size()*8)
 // CoeffsToSlots. Now: tables cached on device for the process lifetime, and
 // all towers ride one upload / launch-loop / download.
 struct DevTab { uint64_t *fr=nullptr,*fp=nullptr,*ir=nullptr,*ip=nullptr; uint64_t ninv=0,ninv_p=0; };
+// GOD PROMPT "CKKS PHASE 33": guards dev_tab() AND autoPermMap() below (one
+// mutex per file, matching src/keyswitch_resident.cpp's g_ks_cache_mutex()
+// precedent). PROVEN necessary, not added defensively: a CUDA-free extraction
+// of this exact find()-then-emplace() pattern, stressed with the same
+// thread count/key-collision shape as tests/test_rotate_concurrent_cache.cpp's
+// existing Phase B/C/D, reproduced real ThreadSanitizer data races in
+// std::map's internal _Rb_tree (concurrent find() racing another thread's
+// emplace()-driven tree rebalance) -- see
+// research/PHASE33_CACHE_CONCURRENCY_AUDIT.md. Lookups/inserts are cheap
+// relative to real rotation work, so locking here costs nothing that matters.
+std::mutex& g_rotate_cache_mutex(){ static std::mutex m; return m; }
 DevTab& dev_tab(uint32_t n, uint64_t q, uint64_t root){
+    std::lock_guard<std::mutex> lock(g_rotate_cache_mutex());
     static std::map<std::pair<uint32_t,uint64_t>,DevTab> dcache;
     auto key=std::make_pair(n,q);
     auto it=dcache.find(key); if(it!=dcache.end()) return it->second;
@@ -162,6 +175,7 @@ uint32_t bitrev32(uint32_t v, uint32_t bits){ uint32_t r=0; for(uint32_t k=0;k<b
 // logged in research/EXPERIMENT_LEDGER.md). Depends only on (n,k), not on
 // any modulus -- cached process-lifetime like the root tables.
 uint32_t* autoPermMap(uint32_t n, uint32_t k, cudaStream_t s){
+    std::lock_guard<std::mutex> lock(g_rotate_cache_mutex());  // see dev_tab()'s comment above
     static std::map<std::pair<uint32_t,uint32_t>,uint32_t*> cache;
     auto key=std::make_pair(n,k);
     auto it=cache.find(key); if(it!=cache.end()) return it->second;

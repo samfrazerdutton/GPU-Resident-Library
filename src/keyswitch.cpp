@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <map>
 #include <vector>
+#include <mutex>
 
 namespace gpufhe {
 
@@ -43,7 +44,14 @@ uint64_t* up(const std::vector<uint64_t>& h){ uint64_t* d; size_t B=h.size()*8;
 // bootstrap. Cache them on the DEVICE for the process lifetime instead.
 // (single-threaded use; concurrent first-touch would need a lock)
 struct DevTab { uint64_t *fr=nullptr,*fp=nullptr,*ir=nullptr,*ip=nullptr; uint64_t ninv=0,ninv_p=0; };
+// GOD PROMPT "CKKS PHASE 33": reachable from keyswitch_core_resident, which
+// is reachable from BOTH src/rotate.cpp's rotate_ct_host (concurrently
+// exercised by tests/test_rotate_concurrent_cache.cpp's Phase D) AND the
+// Rust FFI bridge's gpufhe_ks_fixture_run_reference. PROVEN unsafe pattern,
+// not a defensive guess -- see research/PHASE33_CACHE_CONCURRENCY_AUDIT.md.
+std::mutex& g_keyswitch_cache_mutex(){ static std::mutex m; return m; }
 DevTab& dev_tab(uint32_t n, uint64_t q, uint64_t root){
+    std::lock_guard<std::mutex> lock(g_keyswitch_cache_mutex());
     static std::map<std::pair<uint32_t,uint64_t>,DevTab> dcache;
     auto key=std::make_pair(n,q);
     auto it=dcache.find(key);

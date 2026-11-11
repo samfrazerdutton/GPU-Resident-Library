@@ -192,6 +192,7 @@ gpufhe_test(test_encode_fft_concurrency tests/test_encode_fft_concurrency.cpp)
 gpufhe_test(test_encrypt_host_shoup_matches_reference tests/test_encrypt_host_shoup_matches_reference.cpp)
 gpufhe_test(test_encrypt_host_shoup_pooled_matches_reference tests/test_encrypt_host_shoup_pooled_matches_reference.cpp)
 gpufhe_test(test_encrypt_host_shoup_pooled_thread_safety tests/test_encrypt_host_shoup_pooled_thread_safety.cpp)
+gpufhe_test(test_encrypt_host_shoup_concurrency tests/test_encrypt_host_shoup_concurrency.cpp)
 # GOD PROMPT "CKKS PHASE 14": independent differential test for the
 # Barrett-based embed() replacement (22.4M+ cases incl. LONG_MIN/
 # LONG_MAX, against this project's own real native_primes() moduli),
