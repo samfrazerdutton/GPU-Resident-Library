@@ -3,6 +3,195 @@
 ## Current commit
 
 Check `git log -8 --oneline` on resume. As of this writing HEAD should be
+the Phase 32 commit(s), on top of Phase 31's `42944c7` (verified matching
+`origin/main` exactly, 0 ahead/0 behind, at Phase 32 start). Hardware
+re-confirmed unchanged: RTX 2060 Max-Q, 6144 MiB, driver 595.97, CUDA
+13.2 (`nvcc` 13.2.51), Rust/cargo 1.94.0, compute-sanitizer 2026.1.0.0.
+Windows free RAM measured 2.23-4.60 GiB across this session — still
+below both the 10 GiB (n=8192) and 6 GiB (n=131072) bootstrap gates;
+the full bootstrap was NOT run this round (consistent with every phase
+since 25).
+
+**Phase 32 delivered the five mandated work packages**, organized as:
+architecture audit → two minimal new primitives → a real non-FHE
+application proving them → a fresh CKKS end-to-end re-measurement →
+bounded edge-AI/LLM-KV-cache research prototypes → a self-conducted
+independent review. Used three parallel research-only forks (never
+touching production code concurrently with the integration owner) for
+the architecture audit, edge-AI prototype, and LLM-KV-cache prototype;
+the application workload, CKKS audit, and all integration/commits were
+done by one owner.
+
+**Work Package A (architecture)**: `research/GPU_RESIDENT_ARCHITECTURE.md`.
+Finding: no general device-buffer or execution-context abstraction
+existed; every feature (keyswitch, encrypt, encode, rotate) independently
+reinvented a similar RAII-wrapper-plus-process-lifetime-cache shape.
+Independently re-verified this round's most actionable claim (grep
+confirms 4 of 13 `static std::map` device-resource caches —
+`rotate.cpp` x2, `keyswitch.cpp`, `encrypt_host_shoup.cpp`,
+`encdec.cpp` — have zero `std::mutex`, unlike the 9 already fixed in
+Phases 28/30; `rotate.cpp`'s case is Phase 25's own documented
+"latent, not active" decision, the other three were never flagged
+either way). Recommended exactly two additive primitives (not a
+framework): `DeviceBuffer<T>` and `cuda_check()`. Explicitly recommended
+AGAINST a generic execution-context or generalized CUDA-graph facility
+this round — no second real caller had asked for either yet.
+
+**Implemented both recommended primitives**: `include/device_buffer.h`
+(`gpufhe::DeviceBuffer<T>`, generalizing `DeviceCiphertext`'s proven
+RAII-move-only-owned-pointer pattern to an arbitrary type/count, sync by
+default with explicit `_async` variants requiring the caller to own
+ordering) and `include/cuda_check.h` (promoting `device_ciphertext.cpp`'s
+one-off `ck()` helper to a shared header — directly closing the "nothing
+checked return codes" gap Phase 31 found at the root of its own bug).
+
+**Work Package B (real non-FHE application)**: `examples/resident_finance/`
+— a GPU-resident streaming EWMA-volatility + vectorized Black-Scholes
+simulation, built on `DeviceBuffer<double>` (verified by reading the
+file, not by trusting its own comments — see
+`research/PHASE32_INDEPENDENT_REVIEW.md` section 3). Caught and fixed a
+real bug in this round's OWN draft before any build: an early version
+uploaded a tick directly into the resident `price` buffer and then
+passed that same buffer as both the "old price" and "new price" argument
+to the EWMA kernel, which would have made every log-return exactly zero
+and produced a silently-wrong, constant-zero-volatility simulation that
+still "passed" its own self-consistency check (GPU and CPU would have
+agreed on the same wrong answer) — fixed by uploading into a dedicated
+`newPrice` buffer instead. Correctness: GPU vs. CPU-reference (identical
+tick stream, never two independently-seeded RNGs) max abs error at
+K=4096/2000 ticks: price=0, ewmaVar=1.6e-19, callPrice=3.6e-14,
+vol=1.1e-16 — all double-precision-transcendental-noise scale. **Honest
+crossover sweep, not a single cherry-picked K**: GPU LOSES below ~K=1000
+(0.004x-0.636x at K=8/32/128/512 — CPU wins, launch/transfer overhead
+dominates) and WINS from ~K=2000 up (2.231x at K=2048, rising to 18.952x
+at K=131072). Registered with `ctest` (`resident_finance`, self-checking,
+exit-code pass/fail).
+
+**Work Package D (CKKS)**: `research/CKKS_RESIDENCY_AUDIT.md`.
+Grep-verified per-operation residency table (encode/decode: pure host,
+intentional; `ckks_ops.cpp`'s mul/rescale: genuinely chain-resident, one
+upload + zero mid-chain transfers; `keyswitch_resident`: resident for
+ciphertext/kernels, not yet for the eval key — Phase 25's finding,
+unchanged, `KsResidentCache` still built-tested-unintegrated). Re-ran
+(not copied) the existing 32-client aggregation benchmark fresh:
+end-to-end mean 105.84 ms, production-path speedup 1.518x vs. the old
+plain-encrypt arm, encrypt remaining 86.9% of end-to-end (the confirmed
+next bottleneck for this workload). Re-ran `bench_resident_chain` fresh
+and reported its result exactly as measured: **no statistically
+significant GPU advantage at n=32768/towers=6** (95% CI brackets zero) —
+stated honestly rather than re-tuned into a better-looking number. No
+cryptographic parameter touched; h=64/sigma=3.19/P>=Q_part_max all
+re-confirmed unchanged and, for the latter, actively still rejecting an
+intentionally-undersized fixture with the identical error message
+(the five `test_rescale_*_n1024*` pre-existing failures, section 5).
+
+**Work Package C (edge AI) and E (LLM KV-cache)**: both delivered their
+required research documents (`research/EDGE_SENSOR_RESIDENCY_AUDIT.md`,
+`research/LLM_KV_CACHE_RESEARCH.md`) PLUS a working prototype each
+(neither deferred), independently re-built and re-run by the integration
+owner this round rather than trusted on the forks' own say-so:
+- Edge: `research/edge_prototype/edge_sensor_residency_prototype.cu`
+  (standalone, not wired into CMakeLists.txt) — 1M-point synthetic cloud,
+  chained pose-update→transform→EMA-filter with zero host round-trips
+  between stages, periodic centroid readback. Re-run this round: 15.54x
+  warm per-step speedup vs. CPU reference (fork reported ~13x — both
+  real measurements, the difference being this project's own
+  already-documented run-to-run GPU clock/thermal variance, not a
+  discrepancy), correctness 5.96e-8 (float32-epsilon scale), reproduced
+  exactly. No crossover sweep across point count was done (flagged
+  follow-up).
+- LLM KV-cache: `research/kv_cache_prototype/kv_block_cache_sim.cpp`
+  (standalone, CPU-only, zero CUDA, zero GPU contention risk) — a block
+  pool modeled directly on this project's own `KsResidentCache` design
+  (composite-key-only, bound-by-bytes-and-count, fail-closed,
+  synchronize-before-free lessons). Re-run this round: 768/768 block
+  reads bit-exact under a deliberate 6x-oversubscribed adversarial access
+  pattern (704 evictions, 384 host-spill-and-restores), reproduced
+  exactly. Explicit recommendation: do NOT build a production KV-cache
+  yet; port this allocator logic onto `DeviceBuffer`/a real
+  `cudaMallocAsync` path only once a second real GPU caller (this
+  prototype, or something like it) actually needs it.
+
+**Independent review**: `research/PHASE32_INDEPENDENT_REVIEW.md`. Honest
+about its own limitation — the architecture/edge/LLM-KV-cache work had
+genuine cross-agent independence (three parallel forks with no
+visibility into each other), but the application workload and CKKS audit
+were self-reviewed by the same reasoning process that built them, stated
+plainly rather than dressed up as a second opinion. Re-verified (not
+re-trusted) the architecture audit's unguarded-cache claim and both
+prototypes' numbers by independently re-running everything.
+
+**Regression (re-run fresh this round)**: C++ `ctest` (excluding the
+memory-gated bootstrap tests, same convention since Phase 28):
+**114/124 passing** (up from 113/123 — `resident_finance` newly
+registered and passing), the exact same 10 pre-existing documented
+failures as Phase 31's own baseline (name-for-name cross-checked, not
+just counted): `test_evalkeygen_isolated`, `test_keyswitch_stage_trace`,
+`test_polyeval`, `test_stage2`, `test_boot_multi_input_small`, and the
+five `test_rescale_*_n1024*` family. Zero new regressions. Rust
+(debug-serial, release-parallel): 62 passed/0 failed/1 ignored, both
+modes, identical to the established Phase 25-31 baseline.
+
+**Mistake made and corrected this round, recorded rather than hidden**:
+an early `CMakeLists.txt` edit was accidentally applied to the
+NON-AUTHORITATIVE Windows-filesystem clone
+(`C:\Users\samca\GPU-Resident-Library`) instead of the authoritative WSL
+checkout. Caught immediately via `git diff --stat` showing far more
+insertions than the intended edit; reverted with the exact inverse Edit
+(restoring that clone's pre-existing, unrelated, already-dirty working
+tree to byte-identical with its state before this round touched it,
+confirmed via `grep` finding zero trace of the mistaken addition
+afterward); the correct edit was then redone in the authoritative WSL
+checkout. No data was lost; the Windows clone's own pre-existing
+divergence (documented since Phase 25/26, never this project's concern
+to reconcile) was never evaluated or touched beyond this single
+caught-and-reverted accident.
+
+**Left genuinely uncommitted and out of this round's scope** (carried
+forward unchanged from Phase 31's own note): `graphify-out/GRAPH_REPORT.md`
+and `graphify-out/graph.json` (pre-existing, unrelated `/graphify` run
+output), `.claude/agents/`, `.claude/skills/scrum-orchestrator/`,
+`.scrum-orchestrator/`, `tools/__pycache__/` (pre-existing, unrelated
+tooling). Not touched, not staged, not committed this round either.
+
+## Immediate next actions, in order (Phase 32 handoff)
+
+1. **The single highest-value next engineering milestone, per this
+   round's own evidence**: decide on the 4 unguarded caches
+   (`rotate.cpp` x2, `keyswitch.cpp`, `encrypt_host_shoup.cpp`,
+   `encdec.cpp` — section "Work Package A" above). Before fixing: first
+   independently verify whether `keyswitch.cpp`/`encrypt_host_shoup.cpp`/
+   `encdec.cpp` are genuinely cold (not reachable from the production
+   Rust-bridge call path) — this round did NOT write a test proving that,
+   it only cited the prior phases' own characterization. If cold,
+   document that explicitly (closing the open question, matching
+   `rotate.cpp`'s already-documented status); if any is reachable,
+   mutex-guard it following the established Phase 28/30 pattern.
+2. **Migrate a second real caller onto `DeviceBuffer`/`cuda_check`** to
+   validate the primitives generalize beyond their first use
+   (`resident_finance`) — the LLM KV-cache prototype's own recommendation
+   (port its allocator onto `DeviceBuffer` + real `cudaMallocAsync`) is
+   the most concretely evidenced candidate; the edge-AI prototype's three
+   raw `cudaMalloc` buffers are the other.
+3. **Sweep `resident_finance`'s crossover more finely** (between K=512
+   and K=2048, where this round's coarse sweep bracketed but did not
+   pinpoint the actual crossover) and consider wiring a CUDA-graph
+   capture of its 2-kernel chain (same shape as `keyswitch_resident`'s
+   already-proven Phase 30/31 graph path) for a warm-replay speedup
+   measurement.
+4. **Re-run `tests/test_boot.cpp` the moment the memory gate clears**
+   (`Get-CimInstance Win32_OperatingSystem`, need >=10 GiB free) — now
+   FIVE phases running without this verification.
+5. **Encrypt-stage optimization** (`research/CKKS_RESIDENCY_AUDIT.md`
+   section 7): the aggregation workload's own 86.9%-encrypt-dominance is
+   unchanged since Phase 25; the pinned-memory variant reverted for
+   single-call latency might behave differently in this workload's
+   steady-state many-calls-same-key pattern — still unexplored.
+6. Re-run the Windows free-RAM gate check before any of the above.
+
+## Earlier commit (Phase 31)
+
+Check `git log -8 --oneline` on resume. As of this writing HEAD should be
 the Phase 31 commit(s), on top of Phase 30's `c43b721` (verified matching
 `origin/main` exactly, 0 ahead/0 behind, at Phase 31 start). Hardware
 re-confirmed unchanged: RTX 2060 Max-Q, 6144 MiB, cc7.5, driver 595.97,
