@@ -81,14 +81,21 @@ struct Fixture {
 
 static FinancialInputEnvelope build_envelope(const Fixture& F, const MockAttestor& attestor,
                                               double numeric_value, const SourceIdentity& source,
-                                              const SessionId& session, uint64_t encSeed) {
+                                              const SessionId& session, uint64_t encSeed,
+                                              double deltaOverride = 0.0) {
+    // deltaOverride lets a test build an envelope that is internally
+    // self-consistent (correctly attested for its OWN enc_meta) but
+    // encoded with a DIFFERENT delta than the fixture's session default --
+    // used by the RejectedEncodingMismatch adversarial case below.
+    const double delta = (deltaOverride != 0.0) ? deltaOverride : F.delta;
     QueryResponseBinding binding{"GET /mock-statement", 256};
     PayloadCommitment commitment{digest_of_value(numeric_value, source, session)};
-    MockAttestation attestation = attestor.attest(source, session, binding, commitment);
+    CkksEncodingMetadata encMeta{F.n, delta};
+    MockAttestation attestation = attestor.attest(source, session, binding, commitment, encMeta);
 
     std::vector<cd> z(F.S, cd(numeric_value, 0.0));
     std::vector<int64_t> m;
-    gpufhe::encode_host_fft(m, z, F.n, F.delta);
+    gpufhe::encode_host_fft(m, z, F.n, delta);
     std::vector<uint64_t> c0, c1;
     gpufhe::encrypt_host_shoup_pooled_barrett_batched(c0, c1, m, F.KP.pkA, F.KP.pkB, F.n, F.mod, F.root,
                                                        F.ns, F.sigma, encSeed);
@@ -96,7 +103,7 @@ static FinancialInputEnvelope build_envelope(const Fixture& F, const MockAttesto
     FinancialInputEnvelope env;
     env.source = source; env.session = session; env.binding = binding;
     env.commitment = commitment; env.attestation = attestation;
-    env.enc_meta = {F.n, F.delta};
+    env.enc_meta = encMeta;
     env.c0 = c0; env.c1 = c1;
     return env;
 }
@@ -127,7 +134,7 @@ int main() {
     for (uint32_t k = 0; k < K; ++k) values[k] = d(msgRng);
     double plainSum = 0; for (double v : values) plainSum += v;
 
-    AggregationSessionVerifier verifier(attestorKey, applicationId);
+    AggregationSessionVerifier verifier(attestorKey, applicationId, CkksEncodingMetadata{F.n, F.delta}, F.sizeQ);
     std::vector<uint64_t> acc0, acc1; bool first = true;
     uint32_t acceptedGolden = 0;
     for (uint32_t k = 0; k < K; ++k) {
@@ -214,6 +221,43 @@ int main() {
         env.c0.clear(); env.c1.clear(); // simulate a malformed/empty ciphertext
         check(verifier.verify(env) == VerificationResult::RejectedCiphertextMissing,
               "envelope with no ciphertext payload rejected");
+    }
+    {
+        // GOD PROMPT "CKKS PHASE 36": enc_meta tampered AFTER attestation --
+        // must now be caught by the attestation check, since enc_meta is
+        // bound into canonical_attestation_bytes as of this phase (the OLD
+        // verifier didn't even look at enc_meta, so this tamper would have
+        // sailed through entirely before this change).
+        SourceIdentity source{"mock-bank-0.example", "account_balance_statement"};
+        SessionId session{applicationId, 9009};
+        auto env = build_envelope(F, attestor, 42.0, source, session, 7009);
+        env.enc_meta.delta = std::pow(2.0, 40); // changed AFTER attestation
+        check(verifier.verify(env) == VerificationResult::RejectedBadAttestation,
+              "altered encoding metadata (delta) after attestation rejected");
+    }
+    {
+        // Internally self-consistent envelope (correctly attested for its
+        // OWN enc_meta) but built with a delta the SESSION does not expect --
+        // the attestation alone can never catch this (it only proves
+        // internal consistency), so this exercises the NEW session-level
+        // RejectedEncodingMismatch check specifically.
+        SourceIdentity source{"mock-bank-0.example", "account_balance_statement"};
+        SessionId session{applicationId, 9010};
+        auto env = build_envelope(F, attestor, 42.0, source, session, 7010, std::pow(2.0, 40));
+        check(verifier.verify(env) == VerificationResult::RejectedEncodingMismatch,
+              "envelope correctly attested for the wrong session delta rejected");
+    }
+    {
+        // Non-empty but wrong-length ciphertext (e.g. a truncated or
+        // corrupted transmission) -- must be rejected rather than handed to
+        // ct_add_ct_host, which the OLD emptiness-only check would have let
+        // through.
+        SourceIdentity source{"mock-bank-0.example", "account_balance_statement"};
+        SessionId session{applicationId, 9011};
+        auto env = build_envelope(F, attestor, 42.0, source, session, 7011);
+        env.c0.resize(env.c0.size() / 2); // truncate, but leave non-empty
+        check(verifier.verify(env) == VerificationResult::RejectedCiphertextShapeMismatch,
+              "truncated (non-empty but wrong-length) ciphertext rejected");
     }
 
     std::printf("\n=== TOTAL: %d passed, %d failed ===\n", g_pass, g_fail);

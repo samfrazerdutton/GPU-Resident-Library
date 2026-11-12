@@ -120,6 +120,18 @@ enum class VerificationResult {
     RejectedSessionMismatch,
     RejectedDuplicateSubmission,
     RejectedCiphertextMissing,
+    // GOD PROMPT "CKKS PHASE 36": the envelope's own CkksEncodingMetadata
+    // (n, delta) didn't match what THIS aggregation session expects --
+    // catches an internally-self-consistent (correctly attested) envelope
+    // that was nonetheless built for the wrong encoding parameters, which
+    // the OLD verifier never checked at all (enc_meta was carried in the
+    // envelope but never validated against anything).
+    RejectedEncodingMismatch,
+    // The ciphertext is non-empty but the wrong shape for the session's
+    // (n, sizeQ) -- e.g. truncated or malformed -- which the OLD verifier
+    // would have let through (it only checked for emptiness) and which
+    // could corrupt or crash the real ct_add_ct_host aggregation call.
+    RejectedCiphertextShapeMismatch,
 };
 
 const char* to_string(VerificationResult r);
@@ -148,7 +160,8 @@ struct FinancialInputEnvelope {
 // and verifier both tag over. Exposed so both sides stay in lockstep
 // without duplicating the encoding logic.
 std::vector<uint8_t> canonical_attestation_bytes(const SourceIdentity&, const SessionId&,
-                                                   const QueryResponseBinding&, const PayloadCommitment&);
+                                                   const QueryResponseBinding&, const PayloadCommitment&,
+                                                   const CkksEncodingMetadata&);
 
 // *** MOCK ATTESTOR. *** Issues MockAttestation tags given a shared toy
 // key. Stands in for TLShare's real attestor (which never sees the
@@ -162,7 +175,8 @@ class MockAttestor {
 public:
     explicit MockAttestor(std::vector<uint8_t> shared_key);
     MockAttestation attest(const SourceIdentity&, const SessionId&,
-                            const QueryResponseBinding&, const PayloadCommitment&) const;
+                            const QueryResponseBinding&, const PayloadCommitment&,
+                            const CkksEncodingMetadata&) const;
 private:
     std::vector<uint8_t> key_;
 };
@@ -171,28 +185,39 @@ private:
 //  1. The envelope's session matches the expected application_id for
 //     this aggregation round (RejectedSessionMismatch otherwise).
 //  2. The attestation tag is correct for the envelope's own
-//     (source, session, binding, commitment) under the shared mock key
-//     (RejectedBadAttestation otherwise) -- this is what catches a
-//     tampered source label, altered session id, or altered binding,
-//     since any of those changes the canonical bytes the tag was
-//     computed over.
-//  3. The commitment has not been seen before in this verifier's
+//     (source, session, binding, commitment, enc_meta) under the shared
+//     mock key (RejectedBadAttestation otherwise) -- this is what catches
+//     a tampered source label, altered session id, altered binding, or
+//     (as of Phase 36) altered encoding metadata, since any of those
+//     changes the canonical bytes the tag was computed over.
+//  3. GOD PROMPT "CKKS PHASE 36": the envelope's CkksEncodingMetadata
+//     (n, delta) matches what THIS session expects (RejectedEncodingMismatch
+//     otherwise) -- distinct from check 2: an envelope can be internally
+//     self-consistent (a VALID attestation for its OWN n/delta) while
+//     still being wrong for this aggregation round; the old verifier
+//     never checked enc_meta against anything at all.
+//  4. The commitment has not been seen before in this verifier's
 //     lifetime (RejectedDuplicateSubmission otherwise) -- replay/duplicate
 //     protection.
-//  4. The ciphertext (c0/c1) is non-empty (RejectedCiphertextMissing
-//     otherwise) -- the aggregation boundary must never accept an
-//     envelope with no encrypted payload.
+//  5. The ciphertext (c0/c1) is non-empty AND the correct shape for this
+//     session's (n, sizeQ) (RejectedCiphertextMissing /
+//     RejectedCiphertextShapeMismatch otherwise) -- the aggregation
+//     boundary must never hand ct_add_ct_host a missing or malformed
+//     ciphertext.
 // On Accepted, the envelope's c0/c1 are the only thing the caller should
 // hand to the real aggregation path (ct_add_ct_host) -- this class never
 // exposes numeric_value or any plaintext.
 class AggregationSessionVerifier {
 public:
-    AggregationSessionVerifier(std::vector<uint8_t> shared_key, std::string expected_application_id);
+    AggregationSessionVerifier(std::vector<uint8_t> shared_key, std::string expected_application_id,
+                                CkksEncodingMetadata expected_enc_meta, uint32_t expected_size_q);
     VerificationResult verify(const FinancialInputEnvelope& env);
     size_t accepted_count() const { return accepted_count_; }
 private:
     std::vector<uint8_t> key_;
     std::string expected_application_id_;
+    CkksEncodingMetadata expected_enc_meta_;
+    uint32_t expected_size_q_ = 0;
     std::set<std::string> seen_commitments_; // hex-encoded digest, for dedup
     size_t accepted_count_ = 0;
 };

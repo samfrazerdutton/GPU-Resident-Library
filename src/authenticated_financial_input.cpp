@@ -19,6 +19,8 @@ const char* to_string(VerificationResult r) {
         case VerificationResult::RejectedSessionMismatch: return "RejectedSessionMismatch";
         case VerificationResult::RejectedDuplicateSubmission: return "RejectedDuplicateSubmission";
         case VerificationResult::RejectedCiphertextMissing: return "RejectedCiphertextMissing";
+        case VerificationResult::RejectedEncodingMismatch: return "RejectedEncodingMismatch";
+        case VerificationResult::RejectedCiphertextShapeMismatch: return "RejectedCiphertextShapeMismatch";
     }
     return "Unknown";
 }
@@ -60,9 +62,14 @@ static void append_u64(std::vector<uint8_t>& v, uint64_t x) {
     const uint8_t* p = reinterpret_cast<const uint8_t*>(&x);
     v.insert(v.end(), p, p + 8);
 }
+static void append_f64(std::vector<uint8_t>& v, double x) {
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(&x);
+    v.insert(v.end(), p, p + 8);
+}
 
 std::vector<uint8_t> canonical_attestation_bytes(const SourceIdentity& src, const SessionId& sess,
-                                                   const QueryResponseBinding& bind, const PayloadCommitment& com) {
+                                                   const QueryResponseBinding& bind, const PayloadCommitment& com,
+                                                   const CkksEncodingMetadata& enc) {
     std::vector<uint8_t> b;
     append_str(b, "gpufhe-auth-input-v1"); // domain-separation tag, mirrors TLShare's ctx domain separation
     append_str(b, src.issuer_label);
@@ -72,21 +79,30 @@ std::vector<uint8_t> canonical_attestation_bytes(const SourceIdentity& src, cons
     append_str(b, bind.query_template);
     append_u64(b, (uint64_t)bind.response_length);
     b.insert(b.end(), com.digest.begin(), com.digest.end());
+    // GOD PROMPT "CKKS PHASE 36": bind the CKKS encoding metadata into the
+    // same attestation the other fields already go through, so a
+    // post-attestation tamper of n/delta is caught by the existing
+    // RejectedBadAttestation path rather than passing through unbound.
+    append_u64(b, (uint64_t)enc.n);
+    append_f64(b, enc.delta);
     return b;
 }
 
 MockAttestor::MockAttestor(std::vector<uint8_t> shared_key) : key_(std::move(shared_key)) {}
 
 MockAttestation MockAttestor::attest(const SourceIdentity& src, const SessionId& sess,
-                                      const QueryResponseBinding& bind, const PayloadCommitment& com) const {
-    auto bytes = canonical_attestation_bytes(src, sess, bind, com);
+                                      const QueryResponseBinding& bind, const PayloadCommitment& com,
+                                      const CkksEncodingMetadata& enc) const {
+    auto bytes = canonical_attestation_bytes(src, sess, bind, com, enc);
     MockAttestation a;
     a.tag = toy_keyed_tag(key_, bytes);
     return a;
 }
 
-AggregationSessionVerifier::AggregationSessionVerifier(std::vector<uint8_t> shared_key, std::string expected_application_id)
-    : key_(std::move(shared_key)), expected_application_id_(std::move(expected_application_id)) {}
+AggregationSessionVerifier::AggregationSessionVerifier(std::vector<uint8_t> shared_key, std::string expected_application_id,
+                                                         CkksEncodingMetadata expected_enc_meta, uint32_t expected_size_q)
+    : key_(std::move(shared_key)), expected_application_id_(std::move(expected_application_id)),
+      expected_enc_meta_(expected_enc_meta), expected_size_q_(expected_size_q) {}
 
 static std::string hex_digest(const Tag32& t) {
     std::ostringstream os;
@@ -100,22 +116,42 @@ VerificationResult AggregationSessionVerifier::verify(const FinancialInputEnvelo
         return VerificationResult::RejectedSessionMismatch;
     }
     // 2. Attestation check -- recompute the expected tag from the envelope's
-    //    OWN fields and compare. Any tamper to source/session/binding/commitment
-    //    changes the canonical bytes and therefore the recomputed tag.
-    auto bytes = canonical_attestation_bytes(env.source, env.session, env.binding, env.commitment);
+    //    OWN fields and compare. Any tamper to source/session/binding/
+    //    commitment/enc_meta changes the canonical bytes and therefore the
+    //    recomputed tag. Deliberately checked BEFORE the session-level
+    //    encoding-mismatch check below, so a POST-attestation tamper of
+    //    enc_meta is attributed to the tamper (RejectedBadAttestation),
+    //    distinct from an envelope that was honestly, self-consistently
+    //    attested for the WRONG session parameters in the first place.
+    auto bytes = canonical_attestation_bytes(env.source, env.session, env.binding, env.commitment, env.enc_meta);
     Tag32 expected = toy_keyed_tag(key_, bytes);
     if (expected != env.attestation.tag) {
         return VerificationResult::RejectedBadAttestation;
     }
-    // 3. Duplicate/replay protection, keyed on the commitment digest.
+    // 3. GOD PROMPT "CKKS PHASE 36": the envelope's own encoding metadata
+    //    must match what THIS session expects. An envelope can pass check 2
+    //    (a VALID attestation for its own n/delta) while still being wrong
+    //    for this aggregation round -- the old verifier never checked
+    //    enc_meta against anything at all.
+    if (env.enc_meta.n != expected_enc_meta_.n || env.enc_meta.delta != expected_enc_meta_.delta) {
+        return VerificationResult::RejectedEncodingMismatch;
+    }
+    // 4. Duplicate/replay protection, keyed on the commitment digest.
     std::string key = hex_digest(env.commitment.digest);
     if (seen_commitments_.count(key)) {
         return VerificationResult::RejectedDuplicateSubmission;
     }
-    // 4. The ciphertext must actually be present -- the aggregation boundary
-    //    must never accept an envelope carrying no encrypted payload.
+    // 5. The ciphertext must actually be present AND the correct shape for
+    //    this session's (n, sizeQ) -- the aggregation boundary must never
+    //    hand ct_add_ct_host a missing OR malformed/wrong-length ciphertext
+    //    (the old check only looked for emptiness, which a truncated but
+    //    non-empty ciphertext would have passed).
     if (env.c0.empty() || env.c1.empty()) {
         return VerificationResult::RejectedCiphertextMissing;
+    }
+    const size_t expectedLen = (size_t)expected_size_q_ * env.enc_meta.n;
+    if (env.c0.size() != expectedLen || env.c1.size() != expectedLen) {
+        return VerificationResult::RejectedCiphertextShapeMismatch;
     }
     seen_commitments_.insert(key);
     ++accepted_count_;
