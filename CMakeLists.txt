@@ -823,3 +823,18 @@ gpufhe_test(test_ks_raii tests/test_ks_raii.cpp)
 add_executable(resident_finance examples/resident_finance/main.cpp)
 target_link_libraries(resident_finance PRIVATE gpufhe CUDA::cudart)
 add_test(NAME resident_finance COMMAND resident_finance)
+
+# GOD PROMPT "CKKS PHASE 35": authenticated financial input envelope
+# prototype, inspired by (but NOT implementing) TLShare -- see
+# research/PHASE35_TLSHARE_CKKS_INTEGRATION.md for the full boundary
+# between what is real (the CKKS encrypt/aggregate/decrypt path, called
+# unmodified) and what is MOCK (the attestor, the attestation tag -- NOT
+# TLS, NOT GtP, NOT a zero-knowledge proof). Deliberately kept OUT of the
+# core gpufhe library: src/authenticated_financial_input.cpp is compiled
+# directly into this one executable, not into libgpufhe, so this
+# research module cannot affect any core CKKS build target.
+add_executable(authenticated_financial_input
+  examples/authenticated_financial_input/main.cpp
+  src/authenticated_financial_input.cpp)
+target_link_libraries(authenticated_financial_input PRIVATE gpufhe CUDA::cudart)
+add_test(NAME authenticated_financial_input COMMAND authenticated_financial_input)
