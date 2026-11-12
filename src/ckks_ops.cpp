@@ -97,6 +97,11 @@ void mul_resident(DeviceCiphertext& a, const DeviceCiphertext& b,
     }
 }
 
+// GOD PROMPT "CKKS PHASE 39": for LaunchRescaleFuse's new precon
+// parameters -- duplicated per this project's established convention of
+// duplicating small per-file helpers rather than centralizing them.
+static uint64_t shoup_precon(uint64_t c, uint64_t q) { return (uint64_t)(((unsigned __int128)c << 64) / q); }
+
 // Resident rescale. scratch is a device buffer of length n, reused per tower.
 void rescale_resident(DeviceCiphertext& ct, const DeviceTables& T,
                       const std::vector<uint64_t>& s1,
@@ -126,7 +131,8 @@ void rescale_resident(DeviceCiphertext& ct, const DeviceTables& T,
                        cudaMemcpyDeviceToDevice, stream);
             LaunchSwitchModulus(scratch, qLast, qi, n, stream);
             LaunchNTT_CT(scratch, T.d_froots[t], T.d_fprecon[t], n, qi, stream);
-            LaunchRescaleFuse(base+t*n, scratch, s1[t], s2[t], qi, n, stream);
+            LaunchRescaleFuse(base+t*n, scratch, s1[t], shoup_precon(s1[t],qi),
+                              s2[t], shoup_precon(s2[t],qi), qi, n, stream);
         }
     }
     ct.drop_tower();

@@ -26,7 +26,7 @@
 //!         cudaMemcpyAsync(d_scratch, d_drop, (size_t)n*8, cudaMemcpyDeviceToDevice, s);
 //!         LaunchSwitchModulus(d_scratch, qLast, qi, n, s);
 //!         LaunchNTT_CT(d_scratch, C.d_fr[r], C.d_fp[r], n, qi, s);
-//!         LaunchRescaleFuse(d_c+(size_t)t*n, d_scratch, s1[t], s2[t], qi, n, s);
+//!         LaunchRescaleFuse(d_c+(size_t)t*n, d_scratch, s1[t], shoup_precon(s1[t],qi), s2[t], shoup_precon(s2[t],qi), qi, n, s);
 //!     }
 //! }
 //! ```
@@ -76,7 +76,9 @@ extern "C" {
         d_a: *mut u64,
         d_b: *const u64,
         s1: u64,
+        s1_precon: u64,
         s2: u64,
+        s2_precon: u64,
         q: u64,
         n: u32,
         s: *mut c_void,
@@ -345,11 +347,15 @@ impl RescaleContext {
                 qi,
                 std::ptr::null_mut(),
             );
+            let s1_precon = (((self.s1[t] as u128) << 64) / (qi as u128)) as u64;
+            let s2_precon = (((self.s2[t] as u128) << 64) / (qi as u128)) as u64;
             LaunchRescaleFuse(
                 self.d_c.tower_mut_u64(t, nn),
                 self.d_scratch.as_const_u64(),
                 self.s1[t],
+                s1_precon,
                 self.s2[t],
+                s2_precon,
                 qi,
                 nn as u32,
                 std::ptr::null_mut(),

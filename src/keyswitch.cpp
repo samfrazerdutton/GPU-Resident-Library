@@ -19,6 +19,10 @@ struct RootTab { std::vector<uint64_t> fr,fp,ir,ip; uint64_t ninv,ninv_p; };
 uint64_t powmod(uint64_t b, uint64_t e, uint64_t q){ unsigned __int128 r=1,bb=b%q;
     while(e){ if(e&1) r=(r*bb)%q; bb=(bb*bb)%q; e>>=1;} return (uint64_t)r; }
 uint64_t invmod(uint64_t a, uint64_t q){ return powmod(a,q-2,q); } // q prime
+// GOD PROMPT "CKKS PHASE 39": for LaunchModDownCombine's new sPrecon
+// parameter -- duplicated per this project's established convention of
+// duplicating small per-file helpers rather than centralizing them.
+uint64_t shoup_precon(uint64_t c, uint64_t q) { return (uint64_t)(((unsigned __int128)c << 64) / q); }
 
 RootTab build_tab(uint32_t n, uint64_t q, uint64_t root){
     uint64_t rootInv=invmod(root,q);
@@ -218,7 +222,7 @@ KeySwitchResult keyswitch_core_resident(
             LaunchNTT_CT(dx,T.fr,T.fp,n,q,0);
             std::vector<uint64_t> ha(res.begin()+(size_t)i*n, res.begin()+(size_t)(i+1)*n);
             uint64_t *da=up(ha),*dans; cudaMalloc(&dans,B);
-            LaunchModDownCombine(dans,da,dx,K.pInvModq[i],q,n,0);
+            LaunchModDownCombine(dans,da,dx,K.pInvModq[i],shoup_precon(K.pInvModq[i],q),q,n,0);
             cudaMemcpy(out.data()+(size_t)i*n,dans,B,cudaMemcpyDeviceToHost);
             cudaFree(dx);cudaFree(da);cudaFree(dans); }
         return out;

@@ -19,6 +19,9 @@ namespace {
 uint64_t mulmod(uint64_t a,uint64_t b,uint64_t q){return(uint64_t)(((unsigned __int128)a*b)%q);}
 uint64_t powmod(uint64_t b,uint64_t e,uint64_t q){unsigned __int128 r=1,bb=b%q;while(e){if(e&1)r=(r*bb)%q;bb=(bb*bb)%q;e>>=1;}return(uint64_t)r;}
 uint64_t invmod(uint64_t a,uint64_t q){return powmod(a%q,q-2,q);}
+// GOD PROMPT "CKKS PHASE 39": for LaunchModDownCombine's new sPrecon
+// parameter -- duplicated per this project's established convention.
+uint64_t shoup_precon(uint64_t c, uint64_t q) { return (uint64_t)(((unsigned __int128)c << 64) / q); }
 uint64_t* upv(const std::vector<uint64_t>& h, cudaStream_t s=0){ uint64_t* d;
     cudaMalloc(&d,h.size()*8);
     cudaMemcpyAsync(d,h.data(),h.size()*8,cudaMemcpyHostToDevice,s);
@@ -424,7 +427,8 @@ void ks_moddown(const DeviceKSContext& C, DeviceKSWork& W,
     for(uint32_t i=0;i<sizeQl;++i){
         uint64_t q=C.qModHost[i];
         LaunchModDownCombine(d_out+(size_t)i*n, d_res+(size_t)i*n,
-                             W.d_qsw+(size_t)i*n, C.pInvModqHost[i], q, n, s);
+                             W.d_qsw+(size_t)i*n, C.pInvModqHost[i],
+                             shoup_precon(C.pInvModqHost[i], q), q, n, s);
     }
 }
 
@@ -454,7 +458,8 @@ void rescale_resident_raw(uint64_t* d_c, uint32_t towers,
         cudaMemcpyAsync(d_scratch, d_drop, (size_t)n*8, cudaMemcpyDeviceToDevice, s);
         LaunchSwitchModulus(d_scratch, qLast, qi, n, s);
         LaunchNTT_CT(d_scratch, C.d_fr[r], C.d_fp[r], n, qi, s);
-        LaunchRescaleFuse(d_c+(size_t)t*n, d_scratch, s1[t], s2[t], qi, n, s);
+        LaunchRescaleFuse(d_c+(size_t)t*n, d_scratch, s1[t], shoup_precon(s1[t],qi),
+                          s2[t], shoup_precon(s2[t],qi), qi, n, s);
     }
 }
 

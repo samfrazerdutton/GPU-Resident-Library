@@ -146,7 +146,8 @@ struct RescaleContextCpp {
             cudaMemcpyAsync(d_scratch, d_drop, bytes, cudaMemcpyDeviceToDevice, 0);
             LaunchSwitchModulus(d_scratch, qLast, qi, n, 0);
             LaunchNTT_CT(d_scratch, d_fr[t], d_fp[t], n, qi, 0);
-            LaunchRescaleFuse(d_c + (size_t)t * n, d_scratch, s1[t], s2[t], qi, n, 0);
+            uint64_t p1=(uint64_t)(((unsigned __int128)s1[t]<<64)/qi), p2=(uint64_t)(((unsigned __int128)s2[t]<<64)/qi);
+            LaunchRescaleFuse(d_c + (size_t)t * n, d_scratch, s1[t], p1, s2[t], p2, qi, n, 0);
         }
         cudaDeviceSynchronize();
 

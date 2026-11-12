@@ -81,7 +81,8 @@ static std::vector<uint64_t> gpu_rescale_component(
         std::vector<uint64_t> acoeff(n);
         for (uint32_t i=0;i<n;++i) acoeff[i]=comp.GetAllElements()[t][i].ConvertToInt();
         cudaMemcpy(d_a,acoeff.data(),B,cudaMemcpyHostToDevice);
-        LaunchRescaleFuse(d_a,d_b,s1[t],s2[t],Qi,n,0);
+        uint64_t p1=(uint64_t)(((unsigned __int128)s1[t]<<64)/Qi), p2=(uint64_t)(((unsigned __int128)s2[t]<<64)/Qi);
+        LaunchRescaleFuse(d_a,d_b,s1[t],p1,s2[t],p2,Qi,n,0);
         cudaDeviceSynchronize();
         cudaMemcpy(out.data()+t*n,d_a,B,cudaMemcpyDeviceToHost);
         cudaFree(d_b); cudaFree(d_fr); cudaFree(d_fp); cudaFree(d_a);

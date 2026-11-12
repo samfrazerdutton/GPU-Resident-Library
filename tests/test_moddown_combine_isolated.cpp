@@ -151,7 +151,7 @@ int main() {
                 LaunchNTT_CT(dx, d_fr, d_fp, n, q, 0);
                 std::vector<uint64_t> ha(res.begin() + (size_t)i * n, res.begin() + (size_t)(i + 1) * n);
                 uint64_t *da = up(ha), *dans; cudaMalloc(&dans, (size_t)n * 8);
-                LaunchModDownCombine(dans, da, dx, K.pInvModq[i], q, n, 0);
+                LaunchModDownCombine(dans, da, dx, K.pInvModq[i], (uint64_t)(((unsigned __int128)K.pInvModq[i] << 64) / q), q, n, 0);
                 cudaMemcpy(out.data() + (size_t)i * n, dans, (size_t)n * 8, cudaMemcpyDeviceToHost);
                 cudaFree(dx); cudaFree(d_fr); cudaFree(d_fp); cudaFree(da); cudaFree(dans);
             }

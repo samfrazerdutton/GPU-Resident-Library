@@ -132,7 +132,8 @@ int main() {
         std::vector<uint64_t> ha(n);
         for(uint32_t k=0;k<n;++k) ha[k]=A.GetAllElements()[i][k].ConvertToInt();
         uint64_t *da=up(ha), *dans; cudaMalloc(&dans,B);
-        LaunchModDownCombine(dans,da,dx,PInvModq[i].ConvertToInt(),q.ConvertToInt(),n,0);
+        uint64_t p_s=PInvModq[i].ConvertToInt(), p_q=q.ConvertToInt();
+        LaunchModDownCombine(dans,da,dx,p_s,(uint64_t)(((unsigned __int128)p_s<<64)/p_q),p_q,n,0);
         cudaDeviceSynchronize();
         cudaMemcpy(got.data()+(size_t)i*n,dans,B,cudaMemcpyDeviceToHost);
         cudaFree(dx);cudaFree(dr);cudaFree(dpp);cudaFree(da);cudaFree(dans);
