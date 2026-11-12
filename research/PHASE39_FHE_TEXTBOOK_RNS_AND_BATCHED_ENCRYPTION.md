@@ -438,5 +438,9 @@ repeated here) are unaffected and not revisited.
 
 ## 12. Exact commits and push status
 
-See the end of this session's work for exact commit hashes (filled in
-immediately after creation) and push confirmation.
+Two commits, on top of Phase 38's `d1dc2be`:
+- `0baae6b` -- Tracks D/E/F: the Shoup-ified ModDown and RescaleFuse kernels, the standalone reproducer, and the Rust FFI fix.
+- `4550cc8` -- this report, the companion implementation map, the ledger entry, the K=32 investigation benchmark, and the NEXT_SESSION.md handoff.
+
+Both verified fast-forward-pushable and pushed to `origin/main`, with
+the remote confirmed matching local HEAD afterward.
