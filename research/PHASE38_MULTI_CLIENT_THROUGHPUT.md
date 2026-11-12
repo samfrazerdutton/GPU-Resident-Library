@@ -391,5 +391,9 @@ No orphaned/runaway process was left behind at any point this session.
 
 ## 15. Exact commits and push status
 
-See the end of this session's work for exact commit hashes (filled in
-immediately after creation) and push confirmation.
+Two commits, on top of Phase 37's `5061631`:
+- `1a37d7e` -- Track A/B/E: the new multi-client batched encryption function, its correctness test, and its benchmark.
+- `3e6b905` -- this report, the ledger entry, and the NEXT_SESSION.md handoff.
+
+Both verified fast-forward-pushable and pushed to `origin/main`, with
+the remote confirmed matching local HEAD afterward.
