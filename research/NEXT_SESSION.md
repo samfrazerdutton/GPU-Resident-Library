@@ -3,6 +3,122 @@
 ## Current commit
 
 Check `git log -8 --oneline` on resume. As of this writing HEAD should be
+the Phase 37 commit(s), on top of Phase 36's `69abd0d` (verified matching
+`origin/main` exactly, 0 ahead/0 behind, at Phase 37 start). Hardware
+re-confirmed unchanged: RTX 2060 Max-Q, 6144 MiB, driver 595.97, CUDA
+13.2, cmake 3.28.3, Rust/cargo 1.94.0, 16 logical cores, gcc 13.3.0,
+Ubuntu 24.04.4. Windows free RAM was EVEN MORE VOLATILE this session
+than Phase 36's own (observed range ~1.1-7.3 GiB, vs Phase 36's
+1.98-5.9 GiB) — a base-suite `ctest` batch was killed by the host for
+low memory even AFTER excluding the 4 heaviest n=131072-class tests;
+re-run successfully in 4 smaller sub-batches by test-ID range instead.
+`test_n131072_cache_churn` specifically was killed by the host TWICE in
+a row despite both attempts starting with free RAM well above its own
+~3.2 GiB documented requirement — check free RAM is not just above the
+threshold but STABLE before re-attempting it.
+
+**Full detail for this phase**:
+`research/PHASE37_PRODUCTION_ENCRYPTION_CPU_OPTIMIZATION.md`.
+
+**Measurement correction (not new science, but overdue bookkeeping)**:
+added an explicit, non-destructive correction note directly under
+Phase 34's original "CPU-side work is only 1.2-2.5%" claim in
+`research/PHASE34_PERFORMANCE_INVESTIGATION.md` itself (not just in a
+later phase's report) — confirmed no OTHER document's numeric claim
+depends on the same flawed external-cudaEvent-bracketing technique.
+
+**Track A — finer CPU profile (refines, not contradicts, Phase 36)**:
+direct internal instrumentation (applied, measured across 320 real
+production calls, reverted) cleanly separates RNG/alloc/embed/
+table-build (CPU) from the GPU section from the combine loop (CPU) for
+the first time — Phase 36's own 40-48% CPU-side estimate had lumped
+the GPU section and the combine loop together, biasing it down; the
+real split is **~53% CPU / ~43% GPU**. **RNG sampling is the single
+largest CPU component (19.6% of a call, 97.8% of which is the actual
+Gaussian/ternary draws, not setup overhead)** — explicitly NOT a safe
+optimization target given this project's randomness/security
+constraints; do not revisit this without dedicated, independently
+reviewed cryptographic analysis of any proposed alternative.
+
+**Track B/C — Phase 36's own speculative ranking was wrong, and the
+actual safe candidate was smaller than hoped, but real**: Phase 36
+ranked "replace the combine loop's per-element Shoup-reduction division
+with a Barrett reduction" as its best-supported remaining candidate
+WITHOUT working out the actual arithmetic. This phase did that analysis
+and found a correct double-wide Barrett reduction needs genuine
+multi-precision arithmetic (the 128-bit product times a ~63-bit mu
+exceeds what `unsigned __int128` holds directly) and is NOT clearly
+cheaper than Shoup's existing approach (which already reuses its one
+division across 2 multiplies) — **do not re-attempt this exact
+candidate without first costing out the real multi-precision
+arithmetic**, which this phase's analysis already did once; repeating
+that work from scratch would be wasted effort unless genuinely new
+information changes the picture.
+
+Instead implemented the EMBED loop's `barrett_reduce_u64`: replaced an
+unbounded `while (r>=T.q) r-=T.q;` with 2 bounded `if` corrections,
+justified by classical Barrett theory AND a 70-million-trial standalone
+reproducer (kept: `research/benchmarks/bench_barrett_reduce_bound_check.cpp`)
+plus a new PERMANENT regression test
+(`tests/test_barrett_reduce_bounded_correction.cpp`). Isolated speedup:
+a clean, reproducible **1.033x (3.3%)**. End-to-end
+(`bench_aggregation_decomposed`, 7 interleaved A/B pairs): essentially
+a wash (NEW median 81.82ms vs OLD 81.76ms; NEW mean 82.06ms vs OLD
+82.44ms, ~0.46% favoring NEW) — small and noisy, but exactly consistent
+with the isolated measurement's own back-of-envelope prediction (a 3.3%
+win on a 16.4%-weighted component predicts ~0.5% end-to-end). KEPT: not
+a fabricated win, but a real, rigorously-verified, zero-risk
+improvement whose end-to-end contribution is honestly small. **If
+re-measuring this change's end-to-end effect under calmer system
+conditions, expect it to still be small — do not expect a large
+end-to-end number just because the host is quieter.**
+
+**Track D**: with this change in place, the dominant remaining costs
+are GPU-side transfer (already at/near the measured PCIe floor,
+pinned memory already explored and rejected) and CPU-side RNG sampling
+(off-limits per above). The combine loop (14.6%) remains the only
+other large CPU bucket and does NOT have an obviously-safe cheaper
+algorithm per this phase's analysis — any future attempt needs its own
+fresh standalone reproducer, not a repeat of Phase 36's speculation.
+
+**Track E**: reviewed (not expanded) the `authenticated_financial_input`
+boundary against the full mission checklist — confirmed already
+adequate (metadata binding real, shape validation present, fail-closed,
+deterministic serialization, mock labeling intact, core-library
+isolation intact). Zero changes made.
+
+**Regression**: C++ 118/128 (same 10 pre-existing failures, zero new
+regressions) + `test_n131072_keysize` passing; `test_n131072_cache_churn`
+NOT verified this session (resource exhaustion, see above — re-run
+first next session once memory is confirmed stable, not just
+momentarily sufficient); `test_boot_n131072`/`test_n131072_gpu_lifecycle`
+deferred as usual. Rust 62/0/1, both modes, unchanged.
+
+## Immediate next actions, in order (Phase 37 handoff)
+
+1. **Re-run `test_n131072_cache_churn` first** — it was not verified
+   this session due to resource exhaustion (not a regression). Confirm
+   free RAM is stable above ~3.2 GiB for several checks in a row, not
+   just momentarily, before attempting it.
+2. **Do not re-rank the combine-loop Barrett-reduction candidate from
+   scratch** — this phase already costed out the real multi-precision
+   arithmetic required and found it unpromising as currently
+   understood. If revisiting, start from that analysis
+   (`research/PHASE37_PRODUCTION_ENCRYPTION_CPU_OPTIMIZATION.md`
+   section 5/6.1), not a fresh guess.
+3. **Do not attempt an RNG algorithm/distribution change** without
+   dedicated, independently reviewed cryptographic analysis — it is
+   the largest CPU cost found this phase, but explicitly off-limits
+   without that review.
+4. **`test_boot_n131072` still needs fine-grained per-allocation memory
+   instrumentation before another attempt** — unchanged from every
+   prior phase's handoff on this exact point.
+5. Re-check Windows free RAM before any memory-sensitive step — this
+   session's volatility (1.1-7.3 GiB) may or may not persist.
+
+## Earlier commit (Phase 36)
+
+Check `git log -8 --oneline` on resume. As of this writing HEAD should be
 the Phase 36 commit(s), on top of Phase 35's `a07ecf8` (verified matching
 `origin/main` exactly, 0 ahead/0 behind, at Phase 36 start). Hardware
 re-confirmed unchanged: RTX 2060 Max-Q, 6144 MiB, driver 595.97, CUDA

@@ -113,6 +113,31 @@ point):
   optimizations succeeded completely (CPU work that was once 37-45% of
   the OLD `encrypt_host`'s total is now ~1-3% of the NEW function's much
   smaller total).
+
+  > **CORRECTION (Phase 36, `research/PHASE36_END_TO_END_OPTIMIZATION.md`
+  > section 3.1), added without altering the measurement above**: this
+  > 1.2-2.5% figure is NOT a valid estimate of CPU-side cost and should
+  > not be relied on. The methodology itself was flawed, independent of
+  > any change in the production code since this phase: bracketing the
+  > ENTIRE function call externally with `cudaEventRecord` calls
+  > before/after only measures when the CPU thread reaches each
+  > `cudaEventRecord` line — and the CLOSING event can only be enqueued
+  > after ALL preceding host-only work (RNG, Barrett-embed,
+  > Shoup-combine) has already finished executing. The "GPU-bracketed"
+  > window therefore re-measures almost the entire wall-clock span, not
+  > isolated GPU-only time, making `wall_time - gpu_bracketed_time`
+  > meaningless as a CPU-only estimate — it does not correctly subtract
+  > out the CPU-only portion at all. Phase 36 built direct INTERNAL
+  > instrumentation (timers placed at the true start/end boundaries of
+  > the GPU-touching code, inside the function itself) and found the
+  > real split is approximately **40-48% CPU-side, 52-60% GPU-side** —
+  > roughly 20-40x larger than this entry's own 1.2-2.5% figure. The
+  > original numbers above are left unchanged as the historical record
+  > of what this phase actually measured and believed at the time; this
+  > note exists so a future reader does not treat them as still valid.
+  > No other numeric claim in this document (the PCIe transfer floor,
+  > the kernel-launch count, the kernel-merge speedup) depends on this
+  > external-bracketing technique or is affected by this correction.
 - **`research/benchmarks/bench_transfer_only.cpp`**: isolates pure PCIe
   H2D+D2H for a buffer the EXACT size of the production packed buffer
   (1,048,576 bytes, pageable memory, matching production exactly).
