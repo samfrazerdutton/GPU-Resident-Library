@@ -462,5 +462,10 @@ change) passing, and `authenticated_financial_input` passing (its
 
 ## 11. Exact commits and push status
 
-See the end of this session's work for exact commit hashes (filled in
-immediately after creation, in the same session) and push confirmation.
+Two commits, on top of Phase 36's `69abd0d`:
+- `b149aef` -- Track B/C: bound barrett_reduce_u64's correction loop, verified first via a standalone reproducer, kept with a new permanent regression test.
+- `bd5149e` -- the historical Phase 34 measurement correction and this phase's documentation (this report, the ledger entry, and the NEXT_SESSION.md handoff).
+
+Both verified fast-forward-pushable and pushed to `origin/main`; see
+the git-push confirmation recorded alongside this session's final
+summary.
