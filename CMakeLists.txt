@@ -219,6 +219,14 @@ gpufhe_test(test_encrypt_host_shoup_pooled_barrett_batched_matches_reference tes
 gpufhe_test(test_encrypt_host_shoup_pooled_barrett_batched_concurrency_audit tests/test_encrypt_host_shoup_pooled_barrett_batched_concurrency_audit.cpp)
 gpufhe_test(test_encrypt_host_shoup_pooled_barrett_batched_pinned_matches_reference tests/test_encrypt_host_shoup_pooled_barrett_batched_pinned_matches_reference.cpp)
 gpufhe_test(test_encrypt_host_shoup_pooled_barrett_batched_pinned_concurrency_audit tests/test_encrypt_host_shoup_pooled_barrett_batched_pinned_concurrency_audit.cpp)
+# GOD PROMPT "CKKS PHASE 37": permanent regression guard for the Barrett-
+# reduction bound src/encrypt_host_shoup_pooled_barrett_batched.cpp's
+# barrett_reduce_u64 now relies on (2 bounded corrections instead of an
+# unbounded while loop) -- self-contained, no gpufhe/CUDA dependency, so
+# it runs on every ordinary regression pass. See research/
+# PHASE37_PRODUCTION_ENCRYPTION_CPU_OPTIMIZATION.md.
+add_executable(test_barrett_reduce_bounded_correction tests/test_barrett_reduce_bounded_correction.cpp)
+add_test(NAME test_barrett_reduce_bounded_correction COMMAND test_barrett_reduce_bounded_correction)
 # GOD PROMPT "CKKS PHASE 16": correctness + lifecycle/concurrency tests
 # for the explicit pinned-memory PREWARMING API (encrypt_prewarm_
 # pinned_buffer/encrypt_pinned_buffer_is_ready/encrypt_host_shoup_

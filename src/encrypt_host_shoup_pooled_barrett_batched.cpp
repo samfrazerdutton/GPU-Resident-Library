@@ -87,7 +87,21 @@ inline TowerBarrett make_tower_barrett(uint64_t q) {
 inline uint64_t barrett_reduce_u64(uint64_t x, const TowerBarrett& T) {
     uint64_t qhat = (uint64_t)(((unsigned __int128)x * T.mu) >> 64);
     uint64_t r = x - qhat * T.q;
-    while (r >= T.q) r -= T.q;
+    // GOD PROMPT "CKKS PHASE 37": classical Barrett reduction (mu =
+    // floor(2^64/q), x < 2^64) never needs more than 2 corrective
+    // subtractions here -- verified empirically, not just derived, via a
+    // standalone 70-million-trial probe (research/benchmarks/
+    // bench_barrett_reduce_bound_check.cpp) across every bit-width this
+    // project actually uses (30-62 bits, real primes from native_primes)
+    // plus explicit boundary cases and 2M random x per modulus spanning
+    // the full uint64_t domain: the original while loop never iterated
+    // more than once, and this bounded form was bit-exact in all 70M
+    // trials. Replacing the data-dependent while loop (unpredictable
+    // branch, called 4*sizeQ*n times per encrypt call via emb_barrett)
+    // with two straight-line conditional subtractions lets the compiler
+    // emit branch-free code (e.g. CMOV) instead of a loop-exit branch.
+    if (r >= T.q) r -= T.q;
+    if (r >= T.q) r -= T.q;
     return r;
 }
 inline uint64_t emb_barrett(long x, const TowerBarrett& T) {
