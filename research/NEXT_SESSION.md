@@ -3,6 +3,87 @@
 ## Current commit
 
 Check `git log -8 --oneline` on resume. As of this writing HEAD should be
+the Phase 39 commit(s), on top of Phase 38's `d1dc2be` (verified matching
+`origin/main` exactly, 0 ahead/0 behind, at Phase 39 start). Hardware
+re-confirmed unchanged: RTX 2060 Max-Q, 6144 MiB, driver 595.97, CUDA
+13.2, cmake 3.28.3, Rust/cargo 1.94.0, 16 logical cores, gcc 13.3.0,
+Ubuntu 24.04.4. Windows free RAM started very low (~1.25 GiB) and
+fluctuated ~1.9-6.7 GiB through the session -- `test_n131072_cache_churn`
+was killed by the host twice and not verified passing this session.
+
+**Full detail for this phase**:
+`research/PHASE39_FHE_TEXTBOOK_RNS_AND_BATCHED_ENCRYPTION.md` and its
+companion `research/PHASE39_FHE_TEXTBOOK_IMPLEMENTATION_MAP.md`.
+
+**Reference PDFs** (the FHE textbook, Gentry's dissertation, TLShare)
+are at `~/fhe-reference-material/` -- found in `~/Downloads/`, not
+pre-placed; NOT committed to the repo (copyrighted, no redistribution
+license). If this directory is missing next session, re-locate the
+files or ask the user to re-supply them before assuming the textbook
+mapping needs to be redone from scratch -- it doesn't; the mapping
+document already captures the findings.
+
+**K=32 is NOT a batched-kernel defect -- do not re-investigate the
+batching implementation for it.** Root-caused this phase: the
+UNCHANGED sequential arm shows the identical per-client-cost jump at
+the identical K, ruling out anything about Phase 38's own grid/
+occupancy/register design. Most likely a GPU power-management state
+transition on this specific Max-Q laptop, tied to cumulative per-round
+GPU-busy duration, not literally "32" as a number. A continuous
+`nvidia-smi` clock-logging attempt across one full sweep did NOT
+succeed this session (tooling limitation, not disproof) -- if revisiting,
+fix that logging first rather than re-deriving the grid-geometry
+argument again.
+
+**Two RNS kernels were Shoup-ified this phase** (`kernels/moddown.cu`'s
+`ApproxModDown` combine, `kernels/rescale.cu`'s `rescale_fuse_kernel`) --
+bit-exact verified (35M-trial standalone reproducer + full existing
+differential suite), isolated speedup near-invisible at n=8192 (launch-
+overhead-dominated, ~1.03x) but real at n=131072 (1.44x-1.88x). **A
+genuine near-miss, caught by the Rust suite, not the C++ one**: Rust's
+own `rescale.rs` has a SEPARATE FFI declaration for `LaunchRescaleFuse`
+(its build.rs compiles the kernel independently) that still had the old
+signature after the C++ side was fixed -- caused a real SIGSEGV until
+fixed. **If touching any kernel with a Rust FFI declaration again, grep
+`rust/crates/*/src/*.rs` for its name FIRST**, before assuming the C++
+call sites are the only ones.
+
+**The textbook mapping identified `P >= Q_part_max`'s own textbook
+justification** (`ApproxSwitchCRTBasis` = `FastBConv`, genuinely
+approximate, `P` must absorb its noise) and found this project has NO
+separate `ModDrop` operation at all (only full rescale) -- not a bug,
+just a gap this project's shallow workloads have never needed to close.
+`SmallMont`/`FastBConvEx` remain deliberately unimplemented (would touch
+security-relevant `P`, or aren't needed by this project's CKKS
+multiplication structure respectively).
+
+**Regression**: C++ 130/134 (same 10 pre-existing failures, zero new
+regressions) + `test_n131072_keysize` passing (twice); `cache_churn` NOT
+verified this session. Rust 62/0/1, both modes, AFTER the FFI fix above.
+
+## Immediate next actions, in order (Phase 39 handoff)
+
+1. **Re-run `test_n131072_cache_churn` first** once free RAM is
+   confirmed stable above ~3.2 GiB, not just momentarily.
+2. **If revisiting the K=32 anomaly**, get continuous `nvidia-smi`
+   clock/throttle-reason logging working across one full sweep before
+   anything else -- this session's attempt failed for tooling reasons,
+   not because the hypothesis is wrong.
+3. **Do not add `SmallMont` or `FastBConvEx`** without a dedicated
+   security review of `P >= Q_part_max`'s margin -- this phase
+   deliberately left both unimplemented.
+4. **If adding an n=131072 rescale/key-switch differential test**
+   (deferred this phase, section 11 of the main report), that would
+   close a real coverage gap -- this project's existing `test_rescale_*`
+   suite only covers n=1024/n=8192.
+5. **`test_boot_n131072` still needs fine-grained per-allocation memory
+   instrumentation** before another attempt -- unchanged from every
+   prior phase's handoff on this exact point.
+6. Re-check Windows free RAM before any memory-sensitive step.
+
+## Earlier commit (Phase 38)
+
+Check `git log -8 --oneline` on resume. As of this writing HEAD should be
 the Phase 38 commit(s), on top of Phase 37's `5061631` (verified matching
 `origin/main` exactly, 0 ahead/0 behind, at Phase 38 start). Hardware
 re-confirmed unchanged: RTX 2060 Max-Q, 6144 MiB, driver 595.97, CUDA
