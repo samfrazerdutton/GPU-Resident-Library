@@ -3,6 +3,120 @@
 ## Current commit
 
 Check `git log -8 --oneline` on resume. As of this writing HEAD should be
+the Phase 35 commit(s), on top of Phase 34's `2012092` (verified matching
+`origin/main` exactly, 0 ahead/0 behind, at Phase 35 start). Hardware
+re-confirmed unchanged: RTX 2060 Max-Q, 6144 MiB, driver 595.97, CUDA
+13.2, cmake 3.28.3, Rust/cargo 1.94.0. Windows free RAM fluctuated
+1.97-5.11 GiB across this session.
+
+**Read the uploaded paper in full** (TLShare, IACR CiC Vol 3 No 3, all
+33 technical pages) before any implementation. **Conclusion, stated
+directly**: none of TLShare's three protocols (MPC/Pedersen-VSS, FHE
+with NIZK/CGGI, FHE with IZK/prime-field LWE) are compatible with this
+project's ring-based CKKS as published — two use a different FHE scheme
+entirely (CGGI/TFHE) or no FHE at all (MPC mode), and the third is
+explicitly limited by the paper's OWN authors to prime-field LWE,
+stated as lacking ring-structure support. A genuine CKKS-compatible
+provenance proof would need to handle ring (polynomial) arithmetic, a
+second encoding-approximation source CKKS has that neither paper
+construction needs to prove anything about, and circuits plausibly
+orders of magnitude larger than the paper's own already-substantial
+148-million-gate/1.6-million-edaBit n=2048 scalar LWE circuit — none of
+this was attempted, invented, or claimed solved this round. Full
+protocol-by-protocol comparison, the exact compatibility reasoning, and
+the paper's own threat-model assumptions:
+`research/PHASE35_TLSHARE_CKKS_INTEGRATION.md`.
+
+**Confirmed, from direct source reading, the actual input-authenticity
+gaps in the existing financial aggregation application**: client values
+in `bench/bench_private_aggregation_workload.cpp` are 100% synthetic
+(`std::uniform_real_distribution` fed by a fixed-seed `mt19937_64`), with
+no source authentication, no session/client-identity concept, and no
+replay protection anywhere in the codebase — none of these are
+confirmed vulnerabilities (there is no live service or network boundary
+to exploit), all are architectural gaps relative to a hypothetical real
+deployment, exactly the gap TLShare's paper targets. Full findings
+table in the Phase 35 report section 5.
+
+**Built a scoped, explicitly-mock authenticated-input prototype**
+(`include/authenticated_financial_input.h`,
+`src/authenticated_financial_input.cpp`,
+`examples/authenticated_financial_input/`), kept OUT of `libgpufhe`
+(compiled only into its own executable) so this research module cannot
+affect any core CKKS build target. Demonstrates session binding, source
+identity, and rejection of tampered records/changed sessions/altered
+metadata/duplicate submissions/invalid attestations/missing
+ciphertexts (11/11 checks, `ctest -R authenticated_financial_input`,
+re-run 3x stable) — using the REAL, unmodified
+`encode_host_fft`/`encrypt_host_shoup_pooled_barrett_batched`/
+`ct_add_ct_host`/`decrypt_host`/`decode_host_fft` pipeline for the actual
+cryptography, with the "attestation" itself explicitly, repeatedly
+labeled as a non-cryptographic mock (NOT HMAC, NOT a signature scheme).
+A real bug was caught in this round's own test harness before trusting
+any result: the test's commitment-digest helper didn't incorporate the
+session, causing two of its own test cases to collide and fail for the
+wrong reason — fixed, then re-verified all 11 checks pass for the right
+reasons.
+
+**Encode/FFT investigation — a documented null result, not a shipped
+change**: re-verified encode is still the next-largest relative stage
+(~11.7-12% of end-to-end). Found, by direct reading of
+`src/encode_fft.cpp`, that `fft_unnormalized_inverse` takes its
+parameter by value and its one call site passes an lvalue, silently
+copying a 256 KB buffer every encode call that could safely be moved
+instead (confirmed unused afterward). Isolated measurement showed a
+real, reproducible ~1.82-1.87x improvement — but a proper `git
+stash`-based A/B directly on the real `bench_aggregation_decomposed`
+workload showed **no measurable difference** (9.98-10.05ms before vs.
+10.00-10.07ms after, within noise). Investigated why rather than just
+reporting the discrepancy: the isolated probe runs encode in a tight,
+continuously-CPU-busy loop; the real workload interleaves each encode
+call with a multi-millisecond GPU-bound phase, plausibly letting the CPU
+downclock between calls — the direct CPU-frequency-scaling analog of
+Phase 34's own GPU-clock-drift lesson. Per this phase's explicit "if
+the result is null, revert your own experiment" instruction, the
+`src/encode_fft.cpp` change was reverted (confirmed zero diff via
+`git diff` afterward) despite being correctness-neutral — the standalone
+timing probe is kept as a reusable tool, not shipped as a production
+change.
+
+**Regression (re-run fresh this round)**: C++ `ctest`: **117/127
+passing**, the exact same 10 pre-existing documented failures as every
+prior phase, zero new regressions — this count includes both
+n=131072 tests (both re-confirmed passing this round, `test_n131072_cache_churn`
+run once memory recovered to 5.11 GiB) and the new
+`authenticated_financial_input` test. Rust: 62 passed/0 failed/1
+ignored, both debug-serial and release-parallel, unchanged.
+
+**Left genuinely uncommitted and out of scope** (carried forward
+unchanged): `graphify-out/GRAPH_REPORT.md`/`graph.json`, `.claude/agents/`,
+`.claude/skills/scrum-orchestrator/`, `.scrum-orchestrator/`,
+`tools/__pycache__/`.
+
+## Immediate next actions, in order (Phase 35 handoff)
+
+1. **Do not re-attempt a CKKS provenance proof by transplanting CGGI or
+   prime-field LWE** — read `research/PHASE35_TLSHARE_CKKS_INTEGRATION.md`
+   section 3 first. If pursuing this at all, the first real step is
+   sizing an RLWE-adapted proof circuit's complexity at this project's
+   actual ring dimensions (8192+), not implementing one blind.
+2. **The mock attestor's `attest()` currently receives the plaintext
+   value indirectly via the commitment** — a real design should make it
+   operate on commitments only. Fix this before adding any more features
+   to the authenticated-input prototype.
+3. **The CPU-power-state hypothesis for the encode null result is not
+   independently confirmed** — only inferred from the measurement
+   pattern. If revisiting encode performance, confirm it directly (e.g.
+   sampling `/sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq`
+   during the real workload) before trying another isolated
+   micro-optimization that may not transfer either.
+4. **Run `tests/test_boot.cpp` the moment the 10 GiB memory gate
+   clears** — now EIGHT phases running without this verification.
+5. Re-run the Windows free-RAM gate check before any of the above.
+
+## Earlier commit (Phase 34)
+
+Check `git log -8 --oneline` on resume. As of this writing HEAD should be
 the Phase 34 commit(s), on top of Phase 33's `f95eb74` (verified matching
 `origin/main` exactly, 0 ahead/0 behind, at Phase 34 start). Hardware
 re-confirmed unchanged: RTX 2060 Max-Q, 6144 MiB, driver 595.97, CUDA
