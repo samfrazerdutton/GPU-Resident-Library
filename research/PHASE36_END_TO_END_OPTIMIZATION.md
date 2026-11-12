@@ -458,6 +458,9 @@ regressions, plus 3 net new passing checks in `authenticated_financial_input`
 
 ## 10. Exact commits and push status
 
-See `git log` at the time this phase's commits were created; this
-section is finalized once the commits exist (immediately following, in
-the same session).
+Two commits, on top of Phase 35's `a07ecf8`:
+- `2d32b60` -- Track C: harden authenticated_financial_input envelope validation.
+- `4161262` -- Track A/B/D/E: end-to-end bottleneck investigation and research synthesis (this document, the ledger entry, and the NEXT_SESSION.md handoff).
+
+Both verified fast-forward-pushable and pushed to `origin/main` (see the
+end of this session's final report for push confirmation).
