@@ -3,6 +3,92 @@
 ## Current commit
 
 Check `git log -8 --oneline` on resume. As of this writing HEAD should be
+the Phase 38 commit(s), on top of Phase 37's `5061631` (verified matching
+`origin/main` exactly, 0 ahead/0 behind, at Phase 38 start). Hardware
+re-confirmed unchanged: RTX 2060 Max-Q, 6144 MiB, driver 595.97, CUDA
+13.2, cmake 3.28.3, Rust/cargo 1.94.0, 16 logical cores, gcc 13.3.0,
+Ubuntu 24.04.4. Windows free RAM fluctuated ~2.6-6.9 GiB this session --
+this time nothing was killed; both n=131072 light tests passed cleanly
+(including `test_n131072_cache_churn`, which Phase 37 could not verify
+due to host memory pressure).
+
+**Full detail for this phase**:
+`research/PHASE38_MULTI_CLIENT_THROUGHPUT.md`.
+
+**The headline result**: the existing sequential multi-client path has
+NO economy of scale (confirmed by re-running Phase 29's own
+`bench_aggregation_client_scaling` unmodified -- runtime scales
+linearly with K, VRAM stays flat). Built a genuine BATCHED multi-client
+encrypt function, `encrypt_host_shoup_pooled_barrett_batched_multiclient`
+(new file -- the existing single-client function is completely
+untouched), by generalizing Phase 34's own already-proven kernel-merge
+technique one level further: `kernels/ntt_ct.cu` indexes towers purely
+via `blockIdx.y`, so repeating the per-tower tables M times (once per
+client, since mod/root are shared across clients in one aggregation
+round) and widening `towers` to `4*sizeQ*M` is the identical
+mathematical argument Phase 34 already used for v/e0/e1/m, applied
+once more for M clients. Verified bit-exact against M sequential calls
+to the existing function across a wide (n,sizeQ,M) matrix (including
+M=1 and non-power-of-2 M) before trusting any performance number.
+
+**Throughput result, reported honestly, not oversold**: real,
+reproducible speedup for K<=16 (1.07x-1.38x, peaking ~1.3-1.4x at
+K=16, confirmed across 3 independent runs), but a consistently
+reproduced, NOT root-caused dip to ~1.02-1.04x at K=32 specifically
+(bracketed by stronger results at K=16 and K=64, so it doesn't fit a
+simple "overhead amortizes with scale" story on its own). **Do not
+assume this dip is noise without checking** -- it reproduced across 3
+separate runs. If investigating, start with Phase 37's own `[P37]`-style
+internal CPU/GPU split instrumentation technique, applied to the
+batched function specifically at K=32, before guessing.
+
+**CPU/GPU overlap (Track C) was investigated, not implemented**: the
+batched function front-loads ALL CPU work before its one GPU call, so
+there's no within-call CPU work to overlap with that call's own GPU
+phase. Real overlap needs a CROSS-BATCH double-buffered pipeline
+(two pool sets, async transfers, a redesigned mutex model) -- a
+separate, larger-scope change. **Do not attempt this with threads** --
+Phase 36 already showed thread-spawn overhead can exceed small per-call
+CPU work; any overlap attempt must use streams/async transfers, not
+`std::thread`.
+
+**A real, documented design characteristic, not a bug**: the new
+batched pool is keyed by `(n,sizeQ,M)`, so each DISTINCT M used creates
+its own permanent pool entry (unlike the single-client pool, keyed by
+`(n,sizeQ)` only). Fine for a fixed-batch-size deployment (the realistic
+case); would need an eviction policy if a future caller varies M across
+many distinct values repeatedly. Not given one this phase since the
+real workload doesn't need it.
+
+**Regression**: C++ 130/134 (same 10 pre-existing failures, zero new
+regressions) + both n=131072 tests passing (both, this time). Rust
+62/0/1, both modes, unchanged.
+
+## Immediate next actions, in order (Phase 38 handoff)
+
+1. **Root-cause the K=32 throughput dip** before assuming it's noise --
+   it reproduced across 3 independent runs this phase. Use internal
+   CPU/GPU-split instrumentation (Phase 37's own technique) on the
+   batched function specifically at K=32, not just external timing.
+2. **If pursuing CPU/GPU overlap**, design a genuine cross-batch
+   double-buffered pipeline (two pool sets, `cudaMemcpyAsync` + a
+   dedicated stream + explicit `cudaEvent` ordering) -- do not spawn
+   threads, and do not attempt it without a workload that actually has
+   back-to-back batches to overlap (this project's current benchmarks
+   don't model a sustained multi-round server; that may need building
+   first).
+3. **Do not assume the batched function's `(n,sizeQ,M)` pool needs an
+   eviction policy** unless a real caller actually varies M across many
+   distinct values repeatedly -- the realistic workload (fixed batch
+   size) doesn't need one; don't add complexity speculatively.
+4. **`test_boot_n131072` still needs fine-grained per-allocation memory
+   instrumentation before another attempt** -- unchanged from every
+   prior phase's handoff on this exact point.
+5. Re-check Windows free RAM before any memory-sensitive step.
+
+## Earlier commit (Phase 37)
+
+Check `git log -8 --oneline` on resume. As of this writing HEAD should be
 the Phase 37 commit(s), on top of Phase 36's `69abd0d` (verified matching
 `origin/main` exactly, 0 ahead/0 behind, at Phase 37 start). Hardware
 re-confirmed unchanged: RTX 2060 Max-Q, 6144 MiB, driver 595.97, CUDA
