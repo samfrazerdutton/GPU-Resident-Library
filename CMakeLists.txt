@@ -51,6 +51,7 @@ add_library(gpufhe STATIC
   src/encrypt_host_shoup_pooled_barrett_batched_pinned.cpp
   src/encrypt_host_shoup_pooled_barrett_prewarm.cpp
   src/encrypt_host_shoup_pooled_barrett_batched_registered.cpp
+  src/encrypt_host_shoup_pooled_barrett_batched_multiclient.cpp
   src/rotate.cpp
   src/ptops.cpp
   src/params.cpp
@@ -490,6 +491,10 @@ gpufhe_test(bench_aggregation_openfhe_cpu_baseline bench/bench_aggregation_openf
 # GOD PROMPT "CKKS PHASE 29", Objective F: VRAM/RSS/runtime scaling across
 # client counts (1,2,4,8,16,32,64), production encrypt path.
 gpufhe_test(bench_aggregation_client_scaling bench/bench_aggregation_client_scaling.cpp)
+# GOD PROMPT "CKKS PHASE 38": sequential vs genuinely-batched multi-client
+# encryption throughput, same client-count sweep, interleaved A/B per K.
+# See research/PHASE38_MULTI_CLIENT_THROUGHPUT.md.
+gpufhe_test(bench_aggregation_multiclient_batched bench/bench_aggregation_multiclient_batched.cpp)
 # GOD PROMPT "CKKS PHASE 29", Objective A: extends the Phase 12/28 FFT
 # encode/decode differential test with different scales (Delta) and
 # near-numerical-boundary values -- the two dimensions that test did not
@@ -672,6 +677,13 @@ gpufhe_benchmark(bench_alloc_path_comparison bench/bench_alloc_path_comparison.c
 gpufhe_test(test_registered_host_buffer tests/test_registered_host_buffer.cpp)
 gpufhe_test(test_encrypt_host_shoup_pooled_barrett_batched_registered_matches_reference tests/test_encrypt_host_shoup_pooled_barrett_batched_registered_matches_reference.cpp)
 gpufhe_test(test_encrypt_host_shoup_pooled_barrett_batched_registered_concurrency_audit tests/test_encrypt_host_shoup_pooled_barrett_batched_registered_concurrency_audit.cpp)
+# GOD PROMPT "CKKS PHASE 38": correctness test for the new genuine
+# multi-client batched encrypt path (src/encrypt_host_shoup_pooled_
+# barrett_batched_multiclient.cpp) against M independent calls to the
+# existing single-client function -- bit-exact, plus batch-size
+# boundary (M=1), independent-randomness, and resource-lifetime checks.
+# See research/PHASE38_MULTI_CLIENT_THROUGHPUT.md.
+gpufhe_test(test_encrypt_multiclient_matches_sequential tests/test_encrypt_multiclient_matches_sequential.cpp)
 gpufhe_benchmark(bench_encrypt_registered_lifecycle bench/bench_encrypt_registered_lifecycle.cpp)
 # GOD PROMPT "CKKS PHASE 22": controlled re-test of Phase 20's
 # explicit-prewarming anomaly, using the IDENTICAL (n,sizeQ) key for
