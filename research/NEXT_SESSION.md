@@ -3,6 +3,118 @@
 ## Current commit
 
 Check `git log -8 --oneline` on resume. As of this writing HEAD should be
+the Phase 36 commit(s), on top of Phase 35's `a07ecf8` (verified matching
+`origin/main` exactly, 0 ahead/0 behind, at Phase 36 start). Hardware
+re-confirmed unchanged: RTX 2060 Max-Q, 6144 MiB, driver 595.97, CUDA
+13.2, cmake 3.28.3, Rust/cargo 1.94.0, 16 logical cores. Windows free RAM
+was UNUSUALLY VOLATILE this session (observed 1.98-5.9 GiB) — an initial
+full-suite `ctest` run was killed outright by the host for running the
+system low on memory; subsequent work used memory-aware batches with an
+explicit `Get-CimInstance Win32_OperatingSystem` check before each
+memory-sensitive step. Check free RAM again at the start of the next
+session before assuming the same batching plan still applies.
+
+**Full detail for this phase**:
+`research/PHASE36_END_TO_END_OPTIMIZATION.md`.
+
+**Track A/B — two documented null/negative performance results, no
+change shipped**: re-confirmed encrypt is still 85.6% of end-to-end
+(`bench_aggregation_decomposed`). Direct internal instrumentation (fully
+reverted) corrected Phase 34's own prior claim that CPU-side work is
+only ~1-2% of one encrypt call — the real split is ~40-48% CPU-side
+(RNG+embed+combine) vs ~52-60% GPU-side; Phase 34's external-cudaEvent-
+bracketing methodology was flawed (the closing event can only be
+enqueued after all host-only work already ran). Implemented and
+rigorously measured the top 2 of 5 ranked candidates: (1) thread-
+parallelizing the embed/combine loops (duplicated `parallel_for` from
+`src/encode.cpp`) was bit-exact-correct but a CONFIRMED REGRESSION
+(encrypt-stage median 75ms -> ~155-157ms — `std::thread` spawn/join
+overhead per call swamps the sub-millisecond work being parallelized,
+since this function calls `parallel_for` twice per encrypt call and
+encrypt is called 32x per aggregation round); (2) pooling the per-call
+host scratch buffers was bit-exact-correct but a CONFIRMED NULL RESULT
+via interleaved `git stash` A/B (74-75ms both before and after, within
+noise — glibc already reuses freed blocks cheaply at this size). BOTH
+reverted, confirmed zero diff. **Next session should NOT re-attempt
+either of these exact changes** — the evidence against both is now
+direct and specific (thread-spawn-overhead granularity mismatch;
+allocator-already-cheap), not merely "didn't help."
+
+**The best-supported remaining candidate, not yet attempted**:
+replacing the combine loop's per-element 128-bit `shoup_precon` division
+with a Barrett-style reduction reusing this file's own `TowerBarrett`
+machinery (already used for the embed step). This touches core modular
+arithmetic used by every encrypt call — if pursued, build a STANDALONE
+reproducer first (a tiny isolated test comparing Shoup-reduction output
+vs. a proposed Barrett-reduction-of-a-128-bit-product output across many
+random inputs, bit-for-bit) before touching
+`encrypt_host_shoup_pooled_barrett_batched.cpp` itself, per this
+project's rule against directly modifying core numeric kernels without
+one.
+
+**Track C — authenticated-input hardening (shipped)**: found and fixed
+two real gaps in the Phase 35 prototype — `CkksEncodingMetadata` was
+never checked against anything (now bound into the attestation AND
+checked against the session's expected values, two distinct new
+rejection reasons: `RejectedEncodingMismatch` for a self-consistent-but-
+wrong-session envelope, `RejectedBadAttestation` for a post-attestation
+tamper of `enc_meta`), and ciphertext shape was never validated beyond
+non-emptiness (now checked via `RejectedCiphertextShapeMismatch`). 14/14
+checks passing (up from 11/11). `libgpufhe` untouched.
+
+**Track D — CKKS provenance research (not implemented, as intended)**:
+separated the provenance problem into six distinct sub-claims (TLS
+provenance / commitment / parsing / CKKS encoding correctness /
+encryption correctness / ciphertext-matches-committed-value) and
+identified that CKKS's floating-point canonical-embedding encoding step
+— which BGV/BFV do not have — is the one sub-claim with no identified
+proof technique at all (floating-point rounding inside a ZK proof is a
+known-hard, unsolved-in-general problem). Named candidate lattice-native
+proof-system families (LaBRADOR/Greyhound/LatticeFold-class) as a
+plausible-but-unsized direction for the encryption-correctness
+sub-claim specifically — not verified to fit this project's actual
+parameters, not implemented.
+
+**Regression**: C++ 117/127 (same 10 pre-existing failures) plus both
+`test_n131072_keysize`/`test_n131072_cache_churn` passing (measured
+against their OWN actual memory requirements, ~1.3GB/~3.2GB, not a
+blanket threshold). `test_boot_n131072`/`test_n131072_gpu_lifecycle`
+deferred — memory gate (6-10 GiB class) never cleared this session, and
+`test_boot_n131072` specifically has never completed a single bootstrap
+stage in this project's history regardless of memory available (see
+`research/MEMORY_FEASIBILITY.md`'s multiple OOM attempts) — do not
+re-attempt it without first adding the fine-grained per-allocation
+memory instrumentation that document's own "correct next step" section
+calls for. Rust: 62/0/1, both modes, unchanged.
+
+## Immediate next actions, in order (Phase 36 handoff)
+
+1. **Re-check Windows free RAM before anything memory-sensitive** — this
+   session's volatility (1.98-5.9 GiB) may or may not persist.
+2. **If pursuing more encrypt-stage CPU optimization, start with a
+   standalone Shoup-vs-Barrett reduction reproducer** (see above) before
+   touching production code — do not skip straight to the production
+   file given this project's now-two-for-two record of plausible-seeming
+   CPU optimizations failing to transfer to the real workload once
+   actually measured.
+3. **Do not re-attempt thread-based parallelization of small per-call
+   CPU loops in this file** — the evidence (section 4.1 of the Phase 36
+   report) is specific and direct, not just "didn't help."
+4. **`test_boot_n131072` needs fine-grained per-allocation memory
+   instrumentation BEFORE another attempt** — three-plus prior attempts
+   across multiple phases have all OOM'd without ever reaching a full
+   bootstrap stage; guessing at `KROT_CAP`/`KSC_CAP` again is not a sound
+   next step (see `research/MEMORY_FEASIBILITY.md`).
+5. **If pursuing CKKS provenance research further**, the first bounded
+   step is sizing a lattice-native proof system (LaBRADOR/Greyhound/
+   LatticeFold-family or a successor) against this project's actual ring
+   dimensions for the encryption-correctness sub-claim ALONE — treat the
+   CKKS-encoding-correctness sub-claim (floating-point rounding) as open
+   research, not an engineering task.
+
+## Earlier commit (Phase 35)
+
+Check `git log -8 --oneline` on resume. As of this writing HEAD should be
 the Phase 35 commit(s), on top of Phase 34's `2012092` (verified matching
 `origin/main` exactly, 0 ahead/0 behind, at Phase 35 start). Hardware
 re-confirmed unchanged: RTX 2060 Max-Q, 6144 MiB, driver 595.97, CUDA
