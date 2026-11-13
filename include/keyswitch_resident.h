@@ -41,6 +41,15 @@ struct DeviceKSWork {
     uint64_t* d_towerMods=nullptr;       // per-tower modulus, sizeQlP entries
     uint64_t* d_nInv=nullptr;            // per-tower n_inv (INTT only), sizeQlP entries
     uint64_t* d_nInvPrecon=nullptr;      // per-tower n_inv_precon (INTT only), sizeQlP entries
+    // GOD PROMPT "CKKS PHASE 40" Track E: ks_moddown's final combine step's
+    // per-tower constants (PInvModq[i], shoup_precon(PInvModq[i],q_i), q_i),
+    // sizeQl entries -- feeds ONE LaunchModDownCombineBatched call instead
+    // of sizeQl separate LaunchModDownCombine launches. Same role-buffer
+    // reuse rule as d_rootsA/d_rootsB/d_towerMods above: these values are a
+    // pure function of the fixed DeviceKSContext C, never of d_res/d_out,
+    // so sharing one buffer across ks_moddown's two call sites (d_ba0,
+    // d_ba1) is safe, including under CUDA graph capture.
+    uint64_t *d_mdS=nullptr, *d_mdSPrecon=nullptr, *d_mdQ=nullptr;  // sizeQl entries
 
     // GOD PROMPT "CKKS PHASE 30": host-side staging buffers for the
     // cudaMemcpyAsync(..., HostToDevice, s) calls ks_accumulate_qp/
@@ -103,6 +112,10 @@ struct DeviceKSWork {
     std::vector<uint64_t> h_towerMods_pwork, h_nInv_pwork, h_nInvPrecon_pwork;
     std::vector<const uint64_t*> h_rootsA_qsw, h_rootsB_qsw;                  // ks_moddown role: Ql NTT
     std::vector<uint64_t> h_towerMods_qsw;
+    // GOD PROMPT "CKKS PHASE 40" Track E: ks_moddown's batched-combine role;
+    // persistent host staging for d_mdS/d_mdSPrecon/d_mdQ above (same CUDA-
+    // graph-capture rule as every other host buffer in this struct).
+    std::vector<uint64_t> h_mdS, h_mdSPrecon, h_mdQ;
 };
 
 DeviceKSContext ks_context_create(const KeySwitchConstants& K, cudaStream_t s=0);

@@ -204,6 +204,9 @@ DeviceKSWork ks_work_create(const DeviceKSContext& C){
     cudaMalloc(&W.d_towerMods,(size_t)C.sizeQlP*8);
     cudaMalloc(&W.d_nInv,(size_t)C.sizeQlP*8);
     cudaMalloc(&W.d_nInvPrecon,(size_t)C.sizeQlP*8);
+    cudaMalloc(&W.d_mdS,(size_t)C.sizeQl*8);
+    cudaMalloc(&W.d_mdSPrecon,(size_t)C.sizeQl*8);
+    cudaMalloc(&W.d_mdQ,(size_t)C.sizeQl*8);
     // GOD PROMPT "CKKS PHASE 30": one dedicated, persistent host buffer per
     // (part, role) -- see keyswitch_resident.h's own comment on these
     // fields for the full story (a CUDA-graph-capture dangling-pointer bug
@@ -241,6 +244,7 @@ DeviceKSWork ks_work_create(const DeviceKSContext& C){
     W.h_rootsA_pwork.resize(C.sizeP); W.h_rootsB_pwork.resize(C.sizeP);
     W.h_towerMods_pwork.resize(C.sizeP); W.h_nInv_pwork.resize(C.sizeP); W.h_nInvPrecon_pwork.resize(C.sizeP);
     W.h_rootsA_qsw.resize(C.sizeQl); W.h_rootsB_qsw.resize(C.sizeQl); W.h_towerMods_qsw.resize(C.sizeQl);
+    W.h_mdS.resize(C.sizeQl); W.h_mdSPrecon.resize(C.sizeQl); W.h_mdQ.resize(C.sizeQl);
     return W;
 }
 
@@ -262,6 +266,7 @@ void ks_work_destroy(DeviceKSWork& W){
     cudaFree(W.d_part);cudaFree(W.d_compl);cudaFree(W.d_res0);cudaFree(W.d_res1);
     cudaFree(W.d_pwork);cudaFree(W.d_qsw);cudaFree(W.d_digPtrs);
     cudaFree(W.d_rootsA);cudaFree(W.d_rootsB);cudaFree(W.d_towerMods);cudaFree(W.d_nInv);cudaFree(W.d_nInvPrecon);
+    cudaFree(W.d_mdS);cudaFree(W.d_mdSPrecon);cudaFree(W.d_mdQ);
 }
 
 // modulus -> root-table row
@@ -424,12 +429,29 @@ void ks_moddown(const DeviceKSContext& C, DeviceKSWork& W,
         cudaMemcpyAsync(W.d_towerMods,W.h_towerMods_qsw.data(),sizeQl*8,cudaMemcpyHostToDevice,s);
         LaunchNTT_CT_Batched(W.d_qsw, W.d_rootsA, W.d_rootsB, W.d_towerMods, sizeQl, n, s);
     }
+    // GOD PROMPT "CKKS PHASE 40" Track E: ONE batched launch across all
+    // sizeQl towers instead of sizeQl separate LaunchModDownCombine calls --
+    // the one remaining per-tower serial loop at this call site (the INTT/
+    // NTT steps just above were already batched this way). Justified by a
+    // standalone isolated reproducer (not committed) measuring this exact
+    // serial-loop-vs-one-launch shape at this project's own n=8192 scale:
+    // median 3.88x (sizeQl=5) / 5.93x (sizeQl=8) speedup, launch-overhead-
+    // dominated exactly like every other kernel-merging win this project has
+    // shipped (Phases 9, 30, 34, 38). h_mdS/h_mdSPrecon/h_mdQ are a pure
+    // function of the fixed DeviceKSContext C (never of d_res/d_out), so
+    // re-filling and re-uploading them identically on every call -- even
+    // under CUDA graph capture, where only the LAST host-side write before
+    // capture-end is ever read on replay -- is safe, matching the existing
+    // h_towerMods_qsw/h_rootsA_qsw role's own established rule above.
     for(uint32_t i=0;i<sizeQl;++i){
         uint64_t q=C.qModHost[i];
-        LaunchModDownCombine(d_out+(size_t)i*n, d_res+(size_t)i*n,
-                             W.d_qsw+(size_t)i*n, C.pInvModqHost[i],
-                             shoup_precon(C.pInvModqHost[i], q), q, n, s);
+        W.h_mdQ[i]=q; W.h_mdS[i]=C.pInvModqHost[i];
+        W.h_mdSPrecon[i]=shoup_precon(C.pInvModqHost[i], q);
     }
+    cudaMemcpyAsync(W.d_mdS,W.h_mdS.data(),sizeQl*8,cudaMemcpyHostToDevice,s);
+    cudaMemcpyAsync(W.d_mdSPrecon,W.h_mdSPrecon.data(),sizeQl*8,cudaMemcpyHostToDevice,s);
+    cudaMemcpyAsync(W.d_mdQ,W.h_mdQ.data(),sizeQl*8,cudaMemcpyHostToDevice,s);
+    LaunchModDownCombineBatched(d_out, d_res, W.d_qsw, W.d_mdS, W.d_mdSPrecon, W.d_mdQ, sizeQl, n, s);
 }
 
 // keyswitch_resident: unchanged behavior, now a thin wrapper over the two

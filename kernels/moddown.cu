@@ -54,3 +54,44 @@ extern "C" void LaunchModDownCombine(
     uint32_t blocks = (n + 255) / 256;
     moddown_combine_kernel<<<blocks, 256, 0, st>>>(d_ans, d_a, d_b, s, sPrecon, q, n);
 }
+
+// GOD PROMPT "CKKS PHASE 40" Track E: batched across all `towers` Q-towers
+// in ONE kernel launch (blockIdx.y selects the tower), mirroring the
+// existing LaunchNTT_CT_Batched/LaunchINTT_GS_Batched pattern this same
+// call site (src/keyswitch_resident.cpp's ks_moddown) already uses for its
+// own INTT/NTT steps -- this was the one remaining per-tower serial loop at
+// that call site. `d_a`/`d_b`/`d_ans` are the SAME contiguous
+// [towers][n]-coefficient layout ks_moddown already has (no new buffer
+// shape); `d_s`/`d_sPrecon`/`d_q` are small per-tower arrays (length
+// `towers`) uploaded once by the caller, replacing `towers` separate
+// kernel launches (each dominated by CPU-side launch overhead at this
+// project's primary n=8192 scale, per a standalone isolated reproducer:
+// ~3.9x-5.9x median speedup at sizeQl=5/8, not yet committed to the repo)
+// with exactly one. Bit-exact: each (tower, coefficient) computes the
+// identical shoup_mulmod(...) as the per-tower kernel above, just indexed
+// by blockIdx.y instead of being a compile-time-fixed single call.
+__global__ void moddown_combine_batched_kernel(
+    uint64_t* __restrict__ ans, const uint64_t* __restrict__ a, const uint64_t* __restrict__ b,
+    const uint64_t* __restrict__ sArr, const uint64_t* __restrict__ sPreconArr,
+    const uint64_t* __restrict__ qArr, uint32_t n)
+{
+    uint32_t k = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t tw = blockIdx.y;
+    if (k >= n) return;
+    const size_t off = (size_t)tw * n;
+    const uint64_t q = qArr[tw];
+    uint64_t diff = a[off + k];
+    if (diff < b[off + k]) diff += q;
+    diff -= b[off + k];
+    ans[off + k] = shoup_mulmod(diff, sArr[tw], sPreconArr[tw], q);
+}
+
+extern "C" void LaunchModDownCombineBatched(
+    uint64_t* d_ans, const uint64_t* d_a, const uint64_t* d_b,
+    const uint64_t* d_s, const uint64_t* d_sPrecon, const uint64_t* d_q,
+    uint32_t towers, uint32_t n, cudaStream_t st)
+{
+    uint32_t blocks = (n + 255) / 256;
+    dim3 g(blocks, towers);
+    moddown_combine_batched_kernel<<<g, 256, 0, st>>>(d_ans, d_a, d_b, d_s, d_sPrecon, d_q, n);
+}
