@@ -255,6 +255,10 @@ gpufhe_test(test_evalkeygen_isolated tests/test_evalkeygen_isolated.cpp)
 gpufhe_test(test_moddown_crt_basis_isolated tests/test_moddown_crt_basis_isolated.cpp)
 gpufhe_test(test_decompose_crt_basis_isolated tests/test_decompose_crt_basis_isolated.cpp)
 gpufhe_test(test_moddown_combine_isolated tests/test_moddown_combine_isolated.cpp)
+# GOD PROMPT "CKKS PHASE 40" Track B: boundary-value + correction-branch
+# coverage for the two Phase-39 Shoup-ified kernels, against an independent
+# (non-shoup) oracle. See the test file's own header comment.
+gpufhe_test(test_shoup_moddown_rescale_boundary tests/test_shoup_moddown_rescale_boundary.cpp)
 # Instruments the REAL end-to-end pipeline (real secret/eval key, real
 # decompose+accumulate+moddown) stage by stage across the full sizeQl x
 # sizeP x numPart discriminating matrix -- isolates the failure to the
