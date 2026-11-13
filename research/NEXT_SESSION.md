@@ -3,6 +3,94 @@
 ## Current commit
 
 Check `git log -8 --oneline` on resume. As of this writing HEAD should be
+`275c598` (on top of `f155710`, `80545f8`, and Phase 39's `05ada33`,
+verified matching `origin/main` exactly after push). Hardware re-confirmed unchanged:
+RTX 2060 Max-Q, 6144 MiB, CUDA 13.2, cmake 3.28.3, Rust/cargo 1.94.0,
+16 logical cores, Ubuntu 24.04.4. Windows free RAM fluctuated roughly
+1.2-7.1 GiB through this session (other desktop applications, not this
+project's own work, were the main driver).
+
+**CRITICAL environment finding, read before running any `cmake --build`
+or full reconfigure**: this session's build stalled for 19+ minutes due
+to WSL's default Windows-PATH import (54 `/mnt/c/...` entries) combined
+with a full CMake reconfigure -- each toolchain-detection `find_program`
+lookup had to make a slow 9P round-trip for every Windows PATH entry.
+Root-caused via the kernel's own `wchan=p9_client_rpc`; fixed by
+exporting the project's own already-established clean, hardcoded `PATH`
+(`/usr/local/cuda-13.2/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`)
+before the build command -- not just before ad hoc `nvcc`/`g++` calls,
+where this project already did so. Turned the same operation from
+19+ minutes (still climbing) into a consistent ~3.2-3.4 seconds. Full
+diagnosis: `research/PHASE40_WSL_PERFORMANCE_DIAGNOSIS.md`. **Always
+export that PATH before any toolchain-invoking command in this
+environment, every session, not just when something seems slow.**
+
+**Full detail for this phase**: `research/PHASE40_REGRESSION_BASELINE_RECONCILIATION.md`,
+`research/PHASE40_SHOUP_RNS_VALIDATION.md`,
+`research/PHASE40_PERFORMANCE_AND_NEXT_BOTTLENECK.md`,
+`research/PHASE40_WSL_PERFORMANCE_DIAGNOSIS.md`.
+
+**Phase 38/39's own "130/134 passing" headline sentences were
+internally inconsistent** (130 was the count of tests RUN in the 4
+batches, not the count that PASSED -- 120 passed, 10 failed, within
+that batch of 130; 134 is a THIRD number, the full discovery count
+including 4 large-n tests handled separately). Not a data error --
+the underlying batch tables were always arithmetically self-consistent
+-- just a mislabeled summary sentence, now corrected (original
+phrasing left intact at its source, not erased) in
+`research/PHASE40_REGRESSION_BASELINE_RECONCILIATION.md`. **If writing
+a future phase's own regression summary sentence, state the PASSED
+count as the numerator against the DISCOVERED count as the
+denominator, with run/skipped/resource-exhausted counts separate --
+not a "tests run" count dressed up as "passing."**
+
+**One new kernel-launch-batching optimization shipped this phase**
+(Track E): `src/keyswitch_resident.cpp`'s `ks_moddown` had one
+remaining serial per-tower loop (`LaunchModDownCombine` called once
+per Q-tower) sitting right next to two ALREADY-batched steps
+(`LaunchINTT_GS_Batched`/`LaunchNTT_CT_Batched`) in the same function --
+an oversight, not a new idea. Added `LaunchModDownCombineBatched`
+(`kernels/moddown.cu`/`include/moddown.h`), one launch across all
+towers via `blockIdx.y`, bit-exact with the per-tower kernel (both
+still exist; the original is still used by every other call site).
+Isolated reproducer: 3.88x (sizeQl=5) to 5.93x (sizeQl=8) median
+speedup at n=8192, launch-overhead-dominated. Full correctness
+re-verified (every keyswitch/rotation/hoist test, both C++ and Rust
+suites, bit-exact). **End-to-end effect NOT visible** in
+`test_hoist_allstages`/`bench_hoist_multi` (within those tests' own
+pre-existing noise band) -- honestly reported as a real, verified
+kernel-level win with unmeasured end-to-end impact, exactly like the
+Phase 39 Shoup kernels' own finding. **`rescale_resident_raw`'s
+analogous per-tower loop (3 kernel types per tower, not 1) is a
+second, likely comparably-sized opportunity, deliberately deferred to
+respect this phase's "at most one" scope -- a strong Phase 41
+candidate**, but structurally harder (needs its own reproducer-first
+investigation, not a rushed extension of this phase's `ks_moddown`
+change).
+
+**A near-miss, caught and stopped, not hidden**: a `ctest -R` pattern
+meant to match `test_boot_multi_input_small` also matched
+`test_boot_n131072` via the substring `boot` -- a test that has never
+completed in this project's history and has unbounded memory growth.
+Caught via a free-RAM check (1.23 GiB) within about a minute and
+stopped (only the one background task this session itself started).
+**Never use a `ctest -R`/`-E` substring pattern containing `boot`
+without also excluding `test_boot_n131072` explicitly** (e.g.
+`-E test_boot_n131072`) -- this is now the second phase-level incident
+near this specific test name; worth hard-coding the exclusion into a
+project convention rather than relying on memory each time.
+
+**Regression**: 124/135 verified passing this session (121 across the
+4 standard batches + `test_n131072_keysize` + `test_n131072_cache_churn`
++ `test_n131072_gpu_lifecycle`, the last two both unexpectedly healthy
+this session, unlike Phase 37/39), same 10 named pre-existing failures,
+zero new regressions, `test_boot_n131072` deliberately not run.
+Rust 62/0/1, both modes, unchanged, run both before and after the
+Track E change.
+
+## Earlier commit (Phase 39)
+
+Check `git log -8 --oneline` on resume. As of this writing HEAD should be
 the Phase 39 commit(s), on top of Phase 38's `d1dc2be` (verified matching
 `origin/main` exactly, 0 ahead/0 behind, at Phase 39 start). Hardware
 re-confirmed unchanged: RTX 2060 Max-Q, 6144 MiB, driver 595.97, CUDA
