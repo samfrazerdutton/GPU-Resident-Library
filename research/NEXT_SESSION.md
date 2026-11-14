@@ -3,6 +3,79 @@
 ## Current commit
 
 Check `git log -8 --oneline` on resume. As of this writing HEAD should be
+`31c856a` (plus a docs-only commit on top), on Phase 40's `1357624`
+(verified matching `origin/main` exactly at Phase 42 start -- **there was
+no Phase 41**; a
+god-prompt referenced one, but `git log`/`git reflog`/`git stash list`/
+`git branch -a` all confirmed it never happened; the repo was exactly at
+Phase 40's own final state). Hardware re-confirmed unchanged:
+RTX 2060 Max-Q, 6144 MiB, CUDA 13.2, cmake 3.28.3, Rust/cargo 1.94.0,
+16 logical cores, Ubuntu 24.04.4 (fresh WSL VM boot this session, ~2 min
+uptime at session start). Windows free RAM fluctuated ~1.2-7.1 GiB.
+
+**Full detail for this phase**: `research/PHASE42_PERFORMANCE_AUDIT.md`,
+`research/PHASE42_IMPLEMENTATION.md`, `research/PHASE42_PERFORMANCE_RESULTS.md`,
+`research/PHASE42_REGRESSION_INVENTORY.md`.
+
+**Completed the ONE thing Phase 40 deferred**: `rescale_resident_raw`'s
+per-tower serial loop (SwitchModulus + NTT_CT's own ~5 internal launches
++ RescaleFuse, repeated `towers-1` times) is now batched into ~7 total
+launches via two NEW kernels (`LaunchSwitchModulusBatched` in
+`kernels/switch_modulus.cu`, `LaunchRescaleFuseBatched` in
+`kernels/rescale.cu`) plus the ALREADY-EXISTING, already-proven
+`LaunchNTT_CT_Batched` (unchanged, reused). New `RescaleBatchWork` cache
+in `src/keyswitch_resident.cpp`, keyed by `(n,last)`, same mutex/host-
+staging-persistence convention as every other cache in that file. OLD
+serial path fully preserved behind a new `g_rescale_batched` flag
+(mirrors `g_ks_batched`'s own established convention) -- a real,
+switchable reference implementation, not deleted.
+
+**Measured, not assumed**: isolated `rescale_resident_raw` A/B (3 runs):
+1.18-1.29x at towers=4, 2.21-2.73x at towers=7, 3.44-3.89x at towers=11
+(grows with towers, as expected). End-to-end full EvalMult A/B (3 runs,
+direct non-graph path, N=16 concurrent chains): **1.11-1.16x, a real
+application-level speedup**, not just a kernel number -- rescale is
+~16.6% of one `multiply_relin_rescale` call per the existing
+`bench_evalmult_e2e_breakdown`'s own steady-state numbers (keyswitch/
+relin remains the single largest GPU stage, unchanged this phase -- the
+clear Phase 43 candidate if more end-to-end gain is wanted).
+
+**CUDA graph-capture safety was VERIFIED, not just argued**: added
+`tests/test_rescale_resident_graph.cpp` (new, kept), which captures
+both the single-call case and the real two-call-same-towers-same-s1/s2
+EvalMult pattern (`bench_evalmult_resident.cpp` is the only real caller
+that captures `rescale_resident_raw`) and checks bit-exact against
+direct calls -- 0/98304 mismatches, both scenarios. The safety argument
+(documented in `RescaleBatchWork`'s own comment) rests on a real
+mathematical invariant of this codebase (rescale constants depend only
+on level, never on which ciphertext component), not a hope.
+
+**A near-miss this session, caught immediately**: an overly broad
+`ctest -R` pattern (containing the substring `boot`) briefly started
+`test_boot_n131072` (which never completes in this project's history);
+caught via a free-RAM check dropping toward exhaustion within about a
+minute and stopped. Repeats the Phase 40 near-miss with the exact same
+test -- **this project should adopt a standing rule**: never use a
+`ctest -R`/`-E` pattern containing the substring `boot` without also
+explicitly excluding `test_boot_n131072`.
+
+**Regression**: 125/136 verified passing this session (122 across 4
+standard batches + `test_n131072_keysize` + `test_n131072_cache_churn`
++ `test_n131072_gpu_lifecycle`), same 10 named pre-existing failures
+independently re-verified from their actual thrown errors, zero new
+regressions, `test_boot_n131072` deliberately not run. Rust 62/0/1,
+both modes, unchanged.
+
+**Recommended Phase 43 direction**: profile key-switching/relin itself
+(now the single largest GPU-side stage in the EvalMult breakdown,
+~49% of the full operation per section 3 of
+`research/PHASE42_PERFORMANCE_RESULTS.md`) for the next real bottleneck
+-- do not assume it is already optimal just because it has had prior
+attention; measure first, as this phase did.
+
+## Earlier commit (Phase 40)
+
+Check `git log -8 --oneline` on resume. As of this writing HEAD should be
 `275c598` (on top of `f155710`, `80545f8`, and Phase 39's `05ada33`,
 verified matching `origin/main` exactly after push). Hardware re-confirmed unchanged:
 RTX 2060 Max-Q, 6144 MiB, CUDA 13.2, cmake 3.28.3, Rust/cargo 1.94.0,
