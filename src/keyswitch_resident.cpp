@@ -15,6 +15,11 @@
 
 namespace gpufhe {
 bool g_ks_batched=true;   // A/B switch for the batched fastcore
+// GOD PROMPT "CKKS PHASE 42": A/B switch for rescale_resident_raw's batched
+// SwitchModulus/NTT/RescaleFuse path below (mirrors g_ks_batched's own
+// pattern exactly -- kept for the same reason: a real, switchable reference
+// implementation for interleaved A/B measurement, not a git-stash diff).
+bool g_rescale_batched=true;
 namespace {
 uint64_t mulmod(uint64_t a,uint64_t b,uint64_t q){return(uint64_t)(((unsigned __int128)a*b)%q);}
 uint64_t powmod(uint64_t b,uint64_t e,uint64_t q){unsigned __int128 r=1,bb=b%q;while(e){if(e&1)r=(r*bb)%q;bb=(bb*bb)%q;e>>=1;}return(uint64_t)r;}
@@ -53,6 +58,73 @@ uint64_t* upc(uint64_t key, const std::vector<uint64_t>& h){
     static std::map<uint64_t,uint64_t*> m;
     auto it=m.find(key); if(it!=m.end()) return it->second;
     uint64_t* d=upv(h); m.emplace(key,d); return d; }
+
+// GOD PROMPT "CKKS PHASE 42": rescale_resident_raw's batched-path scratch,
+// keyed by (n, last) where last=towers-1 (the number of surviving towers
+// actually processed by the loop). Device buffers are persistent and keyed
+// by SHAPE only (same convention as every other cache in this file) --
+// growing a new entry per distinct (n,last) pair actually used, never
+// freed early (process-lifetime, matching upc/g_rtab above).
+//
+// Host staging vectors are ALSO persistent fields on this struct (the same
+// CUDA-graph-capture rule DeviceKSWork's own long comment documents: a
+// captured cudaMemcpyAsync node stores the HOST POINTER, re-read on every
+// future replay, so a function-local std::vector would dangle). They are
+// refilled with the CURRENT call's values on every call (q_new/diff/
+// newLarger come only from the fixed DeviceKSContext C, so always identical
+// for a given (n,last); s1/s2 are caller-supplied and refilled every call to
+// stay correct even if a future caller ever passes different ones at the
+// same (n,last)).
+//
+// Safety under CUDA graph capture, verified against this codebase's actual
+// usage (bench/bench_evalmult_resident.cpp is the only call site that
+// captures rescale_resident_raw): the two calls per EvalMult (one for each
+// ciphertext component, c0/c1) are ALWAYS made with the SAME s1/s2 (CKKS's
+// own rescale constants depend only on the level, never on which component
+// is being rescaled, so this is a mathematical invariant of how this
+// function is used, not a coincidence of one bench file) and captures are
+// sequential per chain (one cudaStreamBeginCapture/EndCapture pair fully
+// completes before the next begins) -- so no capture ever records a memcpy
+// node whose value a DIFFERENT, later-in-capture-order call could silently
+// overwrite before replay. If any FUTURE caller captures two calls at the
+// SAME (n,towers) with GENUINELY DIFFERENT s1/s2 inside ONE capture, that
+// would reproduce the exact value-aliasing bug class research/
+// KS_GRAPH_CAPTURE_INVESTIGATION.md documents -- not expected given CKKS's
+// own math, but recorded here explicitly as the contract this cache relies on.
+struct RescaleBatchWork {
+    uint32_t n=0, last=0;
+    uint64_t* d_scratchBatch=nullptr;         // last*n
+    const uint64_t** d_rootsA=nullptr;        // last entries (NTT forward roots)
+    const uint64_t** d_rootsB=nullptr;        // last entries (NTT forward precon)
+    uint64_t* d_towerMods=nullptr;            // last entries
+    uint64_t* d_qNew=nullptr, *d_diff=nullptr; int* d_newLarger=nullptr;   // SwitchModulusBatched
+    uint64_t* d_s1=nullptr,*d_s1p=nullptr,*d_s2=nullptr,*d_s2p=nullptr,*d_q=nullptr; // RescaleFuseBatched
+    std::vector<const uint64_t*> h_rootsA, h_rootsB;
+    std::vector<uint64_t> h_towerMods, h_qNew, h_diff, h_s1, h_s1p, h_s2, h_s2p, h_q;
+    std::vector<int> h_newLarger;
+};
+RescaleBatchWork& getRescaleBatchWork(uint32_t n, uint32_t last){
+    std::lock_guard<std::mutex> lock(g_ks_cache_mutex());
+    static std::map<std::pair<uint32_t,uint32_t>, RescaleBatchWork> cache;
+    auto key = std::make_pair(n, last);
+    auto it = cache.find(key);
+    if (it != cache.end()) return it->second;
+    RescaleBatchWork R; R.n=n; R.last=last;
+    cudaMalloc(&R.d_scratchBatch,(size_t)last*n*8);
+    cudaMalloc(&R.d_rootsA,last*sizeof(uint64_t*));
+    cudaMalloc(&R.d_rootsB,last*sizeof(uint64_t*));
+    cudaMalloc(&R.d_towerMods,last*8);
+    cudaMalloc(&R.d_qNew,last*8); cudaMalloc(&R.d_diff,last*8);
+    cudaMalloc(&R.d_newLarger,last*sizeof(int));
+    cudaMalloc(&R.d_s1,last*8); cudaMalloc(&R.d_s1p,last*8);
+    cudaMalloc(&R.d_s2,last*8); cudaMalloc(&R.d_s2p,last*8); cudaMalloc(&R.d_q,last*8);
+    R.h_rootsA.resize(last); R.h_rootsB.resize(last); R.h_towerMods.resize(last);
+    R.h_qNew.resize(last); R.h_diff.resize(last); R.h_newLarger.resize(last);
+    R.h_s1.resize(last); R.h_s1p.resize(last); R.h_s2.resize(last);
+    R.h_s2p.resize(last); R.h_q.resize(last);
+    auto ins = cache.emplace(key, std::move(R));
+    return ins.first->second;
+}
 } // anon
 
 DeviceKSContext ks_context_create(const KeySwitchConstants& K, cudaStream_t s){
@@ -475,13 +547,49 @@ void rescale_resident_raw(uint64_t* d_c, uint32_t towers,
     uint64_t qLast=C.qModHost[last]; int rl=row_of(C,qLast);
     cudaMemcpyAsync(d_drop, d_c+(size_t)last*n, (size_t)n*8, cudaMemcpyDeviceToDevice, s);
     LaunchINTT_GS(d_drop, C.d_ir[rl], C.d_ip[rl], n, qLast, C.ninv[rl], C.ninv_p[rl], s);
-    for(uint32_t t=0;t<last;++t){
-        uint64_t qi=C.qModHost[t]; int r=row_of(C,qi);
-        cudaMemcpyAsync(d_scratch, d_drop, (size_t)n*8, cudaMemcpyDeviceToDevice, s);
-        LaunchSwitchModulus(d_scratch, qLast, qi, n, s);
-        LaunchNTT_CT(d_scratch, C.d_fr[r], C.d_fp[r], n, qi, s);
-        LaunchRescaleFuse(d_c+(size_t)t*n, d_scratch, s1[t], shoup_precon(s1[t],qi),
-                          s2[t], shoup_precon(s2[t],qi), qi, n, s);
+    if(!g_rescale_batched){
+        for(uint32_t t=0;t<last;++t){
+            uint64_t qi=C.qModHost[t]; int r=row_of(C,qi);
+            cudaMemcpyAsync(d_scratch, d_drop, (size_t)n*8, cudaMemcpyDeviceToDevice, s);
+            LaunchSwitchModulus(d_scratch, qLast, qi, n, s);
+            LaunchNTT_CT(d_scratch, C.d_fr[r], C.d_fp[r], n, qi, s);
+            LaunchRescaleFuse(d_c+(size_t)t*n, d_scratch, s1[t], shoup_precon(s1[t],qi),
+                              s2[t], shoup_precon(s2[t],qi), qi, n, s);
+        }
+    } else {
+        // GOD PROMPT "CKKS PHASE 42": ONE batched launch per stage across all
+        // `last` surviving towers, instead of `last` separate iterations each
+        // issuing LaunchSwitchModulus + LaunchNTT_CT's own ~5 internal
+        // launches + LaunchRescaleFuse (see getRescaleBatchWork's own comment
+        // above for the cache/graph-capture-safety argument).
+        RescaleBatchWork& R = getRescaleBatchWork(n, last);
+        for(uint32_t t=0;t<last;++t){
+            uint64_t qi=C.qModHost[t]; int r=row_of(C,qi);
+            uint64_t diff=(qLast>qi)?(qLast-qi):(qi-qLast);
+            int newLarger=(qi>qLast)?1:0;
+            if(!newLarger) diff%=qi;
+            R.h_qNew[t]=qi; R.h_diff[t]=diff; R.h_newLarger[t]=newLarger;
+            R.h_rootsA[t]=C.d_fr[r]; R.h_rootsB[t]=C.d_fp[r]; R.h_towerMods[t]=qi;
+            R.h_s1[t]=s1[t]; R.h_s1p[t]=shoup_precon(s1[t],qi);
+            R.h_s2[t]=s2[t]; R.h_s2p[t]=shoup_precon(s2[t],qi);
+            R.h_q[t]=qi;
+        }
+        cudaMemcpyAsync(R.d_qNew,R.h_qNew.data(),last*8,cudaMemcpyHostToDevice,s);
+        cudaMemcpyAsync(R.d_diff,R.h_diff.data(),last*8,cudaMemcpyHostToDevice,s);
+        cudaMemcpyAsync(R.d_newLarger,R.h_newLarger.data(),last*sizeof(int),cudaMemcpyHostToDevice,s);
+        cudaMemcpyAsync(R.d_rootsA,R.h_rootsA.data(),last*sizeof(uint64_t*),cudaMemcpyHostToDevice,s);
+        cudaMemcpyAsync(R.d_rootsB,R.h_rootsB.data(),last*sizeof(uint64_t*),cudaMemcpyHostToDevice,s);
+        cudaMemcpyAsync(R.d_towerMods,R.h_towerMods.data(),last*8,cudaMemcpyHostToDevice,s);
+        cudaMemcpyAsync(R.d_s1,R.h_s1.data(),last*8,cudaMemcpyHostToDevice,s);
+        cudaMemcpyAsync(R.d_s1p,R.h_s1p.data(),last*8,cudaMemcpyHostToDevice,s);
+        cudaMemcpyAsync(R.d_s2,R.h_s2.data(),last*8,cudaMemcpyHostToDevice,s);
+        cudaMemcpyAsync(R.d_s2p,R.h_s2p.data(),last*8,cudaMemcpyHostToDevice,s);
+        cudaMemcpyAsync(R.d_q,R.h_q.data(),last*8,cudaMemcpyHostToDevice,s);
+
+        LaunchSwitchModulusBatched(R.d_scratchBatch, d_drop, qLast,
+                                   R.d_qNew, R.d_diff, R.d_newLarger, last, n, s);
+        LaunchNTT_CT_Batched(R.d_scratchBatch, R.d_rootsA, R.d_rootsB, R.d_towerMods, last, n, s);
+        LaunchRescaleFuseBatched(d_c, R.d_scratchBatch, R.d_s1, R.d_s1p, R.d_s2, R.d_s2p, R.d_q, last, n, s);
     }
 }
 

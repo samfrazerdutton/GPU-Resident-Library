@@ -54,3 +54,42 @@ extern "C" void LaunchRescaleFuse(
     uint32_t blocks = (n + 255) / 256;
     rescale_fuse_kernel<<<blocks, 256, 0, s>>>(d_a, d_b, s1, s1Precon, s2, s2Precon, q, n);
 }
+
+// GOD PROMPT "CKKS PHASE 42": batched variant for src/keyswitch_resident.cpp's
+// rescale_resident_raw, which previously called LaunchRescaleFuse once per
+// surviving tower -- the one remaining per-tower serial launch in that
+// function's loop, after batching its SwitchModulus and (already-existing,
+// already-proven) NTT steps. One launch across `towers` towers via
+// blockIdx.y; `a` (d_c) and `b` (the batched switched+NTT'd scratch) use the
+// SAME [towers][n] contiguous layout as kernels/moddown.cu's own
+// moddown_combine_batched_kernel. Bit-exact with rescale_fuse_kernel:
+// identical per-(tower,coefficient) shoup_mulmod/add, just indexed instead
+// of fixed to one tower per launch.
+__global__ void rescale_fuse_batched_kernel(
+    uint64_t* __restrict__ a, const uint64_t* __restrict__ b,
+    const uint64_t* __restrict__ s1Arr, const uint64_t* __restrict__ s1PreconArr,
+    const uint64_t* __restrict__ s2Arr, const uint64_t* __restrict__ s2PreconArr,
+    const uint64_t* __restrict__ qArr, uint32_t n)
+{
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t tw = blockIdx.y;
+    if (idx >= n) return;
+    const size_t off = (size_t)tw * n;
+    const uint64_t q = qArr[tw];
+    uint64_t t1 = shoup_mulmod(a[off + idx], s1Arr[tw], s1PreconArr[tw], q);
+    uint64_t t2 = shoup_mulmod(b[off + idx], s2Arr[tw], s2PreconArr[tw], q);
+    uint64_t sum = t1 + t2;
+    a[off + idx] = (sum >= q) ? sum - q : sum;
+}
+
+extern "C" void LaunchRescaleFuseBatched(
+    uint64_t* d_a, const uint64_t* d_b,
+    const uint64_t* d_s1, const uint64_t* d_s1Precon,
+    const uint64_t* d_s2, const uint64_t* d_s2Precon, const uint64_t* d_q,
+    uint32_t towers, uint32_t n, cudaStream_t s)
+{
+    uint32_t blocks = (n + 255) / 256;
+    dim3 g(blocks, towers);
+    rescale_fuse_batched_kernel<<<g, 256, 0, s>>>(
+        d_a, d_b, d_s1, d_s1Precon, d_s2, d_s2Precon, d_q, n);
+}

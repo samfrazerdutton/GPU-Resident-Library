@@ -19,6 +19,7 @@ extern "C" void LaunchTensor(const uint64_t*,const uint64_t*,const uint64_t*,con
     uint64_t*,uint64_t*,uint64_t*,const uint64_t*,uint32_t,uint32_t,cudaStream_t);
 extern "C" void LaunchCombine(uint64_t*,uint64_t*,const uint64_t*,const uint64_t*,
     const uint64_t*,const uint64_t*,const uint64_t*,uint32_t,uint32_t,cudaStream_t);
+namespace gpufhe { extern bool g_rescale_batched; }
 
 static double median(std::vector<double> v){ if(v.empty())return 0; std::sort(v.begin(),v.end());
     size_t n=v.size(); return n%2?v[n/2]:0.5*(v[n/2-1]+v[n/2]); }
@@ -180,6 +181,23 @@ int main(int argc,char**argv){
     std::cout<<"  gpu-cpu median = "<<median(d)<<" ms  95% CI ["<<ci.first<<", "<<ci.second<<"]\n";
     std::cout<<"  => "<<((ci.second<0)?"GPU FASTER":(ci.first>0)?"GPU SLOWER":"inconclusive")<<" ("
              <<median(cv)/median(gg)<<"x, graph path)\n";
+    // GOD PROMPT "CKKS PHASE 42": direct-path (non-graph) end-to-end A/B for
+    // rescale_resident_raw's new batched combine vs the preserved serial
+    // reference, toggled in-process via g_rescale_batched (same convention
+    // as g_ks_batched). Order-alternated, same warm-up discipline.
+    {
+        run_gpu(); // warm-up both states once more under the toggle
+        std::vector<double> oldG, newG;
+        for (uint32_t r=0;r<reps;++r){
+            if (r%2==0){ gpufhe::g_rescale_batched=false; oldG.push_back(run_gpu());
+                         gpufhe::g_rescale_batched=true;  newG.push_back(run_gpu()); }
+            else        { gpufhe::g_rescale_batched=true;  newG.push_back(run_gpu());
+                         gpufhe::g_rescale_batched=false; oldG.push_back(run_gpu()); }
+        }
+        gpufhe::g_rescale_batched=true; // restore default
+        std::cout<<"  [Phase 42 A/B] direct-path end-to-end: OLD(serial rescale)="<<median(oldG)
+                 <<"ms  NEW(batched rescale)="<<median(newG)<<"ms  speedup="<<(median(oldG)/median(newG))<<"x\n";
+    }
     for(uint32_t c=0;c<N;++c){ gpufhe::ks_work_destroy(W[c]); cudaStreamDestroy(streams[c]);
         auto&x=ch[c]; for(uint64_t* p:{x.c0a,x.c1a,x.c0b,x.c1b,x.t0,x.t1,x.t2,x.ba0,x.ba1,x.r0,x.r1,x.scr,x.drp})cudaFree(p); }
     for(auto&e:gexec)cudaGraphExecDestroy(e);

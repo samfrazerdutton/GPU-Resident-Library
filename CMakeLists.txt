@@ -259,6 +259,10 @@ gpufhe_test(test_moddown_combine_isolated tests/test_moddown_combine_isolated.cp
 # coverage for the two Phase-39 Shoup-ified kernels, against an independent
 # (non-shoup) oracle. See the test file's own header comment.
 gpufhe_test(test_shoup_moddown_rescale_boundary tests/test_shoup_moddown_rescale_boundary.cpp)
+# GOD PROMPT "CKKS PHASE 42": CUDA-graph-capture gate for rescale_resident_raw's
+# new batched path -- captured-vs-direct bit-exactness, including the real
+# two-calls-same-towers-same-s1/s2 EvalMult pattern. See the test's own header.
+gpufhe_test(test_rescale_resident_graph tests/test_rescale_resident_graph.cpp)
 # Instruments the REAL end-to-end pipeline (real secret/eval key, real
 # decompose+accumulate+moddown) stage by stage across the full sizeQl x
 # sizeP x numPart discriminating matrix -- isolates the failure to the
@@ -544,6 +548,9 @@ gpufhe_test(bench_resident_chain bench/bench_resident_chain.cpp)
 gpufhe_test(bench_batch bench/bench_batch.cpp)
 gpufhe_test(bench_evalmult bench/bench_evalmult.cpp)
 gpufhe_test(bench_evalmult_resident bench/bench_evalmult_resident.cpp)
+# GOD PROMPT "CKKS PHASE 42": isolated A/B (g_rescale_batched toggle) for
+# rescale_resident_raw's new batched path vs the preserved serial reference.
+gpufhe_test(bench_rescale_resident_batched_vs_serial bench/bench_rescale_resident_batched_vs_serial.cpp)
 gpufhe_test(bench_hoist_multi bench/bench_hoist_multi.cpp)
 # GOD PROMPT "CKKS RUST + CUDA EVOLUTION"/"FAIR BENCHMARKS" rounds: Path A
 # (existing C++ host + existing CUDA C++ kernel) of a three-way comparison

@@ -14,3 +14,15 @@ extern "C" void LaunchRescaleFuse(
     uint64_t* d_a, const uint64_t* d_b,
     uint64_t s1, uint64_t s1Precon, uint64_t s2, uint64_t s2Precon,
     uint64_t q, uint32_t n, cudaStream_t s);
+
+// GOD PROMPT "CKKS PHASE 42": batched variant, one launch across `towers`
+// towers instead of `towers` separate LaunchRescaleFuse calls. d_a/d_b use
+// the same [towers][n] contiguous layout as moddown.cu's
+// LaunchModDownCombineBatched. d_s1/d_s1Precon/d_s2/d_s2Precon/d_q: device
+// arrays of length `towers`, the same per-tower rescale constants each call
+// already computes, just uploaded once instead of used one tower at a time.
+extern "C" void LaunchRescaleFuseBatched(
+    uint64_t* d_a, const uint64_t* d_b,
+    const uint64_t* d_s1, const uint64_t* d_s1Precon,
+    const uint64_t* d_s2, const uint64_t* d_s2Precon, const uint64_t* d_q,
+    uint32_t towers, uint32_t n, cudaStream_t s);
